@@ -1,14 +1,150 @@
 const express = require('express');
 const router = express.Router();
-// const supabase = require('../lib/supabase');
+const supabase = require('../lib/supabase');
 
-// TODO: Implement Shopify webhook routes
-// - POST /webhook/shopify/orders/create - Handle new order creation
-// - POST /webhook/shopify/orders/updated - Handle order updates
-// - POST /webhook/shopify/products/create - Handle new product creation
-// - POST /webhook/shopify/products/update - Handle product updates
-// - GET /webhook/shopify - Webhook verification if needed
+// POST /products/sync - Bulk sync products from Shopify
+router.post('/sync', async (req, res) => {
+  try {
+    const { user_id, products } = req.body;
 
+    // Validate request body
+    if (!user_id || !Array.isArray(products)) {
+      return res.status(400).json({
+        error: 'Invalid request body. Expected { user_id, products: [] }'
+      });
+    }
+
+    if (products.length === 0) {
+      return res.json({ success: true, count: 0, message: 'No products to sync' });
+    }
+
+    const syncedAt = new Date().toISOString();
+
+    // Prepare products for upsert
+    const productsToUpsert = products.map(product => ({
+      user_id,
+      shopify_product_id: product.shopify_product_id,
+      brand_id: product.brand_id || null, // Optional: for backwards compatibility
+      name: product.name,
+      description: product.description || null,
+      price: product.price || null,
+      currency: product.currency || 'EGP',
+      variants: product.variants || [],
+      in_stock: product.in_stock !== undefined ? product.in_stock : true,
+      availability: product.in_stock ? 'in_stock' : 'out_of_stock', // For backwards compatibility
+      sku: product.sku || null,
+      image_url: product.image_url || null,
+      synced_at: syncedAt,
+      updated_at: syncedAt,
+    }));
+
+    // Upsert all products using shopify_product_id as unique key
+    const { data, error } = await supabase
+      .from('products')
+      .upsert(productsToUpsert, {
+        onConflict: 'shopify_product_id',
+        ignoreDuplicates: false, // Update existing records
+      })
+      .select();
+
+    if (error) {
+      console.error('Error syncing products:', error);
+      throw error;
+    }
+
+    console.log(`✅ Synced ${products.length} products for user ${user_id}`);
+
+    res.json({
+      success: true,
+      count: products.length,
+      synced_at: syncedAt,
+      products: data
+    });
+
+  } catch (error) {
+    console.error('Error in /sync endpoint:', error);
+    res.status(500).json({
+      error: 'Failed to sync products',
+      details: error.message
+    });
+  }
+});
+
+// POST /webhook/shopify/product-update - Handle product create/update from Shopify
+router.post('/product-update', async (req, res) => {
+  try {
+    const { user_id, product } = req.body;
+
+    if (!user_id || !product) {
+      return res.status(400).json({
+        error: 'Invalid request body. Expected { user_id, product }'
+      });
+    }
+
+    // TODO: Map user_id (shop) to brand_id in your database
+    const brandId = user_id; // Replace with actual brand_id lookup
+
+    const { data, error } = await supabase
+      .from('products')
+      .upsert({
+        shopify_product_id: product.shopify_product_id,
+        brand_id: brandId,
+        name: product.name,
+        description: product.description,
+        price: product.price,
+        availability: product.in_stock ? 'in_stock' : 'out_of_stock',
+        updated_at: new Date().toISOString(),
+      }, {
+        onConflict: 'shopify_product_id',
+      });
+
+    if (error) throw error;
+
+    console.log(`Product upserted: ${product.name} (${product.shopify_product_id})`);
+
+    res.json({
+      success: true,
+      message: 'Product synced successfully',
+      data
+    });
+  } catch (error) {
+    console.error('Error upserting product:', error);
+    res.status(500).json({ error: 'Failed to upsert product', details: error.message });
+  }
+});
+
+// POST /webhook/shopify/product-delete - Handle product deletion from Shopify
+router.post('/product-delete', async (req, res) => {
+  try {
+    const { user_id, shopify_product_id } = req.body;
+
+    if (!user_id || !shopify_product_id) {
+      return res.status(400).json({
+        error: 'Invalid request body. Expected { user_id, shopify_product_id }'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('products')
+      .delete()
+      .eq('shopify_product_id', shopify_product_id);
+
+    if (error) throw error;
+
+    console.log(`Product deleted: ${shopify_product_id}`);
+
+    res.json({
+      success: true,
+      message: 'Product deleted successfully',
+      data
+    });
+  } catch (error) {
+    console.error('Error deleting product:', error);
+    res.status(500).json({ error: 'Failed to delete product', details: error.message });
+  }
+});
+
+// Legacy webhook endpoints (not yet implemented)
 router.post('/orders/create', (req, res) => {
   res.status(501).json({ message: 'Shopify order creation webhook not yet implemented' });
 });
