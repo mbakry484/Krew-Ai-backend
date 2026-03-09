@@ -1,6 +1,7 @@
-const express = require('express');
+// Load environment variables first, before any other modules
 require('dotenv').config();
 
+const express = require('express');
 const authRoutes = require('./routes/auth');
 const instagramRoutes = require('./routes/instagram');
 const shopifyRoutes = require('./routes/shopify');
