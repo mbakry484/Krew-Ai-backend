@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const instagramRoutes = require('./routes/instagram');
 const shopifyRoutes = require('./routes/shopify');
@@ -12,7 +13,29 @@ const aiRoutes = require('./routes/ai');
 
 const app = express();
 
+// Parse ALLOWED_ORIGINS from environment variable
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
+  .split(',')
+  .map(origin => origin.trim());
+
+// CORS configuration
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
 // Middleware
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Health check
