@@ -186,4 +186,32 @@ router.post('/onboarding', verifyToken, async (req, res) => {
   }
 });
 
+/**
+ * GET /auth/me
+ * Get authenticated user's profile (protected route)
+ */
+router.get('/me', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    // Fetch user from database, excluding password
+    const { data: user, error: fetchError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, created_at')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      user
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;
