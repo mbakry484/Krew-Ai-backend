@@ -21,10 +21,15 @@ router.post('/signup', async (req, res) => {
   try {
     const { email, password, first_name, last_name, business_name } = req.body;
 
+    // Debug logging
+    console.log('Signup request body:', req.body);
+    console.log('Extracted fields:', { email, password, first_name, last_name, business_name });
+
     // Validate required fields
     if (!email || !password || !first_name || !last_name || !business_name) {
       return res.status(400).json({
-        error: 'Missing required fields: email, password, first_name, last_name, business_name'
+        error: 'Missing required fields: email, password, first_name, last_name, business_name',
+        received: { email, password, first_name, last_name, business_name }
       });
     }
 
