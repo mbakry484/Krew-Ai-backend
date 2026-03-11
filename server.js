@@ -10,6 +10,7 @@ const productsRoutes = require('./routes/products');
 const knowledgeBaseRoutes = require('./routes/knowledge-base');
 const conversationsRoutes = require('./routes/conversations');
 const aiRoutes = require('./routes/ai');
+const integrationsRoutes = require('./routes/integrations');
 
 const app = express();
 
@@ -51,6 +52,7 @@ app.use('/products', shopifyRoutes); // Mount shopify routes at /products for /p
 app.use('/knowledge-base', knowledgeBaseRoutes);
 app.use('/conversations', conversationsRoutes);
 app.use('/ai', aiRoutes);
+app.use('/integrations', integrationsRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
