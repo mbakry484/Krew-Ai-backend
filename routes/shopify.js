@@ -88,21 +88,35 @@ router.post('/sync', async (req, res) => {
 // POST /webhook/shopify/product-update - Handle product create/update from Shopify
 router.post('/product-update', async (req, res) => {
   try {
-    const { user_id, product } = req.body;
+    const { shop_domain, product } = req.body;
 
-    if (!user_id || !product) {
+    if (!shop_domain || !product) {
       return res.status(400).json({
-        error: 'Invalid request body. Expected { user_id, product }'
+        error: 'Invalid request body. Expected { shop_domain, product }'
       });
     }
 
-    // TODO: Map user_id (shop) to brand_id in your database
-    const brandId = user_id; // Replace with actual brand_id lookup
+    // Look up brand_id from integrations table using shopify_shop_domain
+    const { data: integration, error: integrationError } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    if (integrationError || !integration || !integration.brand_id) {
+      return res.status(404).json({
+        error: 'Store not linked. Please link the Shopify store to a brand first.'
+      });
+    }
+
+    const brandId = integration.brand_id;
 
     const { data, error } = await supabase
       .from('products')
       .upsert({
         shopify_product_id: product.shopify_product_id,
+        user_id: brandId,
         brand_id: brandId,
         name: product.name,
         description: product.description,
@@ -115,7 +129,7 @@ router.post('/product-update', async (req, res) => {
 
     if (error) throw error;
 
-    console.log(`Product upserted: ${product.name} (${product.shopify_product_id})`);
+    console.log(`Product upserted: ${product.name} (${product.shopify_product_id}) for brand ${brandId}`);
 
     res.json({
       success: true,
@@ -131,22 +145,40 @@ router.post('/product-update', async (req, res) => {
 // POST /webhook/shopify/product-delete - Handle product deletion from Shopify
 router.post('/product-delete', async (req, res) => {
   try {
-    const { user_id, shopify_product_id } = req.body;
+    const { shop_domain, shopify_product_id } = req.body;
 
-    if (!user_id || !shopify_product_id) {
+    if (!shop_domain || !shopify_product_id) {
       return res.status(400).json({
-        error: 'Invalid request body. Expected { user_id, shopify_product_id }'
+        error: 'Invalid request body. Expected { shop_domain, shopify_product_id }'
       });
     }
 
+    // Look up brand_id from integrations table using shopify_shop_domain
+    const { data: integration, error: integrationError } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    if (integrationError || !integration || !integration.brand_id) {
+      return res.status(404).json({
+        error: 'Store not linked. Please link the Shopify store to a brand first.'
+      });
+    }
+
+    const brandId = integration.brand_id;
+
+    // Delete product belonging to this brand
     const { data, error } = await supabase
       .from('products')
       .delete()
-      .eq('shopify_product_id', shopify_product_id);
+      .eq('shopify_product_id', shopify_product_id)
+      .eq('brand_id', brandId);
 
     if (error) throw error;
 
-    console.log(`Product deleted: ${shopify_product_id}`);
+    console.log(`Product deleted: ${shopify_product_id} for brand ${brandId}`);
 
     res.json({
       success: true,
