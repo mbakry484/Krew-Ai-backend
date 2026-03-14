@@ -23,11 +23,23 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
 const corsOptions = {
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+    if (!origin) {
+      return callback(null, true);
     }
+
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow any localhost origin (for development)
+    const localhostPattern = /^http:\/\/localhost:\d+$/;
+    const localhostIPPattern = /^http:\/\/127\.0\.0\.1:\d+$/;
+    if (localhostPattern.test(origin) || localhostIPPattern.test(origin)) {
+      return callback(null, true);
+    }
+
+    callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -38,6 +50,33 @@ const corsOptions = {
 // Middleware
 app.use(cors(corsOptions));
 app.use(express.json());
+
+// Request logging middleware - Log all incoming requests
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log('\n' + '='.repeat(80));
+  console.log(`[${timestamp}] ${req.method} ${req.url}`);
+  console.log('Headers:', JSON.stringify(req.headers, null, 2));
+
+  if (req.query && Object.keys(req.query).length > 0) {
+    console.log('Query Params:', JSON.stringify(req.query, null, 2));
+  }
+
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+  }
+
+  // Capture response
+  const originalSend = res.send;
+  res.send = function(data) {
+    console.log(`Response Status: ${res.statusCode}`);
+    console.log('Response Body:', typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+    console.log('='.repeat(80) + '\n');
+    originalSend.call(this, data);
+  };
+
+  next();
+});
 
 // Health check
 app.get('/', (req, res) => {

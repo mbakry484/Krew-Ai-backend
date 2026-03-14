@@ -5,12 +5,12 @@ const supabase = require('../lib/supabase');
 // POST /products/sync - Bulk sync products from Shopify
 router.post('/sync', async (req, res) => {
   try {
-    const { user_id, products } = req.body;
+    const { shop_domain, products } = req.body;
 
     // Validate request body
-    if (!user_id || !Array.isArray(products)) {
+    if (!shop_domain || !Array.isArray(products)) {
       return res.status(400).json({
-        error: 'Invalid request body. Expected { user_id, products: [] }'
+        error: 'Invalid request body. Expected { shop_domain, products: [] }'
       });
     }
 
@@ -18,13 +18,28 @@ router.post('/sync', async (req, res) => {
       return res.json({ success: true, count: 0, message: 'No products to sync' });
     }
 
+    // Look up brand_id from integrations table using shopify_shop_domain
+    const { data: integration, error: integrationError } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    if (integrationError || !integration || !integration.brand_id) {
+      return res.status(404).json({
+        error: 'Store not linked. Please link the Shopify store to a brand first.'
+      });
+    }
+
+    const brandId = integration.brand_id;
     const syncedAt = new Date().toISOString();
 
     // Prepare products for upsert
     const productsToUpsert = products.map(product => ({
-      user_id,
+      user_id: brandId,
       shopify_product_id: product.shopify_product_id,
-      brand_id: product.brand_id || null, // Optional: for backwards compatibility
+      brand_id: brandId,
       name: product.name,
       description: product.description || null,
       price: product.price || null,
@@ -52,7 +67,7 @@ router.post('/sync', async (req, res) => {
       throw error;
     }
 
-    console.log(`✅ Synced ${products.length} products for user ${user_id}`);
+    console.log(`✅ Synced ${products.length} products for brand ${brandId} from shop ${shop_domain}`);
 
     res.json({
       success: true,

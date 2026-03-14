@@ -47,7 +47,23 @@ router.post('/signup', async (req, res) => {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-    // Insert new user into database
+    // Create a brand for the user
+    const { data: newBrand, error: brandError } = await supabase
+      .from('brands')
+      .insert([
+        {
+          name: business_name
+        }
+      ])
+      .select('id')
+      .single();
+
+    if (brandError) {
+      console.error('Error creating brand:', brandError);
+      return res.status(500).json({ error: 'Failed to create brand' });
+    }
+
+    // Insert new user into database with brand_id
     const { data: newUser, error: insertError } = await supabase
       .from('users')
       .insert([
@@ -56,14 +72,17 @@ router.post('/signup', async (req, res) => {
           password: hashedPassword,
           first_name,
           last_name,
-          business_name
+          business_name,
+          brand_id: newBrand.id
         }
       ])
-      .select('id, email')
+      .select('id, email, brand_id')
       .single();
 
     if (insertError) {
       console.error('Error inserting user:', insertError);
+      // Cleanup: delete the brand if user creation fails
+      await supabase.from('brands').delete().eq('id', newBrand.id);
       return res.status(500).json({ error: 'Failed to create user account' });
     }
 

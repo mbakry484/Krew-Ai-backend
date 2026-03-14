@@ -21,7 +21,7 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
       .select('*')
-      .eq('account_id', shop_domain)
+      .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify')
       .single();
 
@@ -34,8 +34,8 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
     // Update the integration to link it to the user
     const { error: updateError } = await supabase
       .from('integrations')
-      .update({ user_id: userId })
-      .eq('account_id', shop_domain)
+      .update({ brand_id: userId })
+      .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify');
 
     if (updateError) {
@@ -54,31 +54,82 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
 });
 
 /**
- * GET /integrations/shopify/status
- * Check if the authenticated user has a linked Shopify store
+ * GET /integrations/shopify/status?shop_domain=example.myshopify.com
+ * Check if a Shopify store is linked to a brand
  */
-router.get('/shopify/status', verifyToken, async (req, res) => {
+router.get('/shopify/status', async (req, res) => {
   try {
-    const userId = req.user.user_id;
+    const { shop_domain } = req.query;
 
-    // Check if user has a Shopify integration
+    // Validate required parameter
+    if (!shop_domain) {
+      return res.status(400).json({ error: 'shop_domain query parameter is required' });
+    }
+
+    // Query the integrations table by shopify_shop_domain
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
-      .select('account_id')
-      .eq('user_id', userId)
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify')
       .single();
 
+    // No row found
     if (fetchError || !integration) {
-      return res.json({ connected: false });
+      return res.json({ linked: false });
     }
 
-    res.json({
-      connected: true,
-      shop_domain: integration.account_id
-    });
+    // Check if brand_id is not null
+    if (integration.brand_id === null) {
+      return res.json({ linked: false });
+    }
+
+    // brand_id is not null, store is linked
+    res.json({ linked: true });
   } catch (error) {
     console.error('Shopify status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /integrations/shopify/status?shop_domain=example.myshopify.com
+ * Check if a Shopify store is linked (unprotected endpoint)
+ */
+router.get('/shopify/link-status', async (req, res) => {
+  try {
+    const { shop_domain } = req.query;
+
+    // Validate required parameter
+    if (!shop_domain) {
+      return res.status(400).json({ error: 'shop_domain query parameter is required' });
+    }
+
+    // Query the integrations table
+    const { data: integration, error: fetchError } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    // No row found
+    if (fetchError || !integration) {
+      return res.json({ linked: false });
+    }
+
+    // Row exists but brand_id is null
+    if (integration.brand_id === null) {
+      return res.json({ linked: false });
+    }
+
+    // Row exists and brand_id is not null
+    res.json({
+      linked: true,
+      user_id: integration.brand_id
+    });
+  } catch (error) {
+    console.error('Shopify link status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
