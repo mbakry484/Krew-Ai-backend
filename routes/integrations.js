@@ -25,6 +25,11 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
       });
     }
 
+    // Log and set BACKEND_URL with fallback
+    console.log('BACKEND_URL from env:', process.env.BACKEND_URL);
+    const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
+    console.log('Using BACKEND_URL:', backendUrl);
+
     // Generate state parameter by signing user_id and shop_domain with JWT_SECRET
     const state = jwt.sign(
       { user_id: userId, shop_domain },
@@ -34,7 +39,7 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
 
     // Build Shopify OAuth URL
     const scopes = 'read_products,write_products';
-    const redirectUri = `${process.env.BACKEND_URL}/integrations/shopify/callback`;
+    const redirectUri = `${backendUrl}/integrations/shopify/callback`;
     const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
 
     res.json({ oauth_url: oauthUrl });
