@@ -67,10 +67,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   const messageText = messagingEvent.message.text;
   const messageId = messagingEvent.message.mid;
 
-  console.log(`Received message from ${senderId}: ${messageText}`);
+  console.log(`\n📨 Received message from ${senderId}: ${messageText}`);
+  console.log(`   Recipient (Page ID): ${recipientId}`);
 
   try {
     // 1. Look up the brand using recipient.id (Instagram page ID)
+    console.log(`🔍 Looking up integration for page: ${recipientId}`);
     const { data: integration, error: integrationError } = await supabase
       .from('integrations')
       .select('brand_id, access_token')
@@ -78,52 +80,91 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .eq('platform', 'instagram')
       .maybeSingle();
 
-    if (integrationError || !integration || !integration.brand_id) {
-      console.error('Brand not found for Instagram page:', recipientId);
+    if (integrationError) {
+      console.error('❌ Error fetching integration:', integrationError);
       return;
     }
+
+    if (!integration) {
+      console.error('❌ No integration found for page:', recipientId);
+      console.error('   Make sure you have a row in integrations table with:');
+      console.error('   - instagram_page_id =', recipientId);
+      console.error('   - platform = \'instagram\'');
+      return;
+    }
+
+    if (!integration.brand_id) {
+      console.error('❌ Integration found but brand_id is NULL!');
+      console.error('   Update the integrations table to set brand_id');
+      return;
+    }
+
+    console.log(`✅ Integration found - brand_id: ${integration.brand_id}`);
 
     const { brand_id, access_token } = integration;
 
     // 2. Fetch knowledge base for the brand
+    console.log(`📚 Fetching knowledge base for brand: ${brand_id}`);
     const { data: knowledgeBaseRows, error: kbError } = await supabase
       .from('knowledge_base')
-      .select('question, answer')
+      .select('*')
       .eq('brand_id', brand_id);
 
     if (kbError) {
-      console.error('Error fetching knowledge base:', kbError);
+      console.error('❌ Error fetching knowledge base:', kbError);
+      console.error('   This is OK - AI will work without knowledge base');
+    } else {
+      console.log(`✅ Knowledge base: ${knowledgeBaseRows?.length || 0} entries`);
     }
 
     // 3. Fetch products for the brand
+    console.log(`🛍️  Fetching products for brand: ${brand_id}`);
     const { data: products, error: productsError } = await supabase
       .from('products')
       .select('name, description, price, in_stock')
       .eq('brand_id', brand_id);
 
     if (productsError) {
-      console.error('Error fetching products:', productsError);
+      console.error('❌ Error fetching products:', productsError);
+    } else {
+      console.log(`✅ Products: ${products?.length || 0} items`);
     }
 
-    // 4. Get or create conversation (upsert)
-    const { data: conversation, error: convUpsertError } = await supabase
+    // 4. Get or create conversation
+    console.log(`💬 Looking for existing conversation...`);
+    let { data: conversation, error: convError } = await supabase
       .from('conversations')
-      .upsert({
-        brand_id,
-        instagram_thread_id: senderId,
-        customer_instagram_id: senderId,
-        platform: 'instagram',
-        status: 'active',
-      }, {
-        onConflict: 'brand_id,customer_instagram_id',
-        ignoreDuplicates: false
-      })
-      .select()
-      .single();
+      .select('*')
+      .eq('brand_id', brand_id)
+      .eq('customer_id', senderId)
+      .eq('platform', 'instagram')
+      .maybeSingle();
 
-    if (convUpsertError) {
-      console.error('Error upserting conversation:', convUpsertError);
-      return;
+    if (convError) {
+      console.error('❌ Error fetching conversation:', convError);
+    }
+
+    if (!conversation) {
+      console.log(`📝 Creating new conversation...`);
+      const { data: newConv, error: createError } = await supabase
+        .from('conversations')
+        .insert({
+          brand_id,
+          customer_id: senderId,
+          platform: 'instagram',
+          status: 'active',
+        })
+        .select()
+        .single();
+
+      if (createError) {
+        console.error('❌ Error creating conversation:', createError);
+        return;
+      }
+      conversation = newConv;
+      console.log(`✅ Conversation created - ID: ${conversation.id}`);
+    } else {
+      console.log(`✅ Existing conversation found - ID: ${conversation.id}`);
     }
 
     // 5. Save incoming message
@@ -141,15 +182,19 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
 
     // 6. Generate AI reply using OpenAI
+    console.log(`🤖 Generating AI reply...`);
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
       products || [],
       brand_id
     );
+    console.log(`✅ AI reply generated: "${aiReply.substring(0, 100)}${aiReply.length > 100 ? '...' : ''}"`);
 
     // 7. Send reply via Meta API
+    console.log(`📤 Sending reply to customer via Meta API...`);
     const sendResponse = await sendDM(senderId, aiReply, access_token);
+    console.log(`✅ Reply sent successfully via Meta API`);
 
     // 8. Save AI reply to database
     const { error: outboundMsgError } = await supabase
