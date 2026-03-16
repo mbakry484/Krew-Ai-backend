@@ -2,6 +2,118 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+
+/**
+ * POST /integrations/shopify/connect
+ * Initiate Shopify OAuth flow (protected route)
+ */
+router.post('/shopify/connect', verifyToken, async (req, res) => {
+  try {
+    const { shop_domain } = req.body;
+    const userId = req.user.user_id;
+
+    // Validate required field
+    if (!shop_domain) {
+      return res.status(400).json({ error: 'shop_domain is required' });
+    }
+
+    // Validate shop_domain format - must end in .myshopify.com
+    if (!shop_domain.endsWith('.myshopify.com')) {
+      return res.status(400).json({
+        error: 'Invalid shop_domain format. Must end in .myshopify.com'
+      });
+    }
+
+    // Generate state parameter by signing user_id and shop_domain with JWT_SECRET
+    const state = jwt.sign(
+      { user_id: userId, shop_domain },
+      process.env.JWT_SECRET,
+      { expiresIn: '10m' } // State expires in 10 minutes for security
+    );
+
+    // Build Shopify OAuth URL
+    const scopes = 'read_products,write_products';
+    const redirectUri = `${process.env.BACKEND_URL}/integrations/shopify/callback`;
+    const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
+
+    res.json({ oauth_url: oauthUrl });
+  } catch (error) {
+    console.error('Shopify OAuth initiation error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /integrations/shopify/callback
+ * Shopify OAuth callback (unprotected - called by Shopify)
+ */
+router.get('/shopify/callback', async (req, res) => {
+  try {
+    const { code, shop, state } = req.query;
+
+    // Validate required parameters
+    if (!code || !shop || !state) {
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=missing_params`);
+    }
+
+    // Verify and decode state to extract user_id
+    let decoded;
+    try {
+      decoded = jwt.verify(state, process.env.JWT_SECRET);
+    } catch (error) {
+      console.error('Invalid or expired state:', error);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=invalid_state`);
+    }
+
+    const { user_id, shop_domain } = decoded;
+
+    // Verify that the shop matches the one in the state
+    if (shop !== shop_domain) {
+      console.error('Shop mismatch:', shop, shop_domain);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=shop_mismatch`);
+    }
+
+    // Exchange code for access_token
+    const tokenExchangeUrl = `https://${shop}/admin/oauth/access_token`;
+    const tokenResponse = await axios.post(tokenExchangeUrl, {
+      client_id: process.env.SHOPIFY_API_KEY,
+      client_secret: process.env.SHOPIFY_API_SECRET,
+      code
+    });
+
+    const { access_token } = tokenResponse.data;
+
+    if (!access_token) {
+      console.error('No access token received from Shopify');
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=no_token`);
+    }
+
+    // Upsert into integrations table
+    const { error: upsertError } = await supabase
+      .from('integrations')
+      .upsert({
+        brand_id: user_id,
+        shopify_shop_domain: shop,
+        access_token,
+        platform: 'shopify'
+      }, {
+        onConflict: 'shopify_shop_domain'
+      });
+
+    if (upsertError) {
+      console.error('Error upserting integration:', upsertError);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=db_error`);
+    }
+
+    // Redirect to frontend with success
+    res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=connected`);
+  } catch (error) {
+    console.error('Shopify OAuth callback error:', error);
+    res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=server_error`);
+  }
+});
 
 /**
  * POST /integrations/shopify/link
