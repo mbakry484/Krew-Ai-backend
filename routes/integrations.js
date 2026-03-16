@@ -186,38 +186,31 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
 });
 
 /**
- * GET /integrations/shopify/status?shop_domain=example.myshopify.com
- * Check if a Shopify store is linked to a brand
+ * GET /integrations/shopify/status
+ * Check if the authenticated user has a linked Shopify store
  */
-router.get('/shopify/status', async (req, res) => {
+router.get('/shopify/status', verifyToken, async (req, res) => {
   try {
-    const { shop_domain } = req.query;
+    const userId = req.user.user_id;
 
-    // Validate required parameter
-    if (!shop_domain) {
-      return res.status(400).json({ error: 'shop_domain query parameter is required' });
-    }
-
-    // Query the integrations table by shopify_shop_domain
+    // Query the integrations table by brand_id
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
-      .select('brand_id')
-      .eq('shopify_shop_domain', shop_domain)
+      .select('*')
+      .eq('brand_id', userId)
       .eq('platform', 'shopify')
       .single();
 
-    // No row found
+    // No row found or error
     if (fetchError || !integration) {
       return res.json({ linked: false });
     }
 
-    // Check if brand_id is not null
-    if (integration.brand_id === null) {
-      return res.json({ linked: false });
-    }
-
-    // brand_id is not null, store is linked
-    res.json({ linked: true });
+    // Integration found - return linked status with shop_domain
+    res.json({
+      linked: true,
+      shop_domain: integration.shopify_shop_domain
+    });
   } catch (error) {
     console.error('Shopify status error:', error);
     res.status(500).json({ error: 'Internal server error' });
