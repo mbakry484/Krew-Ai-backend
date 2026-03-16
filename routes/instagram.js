@@ -29,32 +29,55 @@ router.get('/', (req, res) => {
 router.post('/', async (req, res) => {
   const body = req.body;
 
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`📥 WEBHOOK RECEIVED - ${new Date().toISOString()}`);
+  console.log(`Object type: ${body.object}`);
+  console.log(`Number of entries: ${body.entry?.length || 0}`);
+
   try {
-    // Check if this is a message event
-    if (body.object === 'instagram') {
+    // Check if this is a message event (can be 'instagram' or 'page')
+    if (body.object === 'instagram' || body.object === 'page') {
+      console.log(`✅ Valid webhook object type: ${body.object}`);
+
       for (const entry of body.entry) {
-        for (const messagingEvent of entry.messaging) {
+        console.log(`\n📦 Processing entry ID: ${entry.id}`);
+        console.log(`   Messaging events: ${entry.messaging?.length || 0}`);
+
+        for (const messagingEvent of entry.messaging || []) {
           // Extract sender and recipient IDs
           const senderId = messagingEvent.sender?.id;
           const recipientId = messagingEvent.recipient?.id;
 
+          console.log(`   👤 Sender: ${senderId}`);
+          console.log(`   📍 Recipient: ${recipientId}`);
+          console.log(`   📝 Has message: ${!!messagingEvent.message}`);
+          console.log(`   🔁 Is echo: ${messagingEvent.message?.is_echo || false}`);
+
           // Ignore messages sent by the page itself (avoid reply loops)
           if (senderId === recipientId) {
-            console.log('Ignoring message sent by page itself');
+            console.log('   ⏭️  Ignoring message sent by page itself');
             continue;
           }
 
           // Only process incoming messages (not echoes)
           if (messagingEvent.message && !messagingEvent.message.is_echo) {
+            console.log(`   ✅ Processing message: "${messagingEvent.message.text}"`);
             await handleIncomingMessage(messagingEvent, recipientId);
+          } else {
+            console.log(`   ⏭️  Skipping (echo or no message)`);
           }
         }
       }
+    } else {
+      console.log(`⚠️  Unknown webhook object type: ${body.object}`);
     }
   } catch (error) {
-    console.error('Error processing webhook:', error);
+    console.error('❌ Error processing webhook:', error);
+    console.error('Stack trace:', error.stack);
   } finally {
     // Always return 200 regardless of errors
+    console.log(`\n✅ Responding with 200 OK`);
+    console.log(`${'='.repeat(80)}\n`);
     res.sendStatus(200);
   }
 });
@@ -168,6 +191,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
 
     // 5. Save incoming message
+    console.log(`💾 Saving customer message to database...`);
     const { error: inboundMsgError } = await supabase
       .from('messages')
       .insert({
@@ -178,7 +202,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       });
 
     if (inboundMsgError) {
-      console.error('Error saving inbound message:', inboundMsgError);
+      console.error('❌ Error saving inbound message:', inboundMsgError);
+    } else {
+      console.log(`✅ Customer message saved`);
     }
 
     // 6. Generate AI reply using OpenAI
@@ -197,6 +223,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     console.log(`✅ Reply sent successfully via Meta API`);
 
     // 8. Save AI reply to database
+    console.log(`💾 Saving AI message to database...`);
     const { error: outboundMsgError } = await supabase
       .from('messages')
       .insert({
@@ -207,10 +234,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       });
 
     if (outboundMsgError) {
-      console.error('Error saving outbound message:', outboundMsgError);
+      console.error('❌ Error saving outbound message:', outboundMsgError);
+    } else {
+      console.log(`✅ AI message saved to database`);
     }
 
-    console.log(`✅ Sent AI reply to ${senderId}`);
+    console.log(`\n🎉 SUCCESS! AI reply sent to ${senderId}`);
   } catch (error) {
     console.error('Error handling message:', error);
 
