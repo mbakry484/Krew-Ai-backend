@@ -3,7 +3,6 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
-const axios = require('axios');
 
 /**
  * POST /integrations/shopify/connect
@@ -77,13 +76,25 @@ router.get('/shopify/callback', async (req, res) => {
 
     // Exchange code for access_token
     const tokenExchangeUrl = `https://${shop}/admin/oauth/access_token`;
-    const tokenResponse = await axios.post(tokenExchangeUrl, {
-      client_id: process.env.SHOPIFY_API_KEY,
-      client_secret: process.env.SHOPIFY_API_SECRET,
-      code
+    const tokenResponse = await fetch(tokenExchangeUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        client_id: process.env.SHOPIFY_API_KEY,
+        client_secret: process.env.SHOPIFY_API_SECRET,
+        code
+      })
     });
 
-    const { access_token } = tokenResponse.data;
+    if (!tokenResponse.ok) {
+      console.error('Failed to exchange code for token:', tokenResponse.status);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=token_exchange_failed`);
+    }
+
+    const tokenData = await tokenResponse.json();
+    const { access_token } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
