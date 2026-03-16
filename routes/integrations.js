@@ -188,6 +188,8 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
 /**
  * GET /integrations/shopify/status
  * Check if the authenticated user has a linked Shopify store
+ * Protected endpoint - requires JWT authentication
+ * Used by: Krew frontend dashboard
  */
 router.get('/shopify/status', verifyToken, async (req, res) => {
   try {
@@ -196,21 +198,18 @@ router.get('/shopify/status', verifyToken, async (req, res) => {
     // Query the integrations table by brand_id
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
-      .select('*')
+      .select('brand_id')
       .eq('brand_id', userId)
       .eq('platform', 'shopify')
-      .single();
+      .maybeSingle();
 
     // No row found or error
     if (fetchError || !integration) {
       return res.json({ linked: false });
     }
 
-    // Integration found - return linked status with shop_domain
-    res.json({
-      linked: true,
-      shop_domain: integration.shopify_shop_domain
-    });
+    // Integration found and brand_id is not null
+    res.json({ linked: true });
   } catch (error) {
     console.error('Shopify status error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -218,10 +217,12 @@ router.get('/shopify/status', verifyToken, async (req, res) => {
 });
 
 /**
- * GET /integrations/shopify/status?shop_domain=example.myshopify.com
- * Check if a Shopify store is linked (unprotected endpoint)
+ * GET /integrations/shopify/app-status?shop_domain=example.myshopify.com
+ * Check if a Shopify store is linked to a brand
+ * Unprotected endpoint - accepts shop_domain as query param
+ * Used by: Shopify app embedded in Shopify admin
  */
-router.get('/shopify/link-status', async (req, res) => {
+router.get('/shopify/app-status', async (req, res) => {
   try {
     const { shop_domain } = req.query;
 
@@ -236,9 +237,9 @@ router.get('/shopify/link-status', async (req, res) => {
       .select('brand_id')
       .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify')
-      .single();
+      .maybeSingle();
 
-    // No row found
+    // No row found or error
     if (fetchError || !integration) {
       return res.json({ linked: false });
     }
@@ -249,12 +250,9 @@ router.get('/shopify/link-status', async (req, res) => {
     }
 
     // Row exists and brand_id is not null
-    res.json({
-      linked: true,
-      user_id: integration.brand_id
-    });
+    res.json({ linked: true });
   } catch (error) {
-    console.error('Shopify link status error:', error);
+    console.error('Shopify app-status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
