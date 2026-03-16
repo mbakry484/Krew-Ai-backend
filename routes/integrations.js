@@ -57,9 +57,12 @@ router.get('/shopify/callback', async (req, res) => {
   try {
     const { code, shop, state } = req.query;
 
+    // Set FRONTEND_URL with fallback
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
     // Validate required parameters
     if (!code || !shop || !state) {
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=missing_params`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=missing_params`);
     }
 
     // Verify and decode state to extract user_id
@@ -68,7 +71,7 @@ router.get('/shopify/callback', async (req, res) => {
       decoded = jwt.verify(state, process.env.JWT_SECRET);
     } catch (error) {
       console.error('Invalid or expired state:', error);
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=invalid_state`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=invalid_state`);
     }
 
     const { user_id, shop_domain } = decoded;
@@ -76,7 +79,7 @@ router.get('/shopify/callback', async (req, res) => {
     // Verify that the shop matches the one in the state
     if (shop !== shop_domain) {
       console.error('Shop mismatch:', shop, shop_domain);
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=shop_mismatch`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=shop_mismatch`);
     }
 
     // Exchange code for access_token
@@ -95,7 +98,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     if (!tokenResponse.ok) {
       console.error('Failed to exchange code for token:', tokenResponse.status);
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=token_exchange_failed`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=token_exchange_failed`);
     }
 
     const tokenData = await tokenResponse.json();
@@ -103,7 +106,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     if (!access_token) {
       console.error('No access token received from Shopify');
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=no_token`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
 
     // Upsert into integrations table
@@ -120,14 +123,15 @@ router.get('/shopify/callback', async (req, res) => {
 
     if (upsertError) {
       console.error('Error upserting integration:', upsertError);
-      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=db_error`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=db_error`);
     }
 
     // Redirect to frontend with success
-    res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=connected`);
+    res.redirect(`${frontendUrl}/dashboard?shopify=connected`);
   } catch (error) {
     console.error('Shopify OAuth callback error:', error);
-    res.redirect(`${process.env.FRONTEND_URL}/dashboard?shopify=error&reason=server_error`);
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=server_error`);
   }
 });
 
