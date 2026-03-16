@@ -29,30 +29,40 @@ router.get('/', (req, res) => {
 router.post('/', async (req, res) => {
   const body = req.body;
 
-  // Acknowledge receipt immediately
-  res.sendStatus(200);
-
   try {
     // Check if this is a message event
     if (body.object === 'instagram') {
       for (const entry of body.entry) {
         for (const messagingEvent of entry.messaging) {
+          // Extract sender and recipient IDs
+          const senderId = messagingEvent.sender?.id;
+          const recipientId = messagingEvent.recipient?.id;
+
+          // Ignore messages sent by the page itself (avoid reply loops)
+          if (senderId === recipientId) {
+            console.log('Ignoring message sent by page itself');
+            continue;
+          }
+
           // Only process incoming messages (not echoes)
           if (messagingEvent.message && !messagingEvent.message.is_echo) {
-            await handleIncomingMessage(messagingEvent, entry.id);
+            await handleIncomingMessage(messagingEvent, recipientId);
           }
         }
       }
     }
   } catch (error) {
     console.error('Error processing webhook:', error);
+  } finally {
+    // Always return 200 regardless of errors
+    res.sendStatus(200);
   }
 });
 
 /**
  * Handle an incoming Instagram DM
  */
-async function handleIncomingMessage(messagingEvent, pageId) {
+async function handleIncomingMessage(messagingEvent, recipientId) {
   const senderId = messagingEvent.sender.id;
   const messageText = messagingEvent.message.text;
   const messageId = messagingEvent.message.mid;
@@ -60,26 +70,26 @@ async function handleIncomingMessage(messagingEvent, pageId) {
   console.log(`Received message from ${senderId}: ${messageText}`);
 
   try {
-    // 1. Identify the brand from integrations table using pageId
+    // 1. Look up the brand using recipient.id (Instagram page ID)
     const { data: integration, error: integrationError } = await supabase
       .from('integrations')
       .select('brand_id, access_token')
-      .eq('instagram_page_id', pageId)
-      .single();
+      .eq('instagram_page_id', recipientId)
+      .eq('platform', 'instagram')
+      .maybeSingle();
 
-    if (integrationError || !integration) {
-      console.error('Brand not found for page:', pageId);
+    if (integrationError || !integration || !integration.brand_id) {
+      console.error('Brand not found for Instagram page:', recipientId);
       return;
     }
 
     const { brand_id, access_token } = integration;
 
     // 2. Fetch knowledge base for the brand
-    const { data: knowledgeBase, error: kbError } = await supabase
+    const { data: knowledgeBaseRows, error: kbError } = await supabase
       .from('knowledge_base')
-      .select('*')
-      .eq('brand_id', brand_id)
-      .single();
+      .select('question, answer')
+      .eq('brand_id', brand_id);
 
     if (kbError) {
       console.error('Error fetching knowledge base:', kbError);
@@ -88,69 +98,74 @@ async function handleIncomingMessage(messagingEvent, pageId) {
     // 3. Fetch products for the brand
     const { data: products, error: productsError } = await supabase
       .from('products')
-      .select('*')
+      .select('name, description, price, in_stock')
       .eq('brand_id', brand_id);
 
     if (productsError) {
       console.error('Error fetching products:', productsError);
     }
 
-    // 4. Get or create conversation
-    let { data: conversation, error: convError } = await supabase
+    // 4. Get or create conversation (upsert)
+    const { data: conversation, error: convUpsertError } = await supabase
       .from('conversations')
-      .select('id')
-      .eq('brand_id', brand_id)
-      .eq('customer_id', senderId)
-      .eq('platform', 'instagram')
+      .upsert({
+        brand_id,
+        instagram_thread_id: senderId,
+        customer_instagram_id: senderId,
+        platform: 'instagram',
+        status: 'active',
+      }, {
+        onConflict: 'brand_id,customer_instagram_id',
+        ignoreDuplicates: false
+      })
+      .select()
       .single();
 
-    if (convError || !conversation) {
-      // Create new conversation
-      const { data: newConv, error: createError } = await supabase
-        .from('conversations')
-        .insert({
-          brand_id,
-          customer_id: senderId,
-          platform: 'instagram',
-          status: 'active',
-        })
-        .select()
-        .single();
-
-      if (createError) {
-        console.error('Error creating conversation:', createError);
-        return;
-      }
-      conversation = newConv;
+    if (convUpsertError) {
+      console.error('Error upserting conversation:', convUpsertError);
+      return;
     }
 
     // 5. Save incoming message
-    await supabase.from('messages').insert({
-      conversation_id: conversation.id,
-      sender: 'customer',
-      content: messageText,
-      platform_message_id: messageId,
-    });
+    const { error: inboundMsgError } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: conversation.id,
+        sender: 'customer',
+        content: messageText,
+        platform_message_id: messageId,
+      });
 
-    // 6. Generate AI reply using Claude
+    if (inboundMsgError) {
+      console.error('Error saving inbound message:', inboundMsgError);
+    }
+
+    // 6. Generate AI reply using OpenAI
     const aiReply = await generateReply(
       messageText,
-      knowledgeBase,
-      products || []
+      knowledgeBaseRows || [],
+      products || [],
+      brand_id
     );
 
     // 7. Send reply via Meta API
     const sendResponse = await sendDM(senderId, aiReply, access_token);
 
     // 8. Save AI reply to database
-    await supabase.from('messages').insert({
-      conversation_id: conversation.id,
-      sender: 'ai',
-      content: aiReply,
-      platform_message_id: sendResponse.message_id,
-    });
+    const { error: outboundMsgError } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: conversation.id,
+        sender: 'ai',
+        content: aiReply,
+        platform_message_id: sendResponse.message_id,
+      });
 
-    console.log(`Sent AI reply to ${senderId}`);
+    if (outboundMsgError) {
+      console.error('Error saving outbound message:', outboundMsgError);
+    }
+
+    console.log(`✅ Sent AI reply to ${senderId}`);
   } catch (error) {
     console.error('Error handling message:', error);
 
@@ -159,8 +174,9 @@ async function handleIncomingMessage(messagingEvent, pageId) {
       const { data: integration } = await supabase
         .from('integrations')
         .select('access_token')
-        .eq('instagram_page_id', pageId)
-        .single();
+        .eq('instagram_page_id', recipientId)
+        .eq('platform', 'instagram')
+        .maybeSingle();
 
       if (integration?.access_token) {
         await sendDM(
