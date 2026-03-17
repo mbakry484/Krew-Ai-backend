@@ -241,10 +241,20 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
     console.log(`\n🎉 SUCCESS! AI reply sent to ${senderId}`);
   } catch (error) {
-    console.error('Error handling message:', error);
+    console.error('\n❌ ERROR HANDLING MESSAGE:');
+    console.error('   Error type:', error.name);
+    console.error('   Error message:', error.message);
+
+    if (error.message.includes('Connection error') || error.message.includes('API key')) {
+      console.error('   ⚠️  This looks like an OpenAI API issue!');
+      console.error('   Check your OPENAI_API_KEY environment variable');
+    }
+
+    console.error('   Stack trace:', error.stack);
 
     // Send fallback message
     try {
+      console.log('\n📤 Attempting to send fallback message...');
       const { data: integration } = await supabase
         .from('integrations')
         .select('access_token')
@@ -258,9 +268,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
           "Sorry, I'm having trouble processing your message right now. Please try again later or contact our support team.",
           integration.access_token
         );
+        console.log('✅ Fallback message sent successfully');
+      } else {
+        console.error('❌ Could not send fallback - no access token found');
       }
     } catch (fallbackError) {
-      console.error('Error sending fallback message:', fallbackError);
+      console.error('❌ Error sending fallback message:', fallbackError.message);
     }
   }
 }
