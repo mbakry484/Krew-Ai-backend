@@ -190,7 +190,22 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       console.log(`✅ Existing conversation found - ID: ${conversation.id}`);
     }
 
-    // 5. Save incoming message
+    // 5. Fetch conversation history (last 10 messages)
+    console.log(`📜 Fetching conversation history...`);
+    const { data: previousMessages, error: historyError } = await supabase
+      .from('messages')
+      .select('sender, content')
+      .eq('conversation_id', conversation.id)
+      .order('sent_at', { ascending: true })
+      .limit(10);
+
+    if (historyError) {
+      console.error('❌ Error fetching conversation history:', historyError);
+    } else {
+      console.log(`✅ Conversation history: ${previousMessages?.length || 0} messages`);
+    }
+
+    // 6. Save incoming message
     console.log(`💾 Saving customer message to database...`);
     const { error: inboundMsgError } = await supabase
       .from('messages')
@@ -207,22 +222,31 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       console.log(`✅ Customer message saved`);
     }
 
-    // 6. Generate AI reply using OpenAI
-    console.log(`🤖 Generating AI reply...`);
+    // 7. Map conversation history to OpenAI message format
+    console.log(`🔄 Mapping conversation history to OpenAI format...`);
+    const conversationHistory = (previousMessages || []).map(msg => ({
+      role: msg.sender === 'customer' ? 'user' : 'assistant',
+      content: msg.content
+    }));
+    console.log(`✅ Conversation history mapped: ${conversationHistory.length} messages`);
+
+    // 8. Generate AI reply using OpenAI with conversation history
+    console.log(`🤖 Generating AI reply with conversation context...`);
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
       products || [],
-      brand_id
+      brand_id,
+      conversationHistory
     );
     console.log(`✅ AI reply generated: "${aiReply.substring(0, 100)}${aiReply.length > 100 ? '...' : ''}"`);
 
-    // 7. Send reply via Meta API
+    // 9. Send reply via Meta API
     console.log(`📤 Sending reply to customer via Meta API...`);
     const sendResponse = await sendDM(senderId, aiReply, access_token);
     console.log(`✅ Reply sent successfully via Meta API`);
 
-    // 8. Save AI reply to database
+    // 10. Save AI reply to database
     console.log(`💾 Saving AI message to database...`);
     const { error: outboundMsgError } = await supabase
       .from('messages')
