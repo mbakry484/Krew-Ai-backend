@@ -206,7 +206,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .from('messages')
       .select('sender, content')
       .eq('conversation_id', conversation.id)
-      .order('sent_at', { ascending: true })
+      .order('created_at', { ascending: true })
       .limit(10);
 
     if (historyError) {
