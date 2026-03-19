@@ -34,6 +34,9 @@ router.post('/', async (req, res) => {
   console.log(`Object type: ${body.object}`);
   console.log(`Number of entries: ${body.entry?.length || 0}`);
 
+  // Detailed webhook structure logging
+  console.log('\n🔍 Full webhook body:', JSON.stringify(body, null, 2));
+
   try {
     // Check if this is a message event (can be 'instagram' or 'page')
     if (body.object === 'instagram' || body.object === 'page') {
@@ -48,6 +51,11 @@ router.post('/', async (req, res) => {
           const senderId = messagingEvent.sender?.id;
           const recipientId = messagingEvent.recipient?.id;
 
+          console.log('\n📌 ID ANALYSIS:');
+          console.log(`   Object type: ${body.object}`);
+          console.log(`   Entry ID: ${entry.id}`);
+          console.log(`   Sender ID: ${senderId}`);
+          console.log(`   Recipient ID: ${recipientId}`);
           console.log(`   👤 Sender: ${senderId}`);
           console.log(`   📍 Recipient: ${recipientId}`);
           console.log(`   📝 Has message: ${!!messagingEvent.message}`);
@@ -91,11 +99,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   const messageId = messagingEvent.message.mid;
 
   console.log(`\n📨 Received message from ${senderId}: ${messageText}`);
-  console.log(`   Recipient (Page ID): ${recipientId}`);
+  console.log(`   Recipient ID being used for lookup: ${recipientId}`);
 
   try {
-    // 1. Look up the brand using recipient.id (Instagram page ID)
-    console.log(`🔍 Looking up integration for page: ${recipientId}`);
+    // 1. Look up the brand using recipient.id
+    console.log('\n🔍 INTEGRATION LOOKUP:');
+    console.log(`   Searching for instagram_page_id = ${recipientId}`);
+    console.log(`   Platform = 'instagram'`);
     const { data: integration, error: integrationError } = await supabase
       .from('integrations')
       .select('brand_id, access_token')
