@@ -30,26 +30,23 @@ router.post('/', async (req, res) => {
   const body = req.body;
 
   try {
-    // Check if this is a message event (can be 'instagram' or 'page')
     if (body.object === 'instagram' || body.object === 'page') {
       for (const entry of body.entry) {
         for (const messagingEvent of entry.messaging || []) {
           const senderId = messagingEvent.sender?.id;
           const recipientId = messagingEvent.recipient?.id;
 
-          // Ignore messages sent by the page itself (avoid reply loops)
           if (senderId === recipientId) continue;
 
-          // Only process incoming messages (not echoes or read receipts)
           if (messagingEvent.message && !messagingEvent.message.is_echo) {
-            console.log(`\n📨 Message from ${senderId}: "${messagingEvent.message.text}"`);
+            console.log(`📨 ${senderId}: "${messagingEvent.message.text}"`);
             await handleIncomingMessage(messagingEvent, recipientId);
           }
         }
       }
     }
   } catch (error) {
-    console.error('❌ Webhook error:', error.message);
+    console.error(`❌ Error: ${error.message}`);
   } finally {
     res.sendStatus(200);
   }
@@ -65,33 +62,33 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
   try {
     // 1. Look up the brand using recipient.id
-    const { data: integration, error: integrationError } = await supabase
+    const { data: integration } = await supabase
       .from('integrations')
       .select('brand_id, access_token')
       .eq('instagram_page_id', recipientId)
       .eq('platform', 'instagram')
       .maybeSingle();
 
-    if (integrationError || !integration?.brand_id) {
-      console.error('❌ No integration found for page:', recipientId);
+    if (!integration?.brand_id) {
+      console.error(`❌ Error: No integration found for page ${recipientId}`);
       return;
     }
 
     const { brand_id, access_token } = integration;
+    console.log(`🔍 Brand found: ${brand_id}`);
 
-    // 2. Fetch knowledge base for the brand
+    // 2. Fetch knowledge base and products
     const { data: knowledgeBaseRows } = await supabase
       .from('knowledge_base')
       .select('*')
       .eq('brand_id', brand_id);
 
-    // 3. Fetch products for the brand
     const { data: products } = await supabase
       .from('products')
       .select('name, description, price, in_stock')
       .eq('brand_id', brand_id);
 
-    // 4. Get or create conversation
+    // 3. Get or create conversation
     let { data: conversation } = await supabase
       .from('conversations')
       .select('*')
@@ -100,7 +97,6 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .eq('platform', 'instagram')
       .maybeSingle();
 
-    // Initialize default metadata
     const defaultMetadata = {
       discussed_products: [],
       current_order: null,
@@ -109,34 +105,35 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     };
 
     if (!conversation) {
-      // Create new conversation with metadata (if column exists, otherwise ignore)
-      const insertData = {
-        brand_id,
-        customer_id: senderId,
-        platform: 'instagram',
-        status: 'active'
-      };
-
-      // Try to include metadata, if it fails the column doesn't exist yet
-      try {
-        insertData.metadata = defaultMetadata;
-      } catch (e) {
-        // Column doesn't exist, skip it
-      }
-
       const { data: newConv } = await supabase
         .from('conversations')
-        .insert(insertData)
+        .insert({
+          brand_id,
+          customer_id: senderId,
+          platform: 'instagram',
+          status: 'active',
+          metadata: defaultMetadata
+        })
         .select()
         .single();
 
       conversation = newConv;
     }
 
-    // Load conversation metadata (with fallback if column doesn't exist)
+    // Load metadata from database (CRITICAL - this is Luna's memory)
     let metadata = defaultMetadata;
-    if (conversation && typeof conversation.metadata === 'object') {
+    if (conversation?.metadata && typeof conversation.metadata === 'object') {
       metadata = { ...defaultMetadata, ...conversation.metadata };
+    }
+    console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
+
+    // 4. Update collected info BEFORE generating reply (capture customer's response to previous awaiting state)
+    if (metadata.awaiting === 'name') {
+      metadata.collected_info.name = messageText.trim();
+    } else if (metadata.awaiting === 'phone') {
+      metadata.collected_info.phone = messageText.trim();
+    } else if (metadata.awaiting === 'address') {
+      metadata.collected_info.address = messageText.trim();
     }
 
     // 5. Fetch conversation history (last 10 messages)
@@ -157,7 +154,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         platform_message_id: messageId,
       });
 
-    // 7. Map conversation history to OpenAI message format
+    // 7. Map conversation history to OpenAI format
     const conversationHistory = (previousMessages || []).map(msg => ({
       role: msg.sender === 'customer' ? 'user' : 'assistant',
       content: msg.content
@@ -171,8 +168,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
 
-    // 9. Generate AI reply using OpenAI with conversation history and metadata
-    console.log(`🤖 Generating reply...`);
+    // 9. Generate AI reply with current metadata state
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
@@ -182,8 +178,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       metadata,
       businessName
     );
+    console.log(`🤖 Luna reply: "${aiReply}"`);
 
-    // 10. Parse and update metadata based on AI reply and customer message
+    // 10. Update metadata based on AI reply (detect new products, order intent, and what Luna is asking for)
     metadata = await updateMetadataFromConversation(
       messageText,
       aiReply,
@@ -195,18 +192,15 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 11. Check if ORDER_READY was detected
     let finalReply = aiReply;
     if (aiReply.includes('ORDER_READY')) {
-      console.log(`🎉 Creating order...`);
       finalReply = await handleOrderCreation(brand_id, metadata, aiReply);
-
-      // Reset order state after successful order
       metadata.current_order = null;
       metadata.collected_info = { name: null, phone: null, address: null };
       metadata.awaiting = null;
     }
 
     // 12. Send reply via Meta API
-    const sendResponse = await sendDM(senderId, finalReply, access_token);
-    console.log(`✅ Reply sent`);
+    await sendDM(senderId, finalReply, access_token);
+    console.log(`✅ Sent to ${senderId}`);
 
     // 13. Save AI reply to database
     await supabase
@@ -215,20 +209,16 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         conversation_id: conversation.id,
         sender: 'ai',
         content: finalReply,
-        platform_message_id: sendResponse.message_id,
       });
 
-    // 14. Save updated metadata to conversation (if column exists)
-    try {
-      await supabase
-        .from('conversations')
-        .update({ metadata })
-        .eq('id', conversation.id);
-    } catch (e) {
-      // Metadata column doesn't exist yet, skip
-    }
+    // 14. Save updated metadata (CRITICAL - this preserves order state across messages)
+    await supabase
+      .from('conversations')
+      .update({ metadata })
+      .eq('id', conversation.id);
+
   } catch (error) {
-    console.error('❌ Error:', error.message);
+    console.error(`❌ Error: ${error.message}`);
 
     // Send fallback message
     try {
@@ -247,7 +237,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         );
       }
     } catch (fallbackError) {
-      console.error('❌ Fallback failed:', fallbackError.message);
+      console.error(`❌ Error: ${fallbackError.message}`);
     }
   }
 }
@@ -279,19 +269,7 @@ async function updateMetadataFromConversation(customerMessage, aiReply, metadata
       }
     });
 
-    // Update collected_info based on awaiting state
-    if (metadata.awaiting === 'name') {
-      metadata.collected_info.name = customerMessage.trim();
-    } else if (metadata.awaiting === 'phone') {
-      metadata.collected_info.phone = customerMessage.trim();
-    } else if (metadata.awaiting === 'address') {
-      metadata.collected_info.address = customerMessage.trim();
-    }
-
-    // Detect what Luna is currently asking for
-    metadata.awaiting = detectAwaitingState(aiReply, metadata);
-
-    // Detect if ordering a product
+    // Detect if ordering a product (if not already ordering)
     if (!metadata.current_order && detectOrderIntent(customerMessage, aiReply)) {
       const orderedProduct = identifyOrderedProduct(
         customerMessage,
@@ -304,9 +282,12 @@ async function updateMetadataFromConversation(customerMessage, aiReply, metadata
       }
     }
 
+    // Detect what Luna is currently asking for (based on her reply)
+    metadata.awaiting = detectAwaitingState(aiReply, metadata);
+
     return metadata;
   } catch (error) {
-    console.error('❌ Error updating metadata:', error);
+    console.error(`❌ Error: ${error.message}`);
     return metadata; // Return unchanged on error
   }
 }
