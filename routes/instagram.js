@@ -186,6 +186,16 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
           customer_id: senderId,
           platform: 'instagram',
           status: 'active',
+          metadata: {
+            discussed_products: [],
+            current_order: null,
+            collected_info: {
+              name: null,
+              phone: null,
+              address: null
+            },
+            awaiting: null
+          }
         })
         .select()
         .single();
@@ -199,6 +209,20 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     } else {
       console.log(`✅ Existing conversation found - ID: ${conversation.id}`);
     }
+
+    // Step 1: Load conversation metadata
+    console.log(`📊 Loading conversation metadata...`);
+    let metadata = conversation.metadata || {
+      discussed_products: [],
+      current_order: null,
+      collected_info: {
+        name: null,
+        phone: null,
+        address: null
+      },
+      awaiting: null
+    };
+    console.log(`✅ Metadata loaded:`, JSON.stringify(metadata, null, 2));
 
     // 5. Fetch conversation history (last 10 messages)
     console.log(`📜 Fetching conversation history...`);
@@ -240,30 +264,72 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }));
     console.log(`✅ Conversation history mapped: ${conversationHistory.length} messages`);
 
-    // 8. Generate AI reply using OpenAI with conversation history
-    console.log(`🤖 Generating AI reply with conversation context...`);
+    // 8. Fetch business name for system prompt
+    console.log(`🏢 Fetching business name for brand: ${brand_id}`);
+    let businessName = 'our business';
+    const { data: user } = await supabase
+      .from('users')
+      .select('business_name')
+      .eq('id', brand_id)
+      .maybeSingle();
+
+    if (user?.business_name) {
+      businessName = user.business_name;
+      console.log(`✅ Business name: ${businessName}`);
+    } else {
+      console.log(`⚠️  Business name not found, using default`);
+    }
+
+    // 9. Generate AI reply using OpenAI with conversation history and metadata
+    console.log(`🤖 Generating AI reply with conversation context and order state...`);
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
       products || [],
       brand_id,
-      conversationHistory
+      conversationHistory,
+      metadata,
+      businessName
     );
     console.log(`✅ AI reply generated: "${aiReply.substring(0, 100)}${aiReply.length > 100 ? '...' : ''}"`);
 
-    // 9. Send reply via Meta API
+    // 10. Parse and update metadata based on AI reply and customer message
+    console.log(`🔄 Parsing conversation to update metadata...`);
+    metadata = await updateMetadataFromConversation(
+      messageText,
+      aiReply,
+      metadata,
+      products || [],
+      previousMessages || []
+    );
+    console.log(`✅ Metadata updated:`, JSON.stringify(metadata, null, 2));
+
+    // 11. Check if ORDER_READY was detected
+    let finalReply = aiReply;
+    if (aiReply.includes('ORDER_READY')) {
+      console.log(`🎉 ORDER_READY detected! Creating Shopify order...`);
+      finalReply = await handleOrderCreation(brand_id, metadata, aiReply);
+
+      // Reset order state after successful order
+      metadata.current_order = null;
+      metadata.collected_info = { name: null, phone: null, address: null };
+      metadata.awaiting = null;
+      console.log(`✅ Order state reset`);
+    }
+
+    // 12. Send reply via Meta API
     console.log(`📤 Sending reply to customer via Meta API...`);
-    const sendResponse = await sendDM(senderId, aiReply, access_token);
+    const sendResponse = await sendDM(senderId, finalReply, access_token);
     console.log(`✅ Reply sent successfully via Meta API`);
 
-    // 10. Save AI reply to database
+    // 13. Save AI reply to database
     console.log(`💾 Saving AI message to database...`);
     const { error: outboundMsgError } = await supabase
       .from('messages')
       .insert({
         conversation_id: conversation.id,
         sender: 'ai',
-        content: aiReply,
+        content: finalReply,
         platform_message_id: sendResponse.message_id,
       });
 
@@ -271,6 +337,19 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       console.error('❌ Error saving outbound message:', outboundMsgError);
     } else {
       console.log(`✅ AI message saved to database`);
+    }
+
+    // 14. Save updated metadata to conversation
+    console.log(`💾 Saving updated metadata to conversation...`);
+    const { error: metadataError } = await supabase
+      .from('conversations')
+      .update({ metadata })
+      .eq('id', conversation.id);
+
+    if (metadataError) {
+      console.error('❌ Error saving metadata:', metadataError);
+    } else {
+      console.log(`✅ Metadata saved to database`);
     }
 
     console.log(`\n🎉 SUCCESS! AI reply sent to ${senderId}`);
@@ -309,6 +388,281 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     } catch (fallbackError) {
       console.error('❌ Error sending fallback message:', fallbackError.message);
     }
+  }
+}
+
+/**
+ * Update metadata based on conversation flow
+ * Tracks discussed products, order state, and customer info
+ */
+async function updateMetadataFromConversation(customerMessage, aiReply, metadata, products, conversationHistory) {
+  try {
+    // Extract product mentions from conversation
+    const productMentions = extractProductMentions(
+      customerMessage,
+      aiReply,
+      products,
+      conversationHistory
+    );
+
+    // Add newly mentioned products to discussed_products
+    productMentions.forEach(product => {
+      const alreadyDiscussed = metadata.discussed_products.find(
+        p => p.product_id === product.product_id
+      );
+      if (!alreadyDiscussed) {
+        metadata.discussed_products.push({
+          index: metadata.discussed_products.length + 1,
+          ...product
+        });
+      }
+    });
+
+    // Update collected_info based on awaiting state
+    if (metadata.awaiting === 'name') {
+      // Customer just provided their name
+      metadata.collected_info.name = customerMessage.trim();
+      console.log(`   📝 Captured name: ${metadata.collected_info.name}`);
+    } else if (metadata.awaiting === 'phone') {
+      // Customer just provided their phone
+      metadata.collected_info.phone = customerMessage.trim();
+      console.log(`   📱 Captured phone: ${metadata.collected_info.phone}`);
+    } else if (metadata.awaiting === 'address') {
+      // Customer just provided their address
+      metadata.collected_info.address = customerMessage.trim();
+      console.log(`   📍 Captured address: ${metadata.collected_info.address}`);
+    }
+
+    // Detect what Luna is currently asking for
+    metadata.awaiting = detectAwaitingState(aiReply, metadata);
+    console.log(`   ⏳ Now awaiting: ${metadata.awaiting || 'nothing'}`);
+
+    // Detect if ordering a product
+    if (!metadata.current_order && detectOrderIntent(customerMessage, aiReply)) {
+      // Try to identify which product they want to order
+      const orderedProduct = identifyOrderedProduct(
+        customerMessage,
+        aiReply,
+        metadata.discussed_products,
+        products
+      );
+      if (orderedProduct) {
+        metadata.current_order = orderedProduct;
+        console.log(`   🛒 Current order set:`, orderedProduct);
+      }
+    }
+
+    return metadata;
+  } catch (error) {
+    console.error('❌ Error updating metadata:', error);
+    return metadata; // Return unchanged on error
+  }
+}
+
+/**
+ * Extract product mentions from conversation
+ */
+function extractProductMentions(customerMessage, aiReply, products, conversationHistory) {
+  const mentions = [];
+  const lowerCaseReply = aiReply.toLowerCase();
+
+  products.forEach(product => {
+    const productNameLower = product.name.toLowerCase();
+    // Check if product is mentioned in AI reply
+    if (lowerCaseReply.includes(productNameLower)) {
+      mentions.push({
+        name: product.name,
+        product_id: product.id,
+        variant_id: product.shopify_product_id || null,
+        price: product.price
+      });
+    }
+  });
+
+  return mentions;
+}
+
+/**
+ * Detect what information Luna is currently asking for
+ */
+function detectAwaitingState(aiReply, metadata) {
+  const lowerReply = aiReply.toLowerCase();
+
+  // Check for confirmation state (all info collected)
+  if (metadata.collected_info.name &&
+      metadata.collected_info.phone &&
+      metadata.collected_info.address &&
+      (lowerReply.includes('confirm') || lowerReply.includes('تأكيد') || lowerReply.includes('ta2kid'))) {
+    return 'confirmation';
+  }
+
+  // Check what's being asked
+  if ((lowerReply.includes('name') || lowerReply.includes('اسم') || lowerReply.includes('ism')) &&
+      !metadata.collected_info.name) {
+    return 'name';
+  }
+
+  if ((lowerReply.includes('phone') || lowerReply.includes('number') || lowerReply.includes('رقم') || lowerReply.includes('ra2m')) &&
+      !metadata.collected_info.phone) {
+    return 'phone';
+  }
+
+  if ((lowerReply.includes('address') || lowerReply.includes('location') || lowerReply.includes('عنوان') || lowerReply.includes('3onwan')) &&
+      !metadata.collected_info.address) {
+    return 'address';
+  }
+
+  return null;
+}
+
+/**
+ * Detect if customer wants to place an order
+ */
+function detectOrderIntent(customerMessage, aiReply) {
+  const lowerMsg = customerMessage.toLowerCase();
+  const orderKeywords = [
+    'order', 'buy', 'purchase', 'take', 'want',
+    '3ayez', '3ayz', 'عايز', 'بدي', 'خد', 'اشتري'
+  ];
+
+  return orderKeywords.some(keyword => lowerMsg.includes(keyword));
+}
+
+/**
+ * Identify which product the customer wants to order
+ */
+function identifyOrderedProduct(customerMessage, aiReply, discussedProducts, allProducts) {
+  const lowerMsg = customerMessage.toLowerCase();
+
+  // Check if customer references by number (e.g., "the first one", "number 2", "الأول")
+  const numberMatch = lowerMsg.match(/\b(first|1st|one|الأول|awel)\b/i);
+  if (numberMatch && discussedProducts.length > 0) {
+    const product = discussedProducts[0];
+    return {
+      product_name: product.name,
+      product_id: product.product_id,
+      variant_id: product.variant_id,
+      price: product.price
+    };
+  }
+
+  // Check if customer mentions a specific product name
+  for (const product of discussedProducts) {
+    if (lowerMsg.includes(product.name.toLowerCase())) {
+      return {
+        product_name: product.name,
+        product_id: product.product_id,
+        variant_id: product.variant_id,
+        price: product.price
+      };
+    }
+  }
+
+  // If only one product discussed, assume that's what they want
+  if (discussedProducts.length === 1) {
+    const product = discussedProducts[0];
+    return {
+      product_name: product.name,
+      product_id: product.product_id,
+      variant_id: product.variant_id,
+      price: product.price
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle order creation when ORDER_READY is detected
+ */
+async function handleOrderCreation(brandId, metadata, aiReply) {
+  try {
+    const { createShopifyOrder } = require('../lib/shopify');
+
+    // Validate order data
+    if (!metadata.current_order) {
+      console.error('❌ No current_order in metadata');
+      return aiReply.replace('ORDER_READY',
+        '⚠️ There was an issue processing your order. Please try again or contact our team.');
+    }
+
+    if (!metadata.collected_info.name ||
+        !metadata.collected_info.phone ||
+        !metadata.collected_info.address) {
+      console.error('❌ Missing customer information');
+      return aiReply.replace('ORDER_READY',
+        '⚠️ We need a bit more information to complete your order. Please provide your full details.');
+    }
+
+    // Fetch Shopify integration
+    console.log(`   🔍 Fetching Shopify integration for brand: ${brandId}`);
+    const { data: shopifyIntegration, error: integrationError } = await supabase
+      .from('integrations')
+      .select('shopify_shop_domain, access_token')
+      .eq('brand_id', brandId)
+      .eq('platform', 'shopify')
+      .maybeSingle();
+
+    if (integrationError || !shopifyIntegration) {
+      console.error('❌ No Shopify integration found:', integrationError);
+      return aiReply.replace('ORDER_READY',
+        '✅ Your order details have been recorded! Our team will contact you shortly to complete the order.');
+    }
+
+    // Create Shopify order
+    const shopifyOrder = await createShopifyOrder({
+      shopDomain: shopifyIntegration.shopify_shop_domain,
+      accessToken: shopifyIntegration.access_token,
+      order: {
+        variant_id: metadata.current_order.variant_id,
+        product_name: metadata.current_order.product_name,
+        price: metadata.current_order.price,
+        customer_name: metadata.collected_info.name,
+        customer_phone: metadata.collected_info.phone,
+        customer_address: metadata.collected_info.address
+      }
+    });
+
+    // Save order to database
+    console.log(`   💾 Saving order to database...`);
+    const { error: orderError } = await supabase
+      .from('orders')
+      .insert({
+        brand_id: brandId,
+        shopify_order_id: shopifyOrder.id.toString(),
+        product_name: metadata.current_order.product_name,
+        product_id: metadata.current_order.product_id,
+        variant_id: metadata.current_order.variant_id,
+        price: metadata.current_order.price,
+        currency: 'EGP',
+        customer_name: metadata.collected_info.name,
+        customer_phone: metadata.collected_info.phone,
+        customer_address: metadata.collected_info.address,
+        status: 'pending',
+        order_number: shopifyOrder.order_number || shopifyOrder.id
+      });
+
+    if (orderError) {
+      console.error('❌ Error saving order to database:', orderError);
+    } else {
+      console.log(`✅ Order saved to database`);
+    }
+
+    // Build confirmation message
+    const confirmationMessage = `
+✅ Your order has been placed! Order #${shopifyOrder.order_number || shopifyOrder.id}
+
+${metadata.current_order.product_name} — ${metadata.current_order.price} EGP
+Delivering to: ${metadata.collected_info.address}
+
+We'll contact you on ${metadata.collected_info.phone} to confirm. Thank you! 🎉
+    `.trim();
+
+    return aiReply.replace('ORDER_READY', confirmationMessage);
+  } catch (error) {
+    console.error('❌ Error creating order:', error);
+    return aiReply.replace('ORDER_READY',
+      '⚠️ There was an issue creating your order. Our team has been notified and will contact you shortly.');
   }
 }
 
