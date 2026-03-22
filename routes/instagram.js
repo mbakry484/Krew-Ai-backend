@@ -268,15 +268,28 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
 
     // 5. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
-    if (metadata.awaiting === 'name') {
-      metadata.collected_info.name = messageText.trim();
-      metadata.awaiting = 'phone';
-    } else if (metadata.awaiting === 'phone') {
-      metadata.collected_info.phone = messageText.trim();
-      metadata.awaiting = 'address';
-    } else if (metadata.awaiting === 'address') {
-      metadata.collected_info.address = messageText.trim();
-      metadata.awaiting = 'confirmation';
+    // GUARD: Don't process through state machine if awaiting confirmation
+    // Let Luna handle rejections/corrections via OpenAI
+    if (metadata.awaiting !== 'confirmation') {
+      if (metadata.awaiting === 'name') {
+        metadata.collected_info.name = messageText.trim();
+        metadata.awaiting = 'phone';
+      } else if (metadata.awaiting === 'phone') {
+        // Validation: Phone must contain at least 5 digits
+        const phoneRegex = /\d{5,}/;
+        if (phoneRegex.test(messageText)) {
+          metadata.collected_info.phone = messageText.trim();
+          metadata.awaiting = 'address';
+        }
+        // If invalid, don't save, don't advance state - Luna will ask again
+      } else if (metadata.awaiting === 'address') {
+        // Validation: Address must be at least 10 characters
+        if (messageText.trim().length >= 10) {
+          metadata.collected_info.address = messageText.trim();
+          metadata.awaiting = 'confirmation';
+        }
+        // If invalid, don't save, don't advance state - Luna will ask again
+      }
     }
 
     // 6. Fetch conversation history (last 10 messages)
@@ -344,7 +357,27 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         content: aiReply,
       });
 
-    // 14. Save updated metadata (CRITICAL - this preserves order state across messages)
+    // 14. Metadata sanity check before saving
+    // Prevent saving invalid phone/address data
+    if (metadata.collected_info.phone) {
+      const phoneRegex = /\d{5,}/;
+      if (!phoneRegex.test(metadata.collected_info.phone)) {
+        metadata.collected_info.phone = null; // Invalid phone, clear it
+        if (metadata.awaiting === 'address' || metadata.awaiting === 'confirmation') {
+          metadata.awaiting = 'phone'; // Go back to phone collection
+        }
+      }
+    }
+    if (metadata.collected_info.address) {
+      if (metadata.collected_info.address.trim().length < 10) {
+        metadata.collected_info.address = null; // Invalid address, clear it
+        if (metadata.awaiting === 'confirmation') {
+          metadata.awaiting = 'address'; // Go back to address collection
+        }
+      }
+    }
+
+    // 15. Save updated metadata (CRITICAL - this preserves order state across messages)
     await supabase
       .from('conversations')
       .update({ metadata })
