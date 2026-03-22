@@ -5,6 +5,24 @@ const { generateReply } = require('../lib/claude');
 const { sendDM } = require('../lib/meta');
 
 /**
+ * Format Egyptian phone numbers to E.164 format for Shopify
+ * Converts: 01234567890 → +201234567890
+ */
+function formatEgyptianPhone(phone) {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.startsWith('0') && digits.length === 11) {
+    return '+2' + digits;
+  }
+  if (digits.startsWith('20') && digits.length === 12) {
+    return '+' + digits;
+  }
+  if (digits.startsWith('2') && digits.length === 11) {
+    return '+' + digits;
+  }
+  return '+2' + digits;
+}
+
+/**
  * GET /webhook/instagram - Webhook verification
  * Meta calls this endpoint to verify the webhook
  */
@@ -57,8 +75,14 @@ router.post('/', async (req, res) => {
  */
 async function handleIncomingMessage(messagingEvent, recipientId) {
   const senderId = messagingEvent.sender.id;
-  const messageText = messagingEvent.message.text;
+  const messageText = messagingEvent.message?.text;
   const messageId = messagingEvent.message.mid;
+
+  // Guard: Ignore non-text events (read receipts, reactions, etc.)
+  if (!messageText) {
+    console.log(`ℹ️  Ignoring non-text event from ${senderId}`);
+    return;
+  }
 
   try {
     // 1. Look up the brand using recipient.id
@@ -155,6 +179,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
             confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${metadata.current_order?.product_name || 'N/A'}\n• Price: ${metadata.current_order?.price || 'N/A'} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
           } else {
             // Shopify integration found - create order via Shopify Admin API
+            // Format phone to E.164 format for Shopify
+            const formattedPhone = formatEgyptianPhone(metadata.collected_info.phone);
+
             const shopifyResponse = await fetch(
               `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
               {
@@ -176,10 +203,10 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
                     shipping_address: {
                       name: metadata.collected_info.name,
                       address1: metadata.collected_info.address,
-                      phone: metadata.collected_info.phone,
+                      phone: formattedPhone,
                       country: 'EG'
                     },
-                    phone: metadata.collected_info.phone,
+                    phone: formattedPhone,
                     financial_status: 'pending',
                     send_receipt: false,
                     note: 'Order placed via Luna AI agent on Instagram/Messenger'
@@ -195,7 +222,30 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
             if (!shopifyResponse.ok) {
               console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
-              throw new Error(`Shopify API error: ${shopifyResponse.status}`);
+
+              // Handle Shopify failure gracefully - don't fall back to OpenAI
+              const errorMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
+
+              // Send error message to customer
+              await supabase.from('messages').insert({
+                conversation_id: conversation.id,
+                sender: 'customer',
+                content: messageText,
+                platform_message_id: messageId,
+              });
+
+              await sendDM(senderId, errorMsg, access_token);
+              console.log(`✅ Sent error message to ${senderId}`);
+
+              await supabase.from('messages').insert({
+                conversation_id: conversation.id,
+                sender: 'ai',
+                content: errorMsg,
+              });
+
+              // Keep metadata intact so customer can try again
+              // Return early - skip OpenAI call
+              return;
             }
 
             console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${metadata.current_order.product_name}`);
