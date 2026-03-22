@@ -127,7 +127,116 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
     console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
 
-    // 4. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
+    // 4. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
+    // If awaiting confirmation, check if customer confirmed and place order directly
+    if (metadata.awaiting === 'confirmation') {
+      const confirmWords = ['yes', 'confirm', 'ok', 'sure', 'place', 'yep', 'yeah', 'تأكيد', 'نعم', 'اه', 'آه', 'موافق'];
+      const isConfirmed = confirmWords.some(word => messageText.toLowerCase().includes(word));
+
+      if (isConfirmed) {
+        // Customer confirmed - create Shopify order directly (skip OpenAI)
+        console.log(`🎉 Order confirmed! Creating Shopify order...`);
+
+        try {
+          const { createShopifyOrder } = require('../lib/shopify');
+
+          // Fetch Shopify integration
+          const { data: shopifyIntegration } = await supabase
+            .from('integrations')
+            .select('shopify_shop_domain, access_token')
+            .eq('brand_id', brand_id)
+            .eq('platform', 'shopify')
+            .maybeSingle();
+
+          let confirmationMsg;
+
+          if (shopifyIntegration && metadata.current_order) {
+            // Create Shopify order
+            const shopifyOrder = await createShopifyOrder({
+              shopDomain: shopifyIntegration.shopify_shop_domain,
+              accessToken: shopifyIntegration.access_token,
+              order: {
+                variant_id: metadata.current_order.variant_id,
+                product_name: metadata.current_order.product_name,
+                price: metadata.current_order.price,
+                customer_name: metadata.collected_info.name,
+                customer_phone: metadata.collected_info.phone,
+                customer_address: metadata.collected_info.address
+              }
+            });
+
+            // Save order to database
+            await supabase
+              .from('orders')
+              .insert({
+                brand_id: brand_id,
+                shopify_order_id: shopifyOrder.id.toString(),
+                product_name: metadata.current_order.product_name,
+                product_id: metadata.current_order.product_id,
+                variant_id: metadata.current_order.variant_id,
+                price: metadata.current_order.price,
+                currency: 'EGP',
+                customer_name: metadata.collected_info.name,
+                customer_phone: metadata.collected_info.phone,
+                customer_address: metadata.collected_info.address,
+                status: 'pending',
+                order_number: shopifyOrder.order_number || shopifyOrder.id
+              });
+
+            confirmationMsg = `✅ Your order has been placed! Order #${shopifyOrder.order_number || shopifyOrder.id}\n\n• Product: ${metadata.current_order.product_name}\n• Price: ${metadata.current_order.price} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
+          } else {
+            // No Shopify integration or current_order - record manually
+            confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${metadata.current_order?.product_name || 'N/A'}\n• Price: ${metadata.current_order?.price || 'N/A'} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
+          }
+
+          // Save incoming message
+          await supabase
+            .from('messages')
+            .insert({
+              conversation_id: conversation.id,
+              sender: 'customer',
+              content: messageText,
+              platform_message_id: messageId,
+            });
+
+          // Send confirmation message directly
+          await sendDM(senderId, confirmationMsg, access_token);
+          console.log(`✅ Sent to ${senderId}`);
+
+          // Save confirmation message
+          await supabase
+            .from('messages')
+            .insert({
+              conversation_id: conversation.id,
+              sender: 'ai',
+              content: confirmationMsg,
+            });
+
+          // Reset metadata after successful order
+          metadata = {
+            discussed_products: [],
+            current_order: null,
+            collected_info: { name: null, phone: null, address: null },
+            awaiting: null
+          };
+
+          // Save reset metadata
+          await supabase
+            .from('conversations')
+            .update({ metadata })
+            .eq('id', conversation.id);
+
+          // Return early - skip OpenAI call entirely
+          return;
+
+        } catch (error) {
+          console.error(`❌ Error: ${error.message}`);
+          // Fall through to normal flow if order creation fails
+        }
+      }
+    }
+
+    // 5. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
     if (metadata.awaiting === 'name') {
       metadata.collected_info.name = messageText.trim();
       metadata.awaiting = 'phone';
@@ -137,16 +246,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     } else if (metadata.awaiting === 'address') {
       metadata.collected_info.address = messageText.trim();
       metadata.awaiting = 'confirmation';
-    } else if (metadata.awaiting === 'confirmation') {
-      // Check if customer confirmed
-      const lowerMsg = messageText.toLowerCase();
-      const confirmKeywords = ['yes', 'ok', 'okay', 'confirm', 'confirmed', 'نعم', 'تأكيد', 'موافق', 'correct', 'right'];
-      if (confirmKeywords.some(keyword => lowerMsg.includes(keyword))) {
-        metadata.awaiting = 'order_ready'; // Signal to create order
-      }
     }
 
-    // 5. Fetch conversation history (last 10 messages)
+    // 6. Fetch conversation history (last 10 messages)
     const { data: previousMessages } = await supabase
       .from('messages')
       .select('sender, content')
@@ -154,7 +256,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .order('created_at', { ascending: true })
       .limit(10);
 
-    // 6. Save incoming message
+    // 7. Save incoming message
     await supabase
       .from('messages')
       .insert({
@@ -164,13 +266,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         platform_message_id: messageId,
       });
 
-    // 7. Map conversation history to OpenAI format
+    // 8. Map conversation history to OpenAI format
     const conversationHistory = (previousMessages || []).map(msg => ({
       role: msg.sender === 'customer' ? 'user' : 'assistant',
       content: msg.content
     }));
 
-    // 8. Fetch business name for system prompt
+    // 9. Fetch business name for system prompt
     const { data: user } = await supabase
       .from('users')
       .select('business_name')
@@ -178,7 +280,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
 
-    // 9. Generate AI reply with current metadata state
+    // 10. Generate AI reply with current metadata state
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
@@ -190,7 +292,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     );
     console.log(`🤖 Luna reply: "${aiReply}"`);
 
-    // 10. Update metadata based on AI reply (only if awaiting is null)
+    // 11. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
       messageText,
       aiReply,
@@ -198,21 +300,8 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       products || []
     );
 
-    // 11. Check if ORDER_READY was detected or awaiting state signals order creation
-    let finalReply = aiReply;
-    if (aiReply.includes('ORDER_READY') || metadata.awaiting === 'order_ready') {
-      finalReply = await handleOrderCreation(brand_id, metadata, aiReply);
-      // Reset metadata after successful order
-      metadata = {
-        discussed_products: [],
-        current_order: null,
-        collected_info: { name: null, phone: null, address: null },
-        awaiting: null
-      };
-    }
-
     // 12. Send reply via Meta API
-    await sendDM(senderId, finalReply, access_token);
+    await sendDM(senderId, aiReply, access_token);
     console.log(`✅ Sent to ${senderId}`);
 
     // 13. Save AI reply to database
@@ -221,7 +310,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .insert({
         conversation_id: conversation.id,
         sender: 'ai',
-        content: finalReply,
+        content: aiReply,
       });
 
     // 14. Save updated metadata (CRITICAL - this preserves order state across messages)
