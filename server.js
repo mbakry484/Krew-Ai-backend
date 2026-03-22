@@ -11,6 +11,7 @@ const knowledgeBaseRoutes = require('./routes/knowledge-base');
 const conversationsRoutes = require('./routes/conversations');
 const aiRoutes = require('./routes/ai');
 const integrationsRoutes = require('./routes/integrations');
+const ordersRoutes = require('./routes/orders');
 
 const app = express();
 
@@ -65,6 +66,7 @@ app.use('/knowledge-base', knowledgeBaseRoutes);
 app.use('/conversations', conversationsRoutes);
 app.use('/ai', aiRoutes);
 app.use('/integrations', integrationsRoutes);
+app.use('/orders', ordersRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

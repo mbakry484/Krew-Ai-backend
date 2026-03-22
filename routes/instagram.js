@@ -138,55 +138,86 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         console.log(`🎉 Order confirmed! Creating Shopify order...`);
 
         try {
-          const { createShopifyOrder } = require('../lib/shopify');
-
           // Fetch Shopify integration
           const { data: shopifyIntegration } = await supabase
             .from('integrations')
             .select('shopify_shop_domain, access_token')
             .eq('brand_id', brand_id)
             .eq('platform', 'shopify')
-            .maybeSingle();
+            .single();
 
           let confirmationMsg;
+          let shopifyOrderNumber = null;
 
-          if (shopifyIntegration && metadata.current_order) {
-            // Create Shopify order
-            const shopifyOrder = await createShopifyOrder({
-              shopDomain: shopifyIntegration.shopify_shop_domain,
-              accessToken: shopifyIntegration.access_token,
-              order: {
-                variant_id: metadata.current_order.variant_id,
-                product_name: metadata.current_order.product_name,
-                price: metadata.current_order.price,
-                customer_name: metadata.collected_info.name,
-                customer_phone: metadata.collected_info.phone,
-                customer_address: metadata.collected_info.address
+          if (!shopifyIntegration) {
+            // No Shopify integration found - log warning and skip Shopify API call
+            console.log(`⚠️  No Shopify integration found for brand ${brand_id} - skipping Shopify order creation`);
+            confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${metadata.current_order?.product_name || 'N/A'}\n• Price: ${metadata.current_order?.price || 'N/A'} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
+          } else {
+            // Shopify integration found - create order via Shopify Admin API
+            const shopifyResponse = await fetch(
+              `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Shopify-Access-Token': shopifyIntegration.access_token
+                },
+                body: JSON.stringify({
+                  order: {
+                    line_items: [{
+                      title: metadata.current_order.product_name,
+                      quantity: 1,
+                      price: metadata.current_order.price
+                    }],
+                    customer: {
+                      first_name: metadata.collected_info.name
+                    },
+                    shipping_address: {
+                      name: metadata.collected_info.name,
+                      address1: metadata.collected_info.address,
+                      phone: metadata.collected_info.phone,
+                      country: 'EG'
+                    },
+                    phone: metadata.collected_info.phone,
+                    financial_status: 'pending',
+                    send_receipt: false,
+                    note: 'Order placed via Luna AI agent on Instagram/Messenger'
+                  }
+                })
               }
+            );
+
+            const shopifyData = await shopifyResponse.json();
+            const shopifyOrder = shopifyData.order;
+            const shopifyOrderId = shopifyOrder?.id;
+            shopifyOrderNumber = shopifyOrder?.order_number;
+
+            if (!shopifyResponse.ok) {
+              console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
+              throw new Error(`Shopify API error: ${shopifyResponse.status}`);
+            }
+
+            console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${metadata.current_order.product_name}`);
+
+            // Save to Supabase orders table
+            await supabase.from('orders').insert({
+              brand_id: brand_id,
+              conversation_id: conversation.id,
+              shopify_order_id: String(shopifyOrderId),
+              shopify_order_number: String(shopifyOrderNumber),
+              customer_name: metadata.collected_info.name,
+              customer_phone: metadata.collected_info.phone,
+              customer_address: metadata.collected_info.address,
+              product_name: metadata.current_order.product_name,
+              price: metadata.current_order.price,
+              currency: 'EGP',
+              status: 'pending',
+              created_at: new Date().toISOString()
             });
 
-            // Save order to database
-            await supabase
-              .from('orders')
-              .insert({
-                brand_id: brand_id,
-                shopify_order_id: shopifyOrder.id.toString(),
-                product_name: metadata.current_order.product_name,
-                product_id: metadata.current_order.product_id,
-                variant_id: metadata.current_order.variant_id,
-                price: metadata.current_order.price,
-                currency: 'EGP',
-                customer_name: metadata.collected_info.name,
-                customer_phone: metadata.collected_info.phone,
-                customer_address: metadata.collected_info.address,
-                status: 'pending',
-                order_number: shopifyOrder.order_number || shopifyOrder.id
-              });
-
-            confirmationMsg = `✅ Your order has been placed! Order #${shopifyOrder.order_number || shopifyOrder.id}\n\n• Product: ${metadata.current_order.product_name}\n• Price: ${metadata.current_order.price} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
-          } else {
-            // No Shopify integration or current_order - record manually
-            confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${metadata.current_order?.product_name || 'N/A'}\n• Price: ${metadata.current_order?.price || 'N/A'} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
+            // Build confirmation message with order number
+            confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${metadata.current_order.product_name}\n• Price: ${metadata.current_order.price} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
           }
 
           // Save incoming message
