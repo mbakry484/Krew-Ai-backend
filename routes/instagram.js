@@ -127,13 +127,23 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
     console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
 
-    // 4. Update collected info BEFORE generating reply (capture customer's response to previous awaiting state)
+    // 4. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
     if (metadata.awaiting === 'name') {
       metadata.collected_info.name = messageText.trim();
+      metadata.awaiting = 'phone';
     } else if (metadata.awaiting === 'phone') {
       metadata.collected_info.phone = messageText.trim();
+      metadata.awaiting = 'address';
     } else if (metadata.awaiting === 'address') {
       metadata.collected_info.address = messageText.trim();
+      metadata.awaiting = 'confirmation';
+    } else if (metadata.awaiting === 'confirmation') {
+      // Check if customer confirmed
+      const lowerMsg = messageText.toLowerCase();
+      const confirmKeywords = ['yes', 'ok', 'okay', 'confirm', 'confirmed', 'نعم', 'تأكيد', 'موافق', 'correct', 'right'];
+      if (confirmKeywords.some(keyword => lowerMsg.includes(keyword))) {
+        metadata.awaiting = 'order_ready'; // Signal to create order
+      }
     }
 
     // 5. Fetch conversation history (last 10 messages)
@@ -180,22 +190,25 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     );
     console.log(`🤖 Luna reply: "${aiReply}"`);
 
-    // 10. Update metadata based on AI reply (detect new products, order intent, and what Luna is asking for)
+    // 10. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
       messageText,
       aiReply,
       metadata,
-      products || [],
-      previousMessages || []
+      products || []
     );
 
-    // 11. Check if ORDER_READY was detected
+    // 11. Check if ORDER_READY was detected or awaiting state signals order creation
     let finalReply = aiReply;
-    if (aiReply.includes('ORDER_READY')) {
+    if (aiReply.includes('ORDER_READY') || metadata.awaiting === 'order_ready') {
       finalReply = await handleOrderCreation(brand_id, metadata, aiReply);
-      metadata.current_order = null;
-      metadata.collected_info = { name: null, phone: null, address: null };
-      metadata.awaiting = null;
+      // Reset metadata after successful order
+      metadata = {
+        discussed_products: [],
+        current_order: null,
+        collected_info: { name: null, phone: null, address: null },
+        awaiting: null
+      };
     }
 
     // 12. Send reply via Meta API
@@ -244,17 +257,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
 /**
  * Update metadata based on conversation flow
- * Tracks discussed products, order state, and customer info
+ * Tracks discussed products, order state, and ONLY updates awaiting when it's null
  */
-async function updateMetadataFromConversation(customerMessage, aiReply, metadata, products, conversationHistory) {
+async function updateMetadataFromConversation(customerMessage, aiReply, metadata, products) {
   try {
     // Extract product mentions from conversation
-    const productMentions = extractProductMentions(
-      customerMessage,
-      aiReply,
-      products,
-      conversationHistory
-    );
+    const productMentions = extractProductMentions(aiReply, products);
 
     // Add newly mentioned products to discussed_products
     productMentions.forEach(product => {
@@ -282,8 +290,17 @@ async function updateMetadataFromConversation(customerMessage, aiReply, metadata
       }
     }
 
-    // Detect what Luna is currently asking for (based on her reply)
-    metadata.awaiting = detectAwaitingState(aiReply, metadata);
+    // ONLY update awaiting if it's currently null (deterministic state machine handles transitions otherwise)
+    if (metadata.awaiting === null) {
+      const lowerReply = aiReply.toLowerCase();
+
+      // Detect what Luna is asking for
+      if (lowerReply.includes('full name') || lowerReply.includes('your name') || lowerReply.includes('اسمك')) {
+        metadata.awaiting = 'name';
+      } else if (lowerReply.includes('phone') || lowerReply.includes('رقم')) {
+        metadata.awaiting = 'phone';
+      }
+    }
 
     return metadata;
   } catch (error) {
@@ -293,9 +310,9 @@ async function updateMetadataFromConversation(customerMessage, aiReply, metadata
 }
 
 /**
- * Extract product mentions from conversation
+ * Extract product mentions from AI reply
  */
-function extractProductMentions(customerMessage, aiReply, products, conversationHistory) {
+function extractProductMentions(aiReply, products) {
   const mentions = [];
   const lowerCaseReply = aiReply.toLowerCase();
 
@@ -313,39 +330,6 @@ function extractProductMentions(customerMessage, aiReply, products, conversation
   });
 
   return mentions;
-}
-
-/**
- * Detect what information Luna is currently asking for
- */
-function detectAwaitingState(aiReply, metadata) {
-  const lowerReply = aiReply.toLowerCase();
-
-  // Check for confirmation state (all info collected)
-  if (metadata.collected_info.name &&
-      metadata.collected_info.phone &&
-      metadata.collected_info.address &&
-      (lowerReply.includes('confirm') || lowerReply.includes('تأكيد') || lowerReply.includes('ta2kid'))) {
-    return 'confirmation';
-  }
-
-  // Check what's being asked
-  if ((lowerReply.includes('name') || lowerReply.includes('اسم') || lowerReply.includes('ism')) &&
-      !metadata.collected_info.name) {
-    return 'name';
-  }
-
-  if ((lowerReply.includes('phone') || lowerReply.includes('number') || lowerReply.includes('رقم') || lowerReply.includes('ra2m')) &&
-      !metadata.collected_info.phone) {
-    return 'phone';
-  }
-
-  if ((lowerReply.includes('address') || lowerReply.includes('location') || lowerReply.includes('عنوان') || lowerReply.includes('3onwan')) &&
-      !metadata.collected_info.address) {
-    return 'address';
-  }
-
-  return null;
 }
 
 /**
