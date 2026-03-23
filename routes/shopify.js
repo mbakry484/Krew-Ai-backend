@@ -121,6 +121,7 @@ router.post('/product-update', async (req, res) => {
         name: product.name,
         description: product.description,
         price: product.price,
+        image_url: product.image_url || null,
         availability: product.in_stock ? 'in_stock' : 'out_of_stock',
         updated_at: new Date().toISOString(),
       }, {

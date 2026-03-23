@@ -52,8 +52,36 @@ router.post('/sync', async (req, res) => {
 });
 
 // GET /products - List all products for a brand
-router.get('/', (req, res) => {
-  res.status(501).json({ message: 'List products endpoint not yet implemented' });
+router.get('/', async (req, res) => {
+  try {
+    const { brand_id } = req.query;
+
+    if (!brand_id) {
+      return res.status(400).json({
+        error: 'Missing required parameter: brand_id'
+      });
+    }
+
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('id, shopify_product_id, brand_id, name, description, price, currency, variants, in_stock, availability, sku, image_url, synced_at, created_at, updated_at')
+      .eq('brand_id', brand_id)
+      .order('updated_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      count: products.length,
+      products
+    });
+  } catch (error) {
+    console.error('Error fetching products:', error);
+    res.status(500).json({
+      error: 'Failed to fetch products',
+      details: error.message
+    });
+  }
 });
 
 // GET /products/:id - Get single product details
