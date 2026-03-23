@@ -78,9 +78,14 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   const messageText = messagingEvent.message?.text;
   const messageId = messagingEvent.message.mid;
 
-  // Guard: Ignore non-text events (read receipts, reactions, etc.)
-  if (!messageText) {
-    console.log(`ℹ️  Ignoring non-text event from ${senderId}`);
+  // Detect image attachments
+  const attachments = messagingEvent.message?.attachments || [];
+  const imageAttachment = attachments.find(a => a.type === 'image');
+  const imageUrl = imageAttachment?.payload?.url || null;
+
+  // Guard: Ignore if no text and no image
+  if (!messageText && !imageUrl) {
+    console.log(`ℹ️  Ignoring non-text/non-image event from ${senderId}`);
     return;
   }
 
@@ -234,8 +239,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
               await supabase.from('messages').insert({
                 conversation_id: conversation.id,
                 sender: 'customer',
-                content: messageText,
+                content: messageText || '[Image]',
                 platform_message_id: messageId,
+                image_url: imageUrl || null,
               });
 
               await sendDM(senderId, errorMsg, access_token);
@@ -280,8 +286,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
             .insert({
               conversation_id: conversation.id,
               sender: 'customer',
-              content: messageText,
+              content: messageText || '[Image]',
               platform_message_id: messageId,
+              image_url: imageUrl || null,
             });
 
           // Send confirmation message directly
@@ -360,8 +367,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .insert({
         conversation_id: conversation.id,
         sender: 'customer',
-        content: messageText,
+        content: messageText || '[Image]',
         platform_message_id: messageId,
+        image_url: imageUrl || null,
       });
 
     // 8. Map conversation history to OpenAI format
@@ -378,7 +386,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
 
-    // 10. Generate AI reply with current metadata state
+    // 10. Generate AI reply with current metadata state and image if present
     const aiReply = await generateReply(
       messageText,
       knowledgeBaseRows || [],
@@ -386,7 +394,8 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       brand_id,
       conversationHistory,
       metadata,
-      businessName
+      businessName,
+      imageUrl
     );
     console.log(`🤖 Luna reply: "${aiReply}"`);
 
