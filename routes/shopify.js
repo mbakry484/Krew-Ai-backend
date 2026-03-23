@@ -53,6 +53,7 @@ router.post('/sync', async (req, res) => {
         availability: inStock ? 'in_stock' : 'out_of_stock', // For backwards compatibility
         sku: product.sku || null,
         image_url: product.image_url || null,
+        images: product.images || [],
         synced_at: syncedAt,
         updated_at: syncedAt,
       };
@@ -71,6 +72,11 @@ router.post('/sync', async (req, res) => {
       console.error('Error syncing products:', error);
       throw error;
     }
+
+    // Log each product with image count
+    products.forEach(product => {
+      console.log(`Saved ${product.name} - images: ${product.images?.length || 0}`);
+    });
 
     console.log(`✅ Synced ${products.length} products for brand ${brandId} from shop ${shop_domain}`);
 
@@ -129,10 +135,14 @@ router.post('/product-update', async (req, res) => {
         name: product.name,
         description: product.description,
         price: product.price,
+        currency: product.currency || 'EGP',
         image_url: product.image_url || null,
+        images: product.images || [],
         variants: product.variants || [],
         in_stock: inStock,
         availability: inStock ? 'in_stock' : 'out_of_stock',
+        sku: product.sku || null,
+        synced_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, {
         onConflict: 'shopify_product_id',
@@ -140,6 +150,7 @@ router.post('/product-update', async (req, res) => {
 
     if (error) throw error;
 
+    console.log(`Saved ${product.name} - images: ${product.images?.length || 0}`);
     console.log(`Product upserted: ${product.name} (${product.shopify_product_id}) for brand ${brandId}`);
 
     res.json({
