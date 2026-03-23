@@ -109,8 +109,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
     const { data: products } = await supabase
       .from('products')
-      .select('name, description, price, in_stock')
-      .eq('brand_id', brand_id);
+      .select('name, price, variants, image_url, shopify_product_id')
+      .eq('brand_id', brand_id)
+      .eq('in_stock', true)
+      .not('price', 'is', null)
+      .gt('price', 0)
+      .order('name', { ascending: true });
 
     // 3. Get or create conversation
     let { data: conversation } = await supabase

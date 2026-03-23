@@ -36,22 +36,27 @@ router.post('/sync', async (req, res) => {
     const syncedAt = new Date().toISOString();
 
     // Prepare products for upsert
-    const productsToUpsert = products.map(product => ({
-      user_id: brandId,
-      shopify_product_id: product.shopify_product_id,
-      brand_id: brandId,
-      name: product.name,
-      description: product.description || null,
-      price: product.price || null,
-      currency: product.currency || 'EGP',
-      variants: product.variants || [],
-      in_stock: product.in_stock !== undefined ? product.in_stock : true,
-      availability: product.in_stock ? 'in_stock' : 'out_of_stock', // For backwards compatibility
-      sku: product.sku || null,
-      image_url: product.image_url || null,
-      synced_at: syncedAt,
-      updated_at: syncedAt,
-    }));
+    const productsToUpsert = products.map(product => {
+      // Calculate in_stock based on variants inventory
+      const inStock = product.variants?.some(v => v.inventory_quantity > 0) ?? true;
+
+      return {
+        user_id: brandId,
+        shopify_product_id: product.shopify_product_id,
+        brand_id: brandId,
+        name: product.name,
+        description: product.description || null,
+        price: product.price || null,
+        currency: product.currency || 'EGP',
+        variants: product.variants || [],
+        in_stock: inStock,
+        availability: inStock ? 'in_stock' : 'out_of_stock', // For backwards compatibility
+        sku: product.sku || null,
+        image_url: product.image_url || null,
+        synced_at: syncedAt,
+        updated_at: syncedAt,
+      };
+    });
 
     // Upsert all products using shopify_product_id as unique key
     const { data, error } = await supabase
@@ -112,6 +117,9 @@ router.post('/product-update', async (req, res) => {
 
     const brandId = integration.brand_id;
 
+    // Calculate in_stock based on variants inventory
+    const inStock = product.variants?.some(v => v.inventory_quantity > 0) ?? true;
+
     const { data, error } = await supabase
       .from('products')
       .upsert({
@@ -122,7 +130,9 @@ router.post('/product-update', async (req, res) => {
         description: product.description,
         price: product.price,
         image_url: product.image_url || null,
-        availability: product.in_stock ? 'in_stock' : 'out_of_stock',
+        variants: product.variants || [],
+        in_stock: inStock,
+        availability: inStock ? 'in_stock' : 'out_of_stock',
         updated_at: new Date().toISOString(),
       }, {
         onConflict: 'shopify_product_id',
