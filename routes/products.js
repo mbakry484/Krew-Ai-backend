@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
-// const { verifyToken } = require('../middleware/auth');
+const { verifyToken } = require('../middleware/auth');
+const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 
 // POST /products/sync - Bulk sync products from Shopify
 router.post('/sync', async (req, res) => {
@@ -113,6 +114,69 @@ router.put('/:id', (req, res) => {
 // DELETE /products/:id - Delete product (protected)
 router.delete('/:id', (req, res) => {
   res.status(501).json({ message: 'Delete product endpoint not yet implemented' });
+});
+
+// POST /products/generate-embeddings - Generate embeddings for all products (protected)
+router.post('/generate-embeddings', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    // Get the user's brand_id from users table
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('brand_id, business_name')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const brandId = userData.brand_id;
+
+    // Check how many products need embeddings
+    const { data: productsNeedingEmbeddings, error: countError } = await supabase
+      .from('products')
+      .select('shopify_product_id, name')
+      .eq('brand_id', brandId)
+      .not('image_url', 'is', null)
+      .is('embedding', null);
+
+    if (countError) {
+      console.error('Error counting products:', countError);
+      return res.status(500).json({ error: 'Failed to count products' });
+    }
+
+    const count = productsNeedingEmbeddings?.length || 0;
+
+    if (count === 0) {
+      return res.json({
+        success: true,
+        message: 'All products already have embeddings',
+        count: 0
+      });
+    }
+
+    // Start embedding generation in background
+    res.json({
+      success: true,
+      message: `Generating embeddings for ${count} products. This will take a few minutes.`,
+      count,
+      status: 'processing'
+    });
+
+    // Run in background (don't await)
+    generateEmbeddingsForBrand(brandId).catch(err =>
+      console.error('❌ Background embedding error:', err.message)
+    );
+
+  } catch (error) {
+    console.error('Error in generate-embeddings endpoint:', error);
+    res.status(500).json({
+      error: 'Failed to generate embeddings',
+      details: error.message
+    });
+  }
 });
 
 module.exports = router;

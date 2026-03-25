@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 
 // POST /products/sync - Bulk sync products from Shopify
 router.post('/sync', async (req, res) => {
@@ -87,6 +88,12 @@ router.post('/sync', async (req, res) => {
       products: data
     });
 
+    // Run embedding generation in background (don't await)
+    // This generates AI descriptions and embeddings for product images
+    generateEmbeddingsForBrand(brandId).catch(err =>
+      console.error('❌ Background embedding error:', err.message)
+    );
+
   } catch (error) {
     console.error('Error in /sync endpoint:', error);
     res.status(500).json({
@@ -158,6 +165,18 @@ router.post('/product-update', async (req, res) => {
       message: 'Product synced successfully',
       data
     });
+
+    // Run embedding generation in background for this product
+    if (product.image_url) {
+      const { generateProductEmbedding } = require('../lib/embeddings');
+      generateProductEmbedding({
+        shopify_product_id: product.shopify_product_id,
+        name: product.name,
+        image_url: product.image_url
+      }).catch(err =>
+        console.error('❌ Background embedding error:', err.message)
+      );
+    }
   } catch (error) {
     console.error('Error upserting product:', error);
     res.status(500).json({ error: 'Failed to upsert product', details: error.message });

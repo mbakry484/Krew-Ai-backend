@@ -62,6 +62,7 @@ app.use('/auth', authRoutes);
 app.use('/webhook/instagram', instagramRoutes);
 app.use('/webhook/shopify', shopifyRoutes);
 app.use('/products', shopifyRoutes); // Mount shopify routes at /products for /products/sync endpoint
+app.use('/products', productsRoutes); // Mount products routes for /products/generate-embeddings and other product endpoints
 app.use('/knowledge-base', knowledgeBaseRoutes);
 app.use('/conversations', conversationsRoutes);
 app.use('/ai', aiRoutes);
