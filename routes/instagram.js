@@ -524,9 +524,11 @@ Customer's image looks like: ${queryDescription}
 
 IMPORTANT:
 - Confirm which product matches best based on the similarity scores and descriptions
-- State availability and price clearly
+- State availability and price clearly - VERY IMPORTANT!
+- If product is OUT OF STOCK ❌: Tell customer "This looks like our [Product Name] (${price} EGP), but unfortunately it's currently out of stock. Would you like me to suggest similar items that are available?"
+- If product is IN STOCK ✅: Confirm it's available and ask if they want to order
 - If the match quality seems low (similarity < 50%), acknowledge it might not be an exact match
-- Offer to help find alternatives if none match well
+- If ALL matches are out of stock, acknowledge the product but suggest checking back later or looking at alternatives
 `;
 
         // Use GPT-4o-mini for the final response (we already did the heavy lifting with vision)

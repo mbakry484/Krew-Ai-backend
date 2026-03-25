@@ -59,6 +59,7 @@ END;
 $$;
 
 -- Step 5: Create optimized function for Instagram image search
+-- Updated to include ALL products (in-stock and out-of-stock)
 CREATE OR REPLACE FUNCTION match_products_by_embedding(
   query_embedding vector(1536),
   match_brand_id uuid,
@@ -96,9 +97,10 @@ BEGIN
   WHERE
     products.embedding IS NOT NULL
     AND products.brand_id = match_brand_id
-    AND products.in_stock = true
     AND 1 - (products.embedding <=> query_embedding) > match_threshold
-  ORDER BY products.embedding <=> query_embedding
+  ORDER BY
+    products.in_stock DESC,  -- Prioritize in-stock products
+    products.embedding <=> query_embedding  -- Then by similarity
   LIMIT match_count;
 END;
 $$;
@@ -107,4 +109,4 @@ $$;
 COMMENT ON COLUMN products.image_description IS 'AI-generated description of product image using GPT-4o vision';
 COMMENT ON COLUMN products.embedding IS 'Text embedding vector (1536 dimensions) for semantic search using text-embedding-3-small';
 COMMENT ON FUNCTION match_products IS 'Find similar products using vector similarity search. Returns products ranked by cosine similarity to query embedding.';
-COMMENT ON FUNCTION match_products_by_embedding IS 'Optimized for Instagram image search - only returns in-stock products for a specific brand with similarity above threshold.';
+COMMENT ON FUNCTION match_products_by_embedding IS 'Instagram image search - returns ALL products (in-stock and OOS) for a brand, prioritizing in-stock products first, with similarity above threshold.';
