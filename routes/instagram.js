@@ -128,37 +128,22 @@ router.post('/', async (req, res) => {
       for (const entry of body.entry) {
         // At the very top of message processing, before any logs
         const messaging = entry.messaging?.[0];
-        if (!messaging) {
-          res.sendStatus(200);
-          return;
-        }
+        if (!messaging) continue;
 
         // Filter out echo messages (Luna's own replies)
-        if (messaging.message?.is_echo) {
-          res.sendStatus(200);
-          return;
-        }
+        if (messaging.message?.is_echo) continue;
 
         // Filter out read receipts
-        if (messaging.read) {
-          res.sendStatus(200);
-          return;
-        }
+        if (messaging.read) continue;
 
         // Filter out delivery receipts
-        if (messaging.delivery) {
-          res.sendStatus(200);
-          return;
-        }
+        if (messaging.delivery) continue;
 
         // Check sender/recipient validity
         const senderId = messaging.sender?.id;
         const recipientId = messaging.recipient?.id;
 
-        if (!senderId || !recipientId || senderId === recipientId) {
-          res.sendStatus(200);
-          return;
-        }
+        if (!senderId || !recipientId || senderId === recipientId) continue;
 
         // Now extract message content
         const customerMessage = messaging.message?.text;
@@ -167,10 +152,7 @@ router.post('/', async (req, res) => {
         const imageUrl = imageAttachment?.payload?.url || null;
 
         // Only proceed if there's actual content
-        if (!customerMessage && !imageUrl) {
-          res.sendStatus(200);
-          return;
-        }
+        if (!customerMessage && !imageUrl) continue;
 
         // NOW log - only real messages reach this point
         console.log(`📨 ${senderId}: "${customerMessage || '[Image]'}"`);
