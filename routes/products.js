@@ -20,15 +20,26 @@ router.post('/sync', async (req, res) => {
     const brandId = user_id; // Replace with actual brand_id lookup
 
     const upsertPromises = products.map(async (product) => {
+      // Calculate in_stock based on variants inventory
+      const inStock = product.variants?.some(v => v.inventory_quantity > 0) ?? (product.in_stock ?? true);
+
       const { data, error } = await supabase
         .from('products')
         .upsert({
           shopify_product_id: product.shopify_product_id,
           brand_id: brandId,
+          user_id: brandId,
           name: product.name,
           description: product.description,
           price: product.price,
-          availability: product.in_stock ? 'in_stock' : 'out_of_stock',
+          currency: product.currency || 'EGP',
+          variants: product.variants || [],
+          in_stock: inStock,
+          availability: inStock ? 'in_stock' : 'out_of_stock',
+          sku: product.sku || null,
+          image_url: product.image_url || null,
+          images: product.images || [],
+          synced_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         }, {
           onConflict: 'shopify_product_id',
