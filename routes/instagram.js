@@ -126,17 +126,57 @@ router.post('/', async (req, res) => {
   try {
     if (body.object === 'instagram' || body.object === 'page') {
       for (const entry of body.entry) {
-        for (const messagingEvent of entry.messaging || []) {
-          const senderId = messagingEvent.sender?.id;
-          const recipientId = messagingEvent.recipient?.id;
-
-          if (senderId === recipientId) continue;
-
-          if (messagingEvent.message && !messagingEvent.message.is_echo) {
-            console.log(`📨 ${senderId}: "${messagingEvent.message.text}"`);
-            await handleIncomingMessage(messagingEvent, recipientId);
-          }
+        // At the very top of message processing, before any logs
+        const messaging = entry.messaging?.[0];
+        if (!messaging) {
+          res.sendStatus(200);
+          return;
         }
+
+        // Filter out echo messages (Luna's own replies)
+        if (messaging.message?.is_echo) {
+          res.sendStatus(200);
+          return;
+        }
+
+        // Filter out read receipts
+        if (messaging.read) {
+          res.sendStatus(200);
+          return;
+        }
+
+        // Filter out delivery receipts
+        if (messaging.delivery) {
+          res.sendStatus(200);
+          return;
+        }
+
+        // Check sender/recipient validity
+        const senderId = messaging.sender?.id;
+        const recipientId = messaging.recipient?.id;
+
+        if (!senderId || !recipientId || senderId === recipientId) {
+          res.sendStatus(200);
+          return;
+        }
+
+        // Now extract message content
+        const customerMessage = messaging.message?.text;
+        const attachments = messaging.message?.attachments || [];
+        const imageAttachment = attachments.find(a => a.type === 'image');
+        const imageUrl = imageAttachment?.payload?.url || null;
+
+        // Only proceed if there's actual content
+        if (!customerMessage && !imageUrl) {
+          res.sendStatus(200);
+          return;
+        }
+
+        // NOW log - only real messages reach this point
+        console.log(`📨 ${senderId}: "${customerMessage || '[Image]'}"`);
+
+        // Process the message
+        await handleIncomingMessage(messaging, recipientId);
       }
     }
   } catch (error) {
@@ -148,10 +188,11 @@ router.post('/', async (req, res) => {
 
 /**
  * Handle an incoming Instagram DM
+ * NOTE: This function only receives validated messages with actual content
  */
 async function handleIncomingMessage(messagingEvent, recipientId) {
   const senderId = messagingEvent.sender.id;
-  const messageText = messagingEvent.message?.text;
+  const customerMessage = messagingEvent.message?.text;
   const messageId = messagingEvent.message.mid;
 
   // Detect image attachments
@@ -159,8 +200,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   const imageAttachment = attachments.find(a => a.type === 'image');
   const imageUrl = imageAttachment?.payload?.url || null;
 
-  // Guard: Ignore if no text and no image
-  if (!messageText && !imageUrl) {
+  // FIX 1: Guard at the very top - ignore read receipts, reactions, and any non-text/non-image events
+  // This must be FIRST before any processing
+  if (!customerMessage && !imageUrl) {
     console.log(`ℹ️  Ignoring non-text/non-image event from ${senderId}`);
     return;
   }
@@ -243,8 +285,10 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 4. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
     // If awaiting confirmation, check if customer confirmed and place order directly
     if (metadata.awaiting === 'confirmation') {
+      // FIX 2: Null safe confirmation check
+      const msgText = customerMessage || '';
       const confirmWords = ['yes', 'confirm', 'ok', 'sure', 'place', 'yep', 'yeah', 'تأكيد', 'نعم', 'اه', 'آه', 'موافق'];
-      const isConfirmed = confirmWords.some(word => messageText.toLowerCase().includes(word));
+      const isConfirmed = confirmWords.some(word => msgText.toLowerCase().includes(word));
 
       if (isConfirmed) {
         // Customer confirmed - create Shopify order directly (skip OpenAI)
@@ -319,7 +363,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
               await supabase.from('messages').insert({
                 conversation_id: conversation.id,
                 sender: 'customer',
-                content: messageText || '[Image]',
+                content: customerMessage || '[Image]',
                 platform_message_id: messageId,
                 image_url: imageUrl || null,
               });
@@ -366,7 +410,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
             .insert({
               conversation_id: conversation.id,
               sender: 'customer',
-              content: messageText || '[Image]',
+              content: customerMessage || '[Image]',
               platform_message_id: messageId,
               image_url: imageUrl || null,
             });
@@ -411,22 +455,23 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 5. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
     // GUARD: Don't process through state machine if awaiting confirmation
     // Let Luna handle rejections/corrections via OpenAI
-    if (metadata.awaiting !== 'confirmation') {
+    // FIX 3: Null safe state machine - only process text messages for data collection
+    if (metadata.awaiting !== 'confirmation' && customerMessage) {
       if (metadata.awaiting === 'name') {
-        metadata.collected_info.name = messageText.trim();
+        metadata.collected_info.name = customerMessage.trim();
         metadata.awaiting = 'phone';
       } else if (metadata.awaiting === 'phone') {
         // Validation: Phone must contain at least 5 digits
         const phoneRegex = /\d{5,}/;
-        if (phoneRegex.test(messageText)) {
-          metadata.collected_info.phone = messageText.trim();
+        if (phoneRegex.test(customerMessage)) {
+          metadata.collected_info.phone = customerMessage.trim();
           metadata.awaiting = 'address';
         }
         // If invalid, don't save, don't advance state - Luna will ask again
       } else if (metadata.awaiting === 'address') {
         // Validation: Address must be at least 10 characters
-        if (messageText.trim().length >= 10) {
-          metadata.collected_info.address = messageText.trim();
+        if (customerMessage.trim().length >= 10) {
+          metadata.collected_info.address = customerMessage.trim();
           metadata.awaiting = 'confirmation';
         }
         // If invalid, don't save, don't advance state - Luna will ask again
@@ -447,7 +492,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .insert({
         conversation_id: conversation.id,
         sender: 'customer',
-        content: messageText || '[Image]',
+        content: customerMessage || '[Image]',
         platform_message_id: messageId,
         image_url: imageUrl || null,
       });
@@ -508,7 +553,7 @@ IMPORTANT:
           messages: [
             { role: 'system', content: imageSystemPrompt },
             ...conversationHistory,
-            { role: 'user', content: messageText || 'Do you have this product?' }
+            { role: 'user', content: customerMessage || 'Do you have this product?' }
           ],
           max_tokens: 400
         });
@@ -525,7 +570,7 @@ IMPORTANT:
     } else {
       // TEXT FLOW: Normal conversation without image
       aiReply = await generateReply(
-        messageText,
+        customerMessage,
         knowledgeBaseRows || [],
         inStockProducts,
         outOfStockProducts,
@@ -540,7 +585,7 @@ IMPORTANT:
 
     // 11. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
-      messageText,
+      customerMessage,
       aiReply,
       metadata,
       inStockProducts
