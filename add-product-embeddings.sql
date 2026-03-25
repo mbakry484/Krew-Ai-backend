@@ -58,7 +58,53 @@ BEGIN
 END;
 $$;
 
--- Step 5: Add comment for documentation
+-- Step 5: Create optimized function for Instagram image search
+CREATE OR REPLACE FUNCTION match_products_by_embedding(
+  query_embedding vector(1536),
+  match_brand_id uuid,
+  match_threshold float DEFAULT 0.4,
+  match_count int DEFAULT 3
+)
+RETURNS TABLE (
+  id uuid,
+  shopify_product_id text,
+  name text,
+  description text,
+  price decimal,
+  image_url text,
+  image_description text,
+  in_stock boolean,
+  availability text,
+  similarity float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    products.id,
+    products.shopify_product_id,
+    products.name,
+    products.description,
+    products.price,
+    products.image_url,
+    products.image_description,
+    products.in_stock,
+    products.availability,
+    1 - (products.embedding <=> query_embedding) AS similarity
+  FROM products
+  WHERE
+    products.embedding IS NOT NULL
+    AND products.brand_id = match_brand_id
+    AND products.in_stock = true
+    AND 1 - (products.embedding <=> query_embedding) > match_threshold
+  ORDER BY products.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$;
+
+-- Step 6: Add comments for documentation
 COMMENT ON COLUMN products.image_description IS 'AI-generated description of product image using GPT-4o vision';
 COMMENT ON COLUMN products.embedding IS 'Text embedding vector (1536 dimensions) for semantic search using text-embedding-3-small';
 COMMENT ON FUNCTION match_products IS 'Find similar products using vector similarity search. Returns products ranked by cosine similarity to query embedding.';
+COMMENT ON FUNCTION match_products_by_embedding IS 'Optimized for Instagram image search - only returns in-stock products for a specific brand with similarity above threshold.';

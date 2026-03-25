@@ -3,6 +3,82 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 const { generateReply } = require('../lib/claude');
 const { sendDM } = require('../lib/meta');
+const OpenAI = require('openai');
+
+// Initialize OpenAI client for image similarity search
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY?.trim(),
+});
+
+/**
+ * Find products similar to a customer's image using vector similarity search
+ * @param {string} imageUrl - URL of the customer's image
+ * @param {string} brandId - Brand ID to search within
+ * @returns {Promise<{matches: Array, queryDescription: string|null}>}
+ */
+async function findSimilarProducts(imageUrl, brandId) {
+  try {
+    // Download and encode customer's image as base64
+    const response = await fetch(imageUrl);
+    if (!response.ok) throw new Error(`Failed to download image: ${response.status}`);
+
+    const buffer = await response.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString('base64');
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+
+    // Generate description of customer's image using GPT-4o vision
+    const visionResponse = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 150,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Describe this clothing/product image in 2-3 sentences focusing on: type of item, colors, style, distinctive visual features.'
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${contentType};base64,${base64}`,
+              detail: 'low'
+            }
+          }
+        ]
+      }]
+    });
+
+    const queryDescription = visionResponse.choices[0].message.content;
+    console.log(`🔍 Customer image described as: ${queryDescription}`);
+
+    // Generate embedding for customer's image description
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: queryDescription
+    });
+    const queryEmbedding = embeddingResponse.data[0].embedding;
+
+    // Search for similar products using pgvector
+    const { data: matches, error } = await supabase.rpc('match_products_by_embedding', {
+      query_embedding: queryEmbedding,
+      match_brand_id: brandId,
+      match_threshold: 0.4,
+      match_count: 3
+    });
+
+    if (error) {
+      console.error('❌ Vector search error:', error.message);
+      return { matches: [], queryDescription };
+    }
+
+    console.log(`🎯 Found ${matches?.length || 0} similar products`);
+    return { matches: matches || [], queryDescription };
+
+  } catch (err) {
+    console.error('❌ Image similarity search failed:', err.message);
+    return { matches: [], queryDescription: null };
+  }
+}
 
 /**
  * Format Egyptian phone numbers to E.164 format for Shopify
@@ -112,14 +188,18 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .select('*')
       .eq('brand_id', brand_id);
 
+    // Fetch ALL products - both in stock and out of stock
     const { data: products } = await supabase
       .from('products')
-      .select('name, price, variants, image_url, shopify_product_id')
+      .select('name, price, variants, image_url, shopify_product_id, in_stock')
       .eq('brand_id', brand_id)
-      .eq('in_stock', true)
       .not('price', 'is', null)
       .gt('price', 0)
       .order('name', { ascending: true });
+
+    // Separate into available and unavailable
+    const inStockProducts = products?.filter(p => p.in_stock) || [];
+    const outOfStockProducts = products?.filter(p => !p.in_stock) || [];
 
     // 3. Get or create conversation
     let { data: conversation } = await supabase
@@ -386,25 +466,84 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
 
-    // 10. Generate AI reply with current metadata state and image if present
-    const aiReply = await generateReply(
-      messageText,
-      knowledgeBaseRows || [],
-      products || [],
-      brand_id,
-      conversationHistory,
-      metadata,
-      businessName,
-      imageUrl
-    );
-    console.log(`🤖 Luna reply: "${aiReply}"`);
+    // 10. Generate AI reply
+    let aiReply;
+
+    if (imageUrl) {
+      // IMAGE FLOW: Use vector similarity search to find matching products
+      console.log('📸 Processing customer image with vector search...');
+      const { matches, queryDescription } = await findSimilarProducts(imageUrl, brand_id);
+
+      if (matches && matches.length > 0) {
+        // Found similar products - build focused prompt with matches
+        const matchList = matches.map(p =>
+          `- ${p.name}: ${p.price} EGP, ${p.in_stock ? 'In Stock ✅' : 'Out of Stock ❌'}\n  Visual match: ${p.image_description || 'N/A'}\n  Similarity: ${(p.similarity * 100).toFixed(0)}%`
+        ).join('\n\n');
+
+        // Build system prompt with knowledge base and matched products
+        const { buildSystemPrompt } = require('../lib/claude');
+        const baseSystemPrompt = buildSystemPrompt(businessName, knowledgeBaseRows || [], inStockProducts, outOfStockProducts, metadata);
+
+        const imageSystemPrompt = `${baseSystemPrompt}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 IMAGE SEARCH RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The customer sent an image. Based on visual similarity search, these are the most likely matching products:
+
+${matchList}
+
+Customer's image looks like: ${queryDescription}
+
+IMPORTANT:
+- Confirm which product matches best based on the similarity scores and descriptions
+- State availability and price clearly
+- If the match quality seems low (similarity < 50%), acknowledge it might not be an exact match
+- Offer to help find alternatives if none match well
+`;
+
+        // Use GPT-4o-mini for the final response (we already did the heavy lifting with vision)
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: imageSystemPrompt },
+            ...conversationHistory,
+            { role: 'user', content: messageText || 'Do you have this product?' }
+          ],
+          max_tokens: 400
+        });
+
+        aiReply = completion.choices[0].message.content;
+        console.log(`🤖 Luna reply (image match): "${aiReply}"`);
+
+      } else {
+        // No matches found - fallback to friendly message
+        aiReply = "Sorry, I couldn't find an exact match for this item in our current collection. Could you describe what you're looking for? For example, the color, style, or type of product? That way I can help you find something similar! 😊";
+        console.log(`🤖 Luna reply (no match): "${aiReply}"`);
+      }
+
+    } else {
+      // TEXT FLOW: Normal conversation without image
+      aiReply = await generateReply(
+        messageText,
+        knowledgeBaseRows || [],
+        inStockProducts,
+        outOfStockProducts,
+        brand_id,
+        conversationHistory,
+        metadata,
+        businessName,
+        null  // No image URL
+      );
+      console.log(`🤖 Luna reply: "${aiReply}"`);
+    }
 
     // 11. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
       messageText,
       aiReply,
       metadata,
-      products || []
+      inStockProducts
     );
 
     // 12. Send reply via Meta API
