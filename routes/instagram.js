@@ -81,6 +81,39 @@ async function findSimilarProducts(imageUrl, brandId) {
 }
 
 /**
+ * Transcribe audio/voice note using OpenAI Whisper
+ * @param {string} audioUrl - URL of the audio file from Instagram
+ * @returns {Promise<string|null>} Transcribed text or null if failed
+ */
+async function transcribeAudio(audioUrl) {
+  try {
+    // Download audio file
+    const response = await fetch(audioUrl);
+    if (!response.ok) throw new Error(`Failed to download audio: ${response.status}`);
+
+    const buffer = await response.arrayBuffer();
+    const audioBuffer = Buffer.from(buffer);
+
+    // Create a File object for OpenAI
+    const { toFile } = await import('openai');
+    const audioFile = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' });
+
+    // Transcribe with Whisper (supports Arabic, English, Franco Arabic)
+    const transcription = await openai.audio.transcriptions.create({
+      file: audioFile,
+      model: 'whisper-1',
+      language: 'ar' // Primary language hint (auto-detects others)
+    });
+
+    console.log(`🎤 Transcribed: "${transcription.text}"`);
+    return transcription.text;
+  } catch (err) {
+    console.error('❌ Transcription failed:', err.message);
+    return null;
+  }
+}
+
+/**
  * Format Egyptian phone numbers to E.164 format for Shopify
  * Converts: 01234567890 → +201234567890
  */
@@ -150,12 +183,34 @@ router.post('/', async (req, res) => {
         const attachments = messaging.message?.attachments || [];
         const imageAttachment = attachments.find(a => a.type === 'image');
         const imageUrl = imageAttachment?.payload?.url || null;
+        const audioAttachment = attachments.find(a => a.type === 'audio');
+        const audioUrl = audioAttachment?.payload?.url || null;
+
+        // Detect shared Instagram posts (template type)
+        const templateAttachment = attachments.find(a => a.type === 'template');
+        const sharedPostImageUrl = templateAttachment?.payload?.elements?.[0]?.image_url
+          || templateAttachment?.payload?.elements?.[0]?.url
+          || null;
+
+        // Use shared post image if no direct image was sent
+        const effectiveImageUrl = imageUrl || sharedPostImageUrl;
+
+        // Detect story replies
+        const storyReply = messaging.message?.reply_to?.story || null;
+        const storyImageUrl = storyReply?.url || null;
+        const storyId = storyReply?.id || null;
+
+        if (storyReply) {
+          console.log(`📖 Customer replied to a story: ${storyId}`);
+        }
 
         // Only proceed if there's actual content
-        if (!customerMessage && !imageUrl) continue;
+        if (!customerMessage && !effectiveImageUrl && !audioUrl && !storyReply) continue;
 
         // NOW log - only real messages reach this point
-        console.log(`📨 ${senderId}: "${customerMessage || '[Image]'}"`);
+        if (sharedPostImageUrl) console.log('📤 Customer shared a post, extracting image...');
+        const logMessage = customerMessage || (effectiveImageUrl ? '[Image]' : (storyReply ? '[Story Reply]' : '[Voice Note]'));
+        console.log(`📨 ${senderId}: "${logMessage}"`);
 
         // Process the message
         await handleIncomingMessage(messaging, recipientId);
@@ -174,19 +229,99 @@ router.post('/', async (req, res) => {
  */
 async function handleIncomingMessage(messagingEvent, recipientId) {
   const senderId = messagingEvent.sender.id;
-  const customerMessage = messagingEvent.message?.text;
+  let customerMessage = messagingEvent.message?.text;
   const messageId = messagingEvent.message.mid;
 
-  // Detect image attachments
+  // Detect attachments (image, audio, and shared posts)
   const attachments = messagingEvent.message?.attachments || [];
   const imageAttachment = attachments.find(a => a.type === 'image');
   const imageUrl = imageAttachment?.payload?.url || null;
+  const audioAttachment = attachments.find(a => a.type === 'audio');
+  const audioUrl = audioAttachment?.payload?.url || null;
 
-  // FIX 1: Guard at the very top - ignore read receipts, reactions, and any non-text/non-image events
-  // This must be FIRST before any processing
-  if (!customerMessage && !imageUrl) {
-    console.log(`ℹ️  Ignoring non-text/non-image event from ${senderId}`);
+  // Detect shared Instagram posts (template type)
+  const templateAttachment = attachments.find(a => a.type === 'template');
+  const sharedPostImageUrl = templateAttachment?.payload?.elements?.[0]?.image_url
+    || templateAttachment?.payload?.elements?.[0]?.url
+    || null;
+
+  // Use shared post image if no direct image was sent
+  const effectiveImageUrl = imageUrl || sharedPostImageUrl;
+
+  if (sharedPostImageUrl) {
+    console.log('📤 Customer shared a post, extracting image for vector search...');
+  }
+
+  // Detect story replies
+  const storyReply = messagingEvent.message?.reply_to?.story || null;
+  const storyImageUrl = storyReply?.url || null;
+  const storyId = storyReply?.id || null;
+
+  if (storyReply) {
+    console.log(`📖 Customer replied to story: ${storyId}`);
+  }
+
+  // Guard: ignore events with no content
+  if (!customerMessage && !effectiveImageUrl && !audioUrl && !storyReply) {
+    console.log(`ℹ️  Ignoring event with no content from ${senderId}`);
     return;
+  }
+
+  // Handle voice notes - transcribe to text
+  let finalMessage = customerMessage;
+
+  // If story reply with no text, set a default message
+  if (!finalMessage && storyReply) {
+    finalMessage = 'The customer replied to your story without adding text.';
+  }
+
+  if (audioUrl) {
+    console.log('🎤 Voice note received, transcribing...');
+    const transcribed = await transcribeAudio(audioUrl);
+    if (transcribed) {
+      finalMessage = transcribed;
+      console.log(`✅ Using transcription: "${transcribed}"`);
+    } else {
+      // Fallback if transcription fails
+      finalMessage = 'The customer sent a voice note that could not be transcribed.';
+      console.log('⚠️  Transcription failed, using fallback message');
+    }
+  }
+
+  // Handle story replies - describe the story for context
+  let storyContext = '';
+  if (storyImageUrl) {
+    try {
+      console.log('📖 Processing story image for context...');
+      // Download and describe the story
+      const response = await fetch(storyImageUrl);
+      if (!response.ok) throw new Error(`Failed to download story: ${response.status}`);
+
+      const buffer = await response.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString('base64');
+      const contentType = response.headers.get('content-type') || 'image/jpeg';
+
+      const visionResponse = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        max_tokens: 100,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this Instagram story briefly - what product or content is shown?' },
+            { type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}`, detail: 'low' } }
+          ]
+        }]
+      });
+
+      storyContext = visionResponse.choices[0].message.content;
+      console.log(`📖 Story content: ${storyContext}`);
+    } catch (err) {
+      console.error('❌ Story image processing failed:', err.message);
+      storyContext = 'Customer replied to one of your stories';
+    }
+  } else if (storyReply) {
+    // Story reply but no image URL available
+    storyContext = 'Customer replied to one of your stories';
   }
 
   try {
@@ -267,8 +402,8 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 4. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
     // If awaiting confirmation, check if customer confirmed and place order directly
     if (metadata.awaiting === 'confirmation') {
-      // FIX 2: Null safe confirmation check
-      const msgText = customerMessage || '';
+      // Null safe confirmation check
+      const msgText = finalMessage || '';
       const confirmWords = ['yes', 'confirm', 'ok', 'sure', 'place', 'yep', 'yeah', 'تأكيد', 'نعم', 'اه', 'آه', 'موافق'];
       const isConfirmed = confirmWords.some(word => msgText.toLowerCase().includes(word));
 
@@ -345,9 +480,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
               await supabase.from('messages').insert({
                 conversation_id: conversation.id,
                 sender: 'customer',
-                content: customerMessage || '[Image]',
+                content: finalMessage || '[Image]',
                 platform_message_id: messageId,
-                image_url: imageUrl || null,
+                image_url: effectiveImageUrl || null,
               });
 
               await sendDM(senderId, errorMsg, access_token);
@@ -392,9 +527,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
             .insert({
               conversation_id: conversation.id,
               sender: 'customer',
-              content: customerMessage || '[Image]',
+              content: finalMessage || '[Image]',
               platform_message_id: messageId,
-              image_url: imageUrl || null,
+              image_url: effectiveImageUrl || null,
             });
 
           // Send confirmation message directly
@@ -437,23 +572,23 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 5. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
     // GUARD: Don't process through state machine if awaiting confirmation
     // Let Luna handle rejections/corrections via OpenAI
-    // FIX 3: Null safe state machine - only process text messages for data collection
-    if (metadata.awaiting !== 'confirmation' && customerMessage) {
+    // Null safe state machine - only process text messages for data collection
+    if (metadata.awaiting !== 'confirmation' && finalMessage) {
       if (metadata.awaiting === 'name') {
-        metadata.collected_info.name = customerMessage.trim();
+        metadata.collected_info.name = finalMessage.trim();
         metadata.awaiting = 'phone';
       } else if (metadata.awaiting === 'phone') {
         // Validation: Phone must contain at least 5 digits
         const phoneRegex = /\d{5,}/;
-        if (phoneRegex.test(customerMessage)) {
-          metadata.collected_info.phone = customerMessage.trim();
+        if (phoneRegex.test(finalMessage)) {
+          metadata.collected_info.phone = finalMessage.trim();
           metadata.awaiting = 'address';
         }
         // If invalid, don't save, don't advance state - Luna will ask again
       } else if (metadata.awaiting === 'address') {
         // Validation: Address must be at least 10 characters
-        if (customerMessage.trim().length >= 10) {
-          metadata.collected_info.address = customerMessage.trim();
+        if (finalMessage.trim().length >= 10) {
+          metadata.collected_info.address = finalMessage.trim();
           metadata.awaiting = 'confirmation';
         }
         // If invalid, don't save, don't advance state - Luna will ask again
@@ -474,9 +609,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .insert({
         conversation_id: conversation.id,
         sender: 'customer',
-        content: customerMessage || '[Image]',
+        content: finalMessage || '[Image]',
         platform_message_id: messageId,
-        image_url: imageUrl || null,
+        image_url: effectiveImageUrl || null,
       });
 
     // 8. Map conversation history to OpenAI format
@@ -496,10 +631,10 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 10. Generate AI reply
     let aiReply;
 
-    if (imageUrl) {
+    if (effectiveImageUrl) {
       // IMAGE FLOW: Use vector similarity search to find matching products
       console.log('📸 Processing customer image with vector search...');
-      const { matches, queryDescription } = await findSimilarProducts(imageUrl, brand_id);
+      const { matches, queryDescription } = await findSimilarProducts(effectiveImageUrl, brand_id);
 
       if (matches && matches.length > 0) {
         // Found similar products - build focused prompt with matches
@@ -511,7 +646,12 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         const { buildSystemPrompt } = require('../lib/claude');
         const baseSystemPrompt = buildSystemPrompt(businessName, knowledgeBaseRows || [], inStockProducts, outOfStockProducts, metadata);
 
-        const imageSystemPrompt = `${baseSystemPrompt}
+        // Add story context if available
+        const storySection = storyContext
+          ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📖 STORY CONTEXT\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe customer is replying to your story that shows: ${storyContext}\nUse this context to understand what they're asking about.\n`
+          : '';
+
+        const imageSystemPrompt = `${baseSystemPrompt}${storySection}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 IMAGE SEARCH RESULTS
@@ -537,7 +677,7 @@ IMPORTANT:
           messages: [
             { role: 'system', content: imageSystemPrompt },
             ...conversationHistory,
-            { role: 'user', content: customerMessage || 'Do you have this product?' }
+            { role: 'user', content: finalMessage || 'Do you have this product?' }
           ],
           max_tokens: 400
         });
@@ -554,7 +694,7 @@ IMPORTANT:
     } else {
       // TEXT FLOW: Normal conversation without image
       aiReply = await generateReply(
-        customerMessage,
+        finalMessage,
         knowledgeBaseRows || [],
         inStockProducts,
         outOfStockProducts,
@@ -562,14 +702,15 @@ IMPORTANT:
         conversationHistory,
         metadata,
         businessName,
-        null  // No image URL
+        null,  // No image URL
+        storyContext  // Story context if replying to story
       );
       console.log(`🤖 Luna reply: "${aiReply}"`);
     }
 
     // 11. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
-      customerMessage,
+      finalMessage,
       aiReply,
       metadata,
       inStockProducts
