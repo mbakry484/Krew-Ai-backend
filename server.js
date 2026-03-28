@@ -13,6 +13,8 @@ const aiRoutes = require('./routes/ai');
 const integrationsRoutes = require('./routes/integrations');
 const ordersRoutes = require('./routes/orders');
 const escalationsRoutes = require('./routes/escalations');
+const refundsRoutes = require('./routes/refunds');
+const exchangesRoutes = require('./routes/exchanges');
 
 const app = express();
 
@@ -70,6 +72,8 @@ app.use('/ai', aiRoutes);
 app.use('/integrations', integrationsRoutes);
 app.use('/orders', ordersRoutes);
 app.use('/escalations', escalationsRoutes);
+app.use('/refunds', refundsRoutes);
+app.use('/exchanges', exchangesRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

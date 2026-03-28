@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
-const { generateReply } = require('../lib/claude');
+const { generateReply, checkEscalation } = require('../lib/claude');
 const { sendDM } = require('../lib/meta');
 const OpenAI = require('openai');
 
@@ -399,7 +399,27 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
     console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
 
-    // 4. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
+    // 4. ESCALATION CHECK - Skip AI response if conversation is escalated
+    if (conversation.is_escalated) {
+      console.log(`🚨 Conversation is escalated (type: ${conversation.escalation_type}) - AI will not respond`);
+      console.log(`   Reason: ${conversation.escalation_reason}`);
+
+      // Still save the incoming message for the team to see
+      await supabase
+        .from('messages')
+        .insert({
+          conversation_id: conversation.id,
+          sender: 'customer',
+          content: finalMessage || '[Image]',
+          platform_message_id: messageId,
+          image_url: effectiveImageUrl || null,
+        });
+
+      // Don't send any reply - let human team handle it
+      return;
+    }
+
+    // 5. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
     // If awaiting confirmation, check if customer confirmed and place order directly
     if (metadata.awaiting === 'confirmation') {
       // Null safe confirmation check
@@ -569,7 +589,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       }
     }
 
-    // 5. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
+    // 6. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
     // GUARD: Don't process through state machine if awaiting confirmation
     // Let Luna handle rejections/corrections via OpenAI
     // Null safe state machine - only process text messages for data collection
@@ -595,7 +615,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       }
     }
 
-    // 6. Fetch conversation history (last 10 messages)
+    // 7. Fetch conversation history (last 10 messages)
     const { data: previousMessages } = await supabase
       .from('messages')
       .select('sender, content')
@@ -603,7 +623,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .order('created_at', { ascending: true })
       .limit(10);
 
-    // 7. Save incoming message
+    // 8. Save incoming message
     await supabase
       .from('messages')
       .insert({
@@ -614,13 +634,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         image_url: effectiveImageUrl || null,
       });
 
-    // 8. Map conversation history to OpenAI format
+    // 9. Map conversation history to OpenAI format
     const conversationHistory = (previousMessages || []).map(msg => ({
       role: msg.sender === 'customer' ? 'user' : 'assistant',
       content: msg.content
     }));
 
-    // 9. Fetch business name for system prompt
+    // 10. Fetch business name for system prompt
     const { data: user } = await supabase
       .from('users')
       .select('business_name')
@@ -628,7 +648,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
 
-    // 10. Generate AI reply
+    // 11. Generate AI reply
     let aiReply;
 
     if (effectiveImageUrl) {
@@ -708,7 +728,77 @@ IMPORTANT:
       console.log(`🤖 Luna reply: "${aiReply}"`);
     }
 
-    // 11. Update metadata based on AI reply (only if awaiting is null)
+    // 12. Check for escalation keywords in AI reply
+    const escalationCheck = checkEscalation(aiReply);
+
+    if (escalationCheck.shouldEscalate) {
+      console.log(`🚨 Escalation detected: ${escalationCheck.type}`);
+      console.log(`   Reason: ${escalationCheck.reason}`);
+
+      // Update conversation to mark as escalated
+      await supabase
+        .from('conversations')
+        .update({
+          is_escalated: true,
+          escalation_type: escalationCheck.type,
+          escalation_reason: escalationCheck.reason,
+          escalated_at: new Date().toISOString(),
+          escalated_by: 'ai'
+        })
+        .eq('id', conversation.id);
+
+      // Auto-create refund/exchange record based on type
+      if (escalationCheck.type === 'refund') {
+        const refundData = {
+          brand_id,
+          conversation_id: conversation.id,
+          customer_id: senderId,
+          customer_name: metadata.collected_info?.name || null,
+          customer_phone: metadata.collected_info?.phone || null,
+          original_order_number: metadata.current_order?.product_name ? 'From conversation' : null,
+          product_name: metadata.current_order?.product_name || 'Product name not captured',
+          order_amount: metadata.current_order?.price || null,
+          refund_amount: metadata.current_order?.price || null,
+          refund_reason: 'defective', // Default, can be updated by team
+          refund_reason_details: `Customer message: ${finalMessage}`,
+          status: 'pending'
+        };
+
+        await supabase.from('refunds').insert(refundData);
+        console.log('✅ Auto-created refund record');
+      }
+
+      if (escalationCheck.type === 'exchange') {
+        const exchangeData = {
+          brand_id,
+          conversation_id: conversation.id,
+          customer_id: senderId,
+          customer_name: metadata.collected_info?.name || null,
+          customer_phone: metadata.collected_info?.phone || null,
+          customer_address: metadata.collected_info?.address || null,
+          original_product_name: metadata.current_order?.product_name || 'Product name not captured',
+          original_size: null, // To be filled by team
+          exchange_reason: 'size_issue', // Default, can be updated by team
+          exchange_reason_details: `Customer message: ${finalMessage}`,
+          status: 'pending'
+        };
+
+        await supabase.from('exchanges').insert(exchangeData);
+        console.log('✅ Auto-created exchange record');
+      }
+
+      // Remove escalation keywords from reply before sending to customer
+      aiReply = aiReply
+        .replace(/ESCALATE_EXCHANGE/gi, '')
+        .replace(/ESCALATE_REFUND/gi, '')
+        .replace(/ESCALATE_DELIVERY/gi, '')
+        .replace(/ESCALATE_GENERAL/gi, '')
+        .trim();
+
+      console.log(`🤖 Cleaned reply (escalation keywords removed): "${aiReply}"`);
+    }
+
+    // 13. Update metadata based on AI reply (only if awaiting is null)
     metadata = await updateMetadataFromConversation(
       finalMessage,
       aiReply,
@@ -716,11 +806,11 @@ IMPORTANT:
       inStockProducts
     );
 
-    // 12. Send reply via Meta API
+    // 14. Send reply via Meta API
     await sendDM(senderId, aiReply, access_token);
     console.log(`✅ Sent to ${senderId}`);
 
-    // 13. Save AI reply to database
+    // 15. Save AI reply to database
     await supabase
       .from('messages')
       .insert({
@@ -729,7 +819,7 @@ IMPORTANT:
         content: aiReply,
       });
 
-    // 14. Metadata sanity check before saving
+    // 16. Metadata sanity check before saving
     // Prevent saving invalid phone/address data
     if (metadata.collected_info.phone) {
       const phoneRegex = /\d{5,}/;
@@ -749,7 +839,7 @@ IMPORTANT:
       }
     }
 
-    // 15. Save updated metadata (CRITICAL - this preserves order state across messages)
+    // 17. Save updated metadata (CRITICAL - this preserves order state across messages)
     await supabase
       .from('conversations')
       .update({ metadata })
