@@ -404,7 +404,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       awaiting: null
     };
 
-    const { data: conversation } = await supabase
+    const { data: conversation, error: convError } = await supabase
       .from('conversations')
       .upsert({
         brand_id,
@@ -419,7 +419,17 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         channel: 'instagram'
       }, { onConflict: 'instagram_thread_id' })
       .select()
-      .single();
+      .maybeSingle();
+
+    if (convError) {
+      console.error('❌ Failed to upsert conversation:', convError.message);
+      return;
+    }
+
+    if (!conversation) {
+      console.error('❌ Conversation upsert returned null');
+      return;
+    }
 
     // Load metadata from database (CRITICAL - this is Luna's memory)
     let metadata = defaultMetadata;
@@ -428,10 +438,10 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
     console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
 
-    // 4. ESCALATION CHECK - Skip AI response if conversation is escalated
-    if (conversation.is_escalated) {
-      console.log(`🚨 Conversation is escalated (type: ${conversation.escalation_type}) - AI will not respond`);
-      console.log(`   Reason: ${conversation.escalation_reason}`);
+    // 4. ESCALATION CHECK - use existingConv (pre-upsert state) to detect escalation
+    // The upsert sets is_escalated: false, so conversation.is_escalated is always false here
+    if (existingConv?.is_escalated === true) {
+      console.log(`🚨 Conversation is escalated - AI will not respond`);
 
       // Still save the incoming message for the team to see
       await supabase
