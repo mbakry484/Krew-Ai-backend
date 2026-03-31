@@ -114,6 +114,25 @@ async function transcribeAudio(audioUrl) {
 }
 
 /**
+ * Fetch customer's Instagram/Facebook profile (name and username)
+ */
+async function getCustomerProfile(senderId, accessToken) {
+  try {
+    const response = await fetch(
+      `https://graph.facebook.com/v21.0/${senderId}?fields=name,username&access_token=${accessToken}`
+    );
+    const data = await response.json();
+    return {
+      name: data.name || null,
+      username: data.username || null
+    };
+  } catch (err) {
+    console.error('Failed to fetch customer profile:', err.message);
+    return { name: null, username: null };
+  }
+}
+
+/**
  * Format Egyptian phone numbers to E.164 format for Shopify
  * Converts: 01234567890 → +201234567890
  */
@@ -341,6 +360,23 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     const { brand_id, access_token } = integration;
     console.log(`🔍 Brand found: ${brand_id}`);
 
+    // 1b. Check if Luna is active for this conversation
+    const { data: existingConv } = await supabase
+      .from('conversations')
+      .select('is_luna_active, status')
+      .eq('instagram_thread_id', senderId)
+      .eq('brand_id', brand_id)
+      .single();
+
+    if (existingConv && !existingConv.is_luna_active) {
+      console.log(`⏸️ Luna is paused for ${senderId} - human has taken over`);
+      return;
+    }
+
+    // 1c. Fetch customer profile
+    const profile = await getCustomerProfile(senderId, access_token);
+    console.log(`👤 Customer: ${profile.name} (@${profile.username})`);
+
     // 2. Fetch knowledge base and products
     const { data: knowledgeBaseRows } = await supabase
       .from('knowledge_base')
@@ -360,15 +396,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     const inStockProducts = products?.filter(p => p.in_stock) || [];
     const outOfStockProducts = products?.filter(p => !p.in_stock) || [];
 
-    // 3. Get or create conversation
-    let { data: conversation } = await supabase
-      .from('conversations')
-      .select('*')
-      .eq('brand_id', brand_id)
-      .eq('customer_id', senderId)
-      .eq('platform', 'instagram')
-      .maybeSingle();
-
+    // 3. Upsert conversation with customer profile info
     const defaultMetadata = {
       discussed_products: [],
       current_order: null,
@@ -376,21 +404,22 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       awaiting: null
     };
 
-    if (!conversation) {
-      const { data: newConv } = await supabase
-        .from('conversations')
-        .insert({
-          brand_id,
-          customer_id: senderId,
-          platform: 'instagram',
-          status: 'active',
-          metadata: defaultMetadata
-        })
-        .select()
-        .single();
-
-      conversation = newConv;
-    }
+    const { data: conversation } = await supabase
+      .from('conversations')
+      .upsert({
+        brand_id,
+        instagram_thread_id: senderId,
+        customer_instagram_id: senderId,
+        customer_name: profile.name,
+        customer_username: profile.username,
+        status: 'active',
+        last_message: finalMessage || '[Image]',
+        last_message_at: new Date().toISOString(),
+        channel: 'instagram',
+        is_luna_active: true
+      }, { onConflict: 'instagram_thread_id' })
+      .select()
+      .single();
 
     // Load metadata from database (CRITICAL - this is Luna's memory)
     let metadata = defaultMetadata;
@@ -409,10 +438,11 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         .from('messages')
         .insert({
           conversation_id: conversation.id,
-          sender: 'customer',
+          direction: 'inbound',
           content: finalMessage || '[Image]',
-          platform_message_id: messageId,
-          image_url: effectiveImageUrl || null,
+          sender_name: profile.name || 'Customer',
+          is_luna: false,
+          sent_at: new Date().toISOString()
         });
 
       // Don't send any reply - let human team handle it
@@ -496,23 +526,27 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
               // Handle Shopify failure gracefully - don't fall back to OpenAI
               const errorMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
 
-              // Send error message to customer
-              await supabase.from('messages').insert({
-                conversation_id: conversation.id,
-                sender: 'customer',
-                content: finalMessage || '[Image]',
-                platform_message_id: messageId,
-                image_url: effectiveImageUrl || null,
-              });
-
               await sendDM(senderId, errorMsg, access_token);
               console.log(`✅ Sent error message to ${senderId}`);
 
-              await supabase.from('messages').insert({
-                conversation_id: conversation.id,
-                sender: 'ai',
-                content: errorMsg,
-              });
+              await supabase.from('messages').insert([
+                {
+                  conversation_id: conversation.id,
+                  direction: 'inbound',
+                  content: finalMessage || '[Image]',
+                  sender_name: profile.name || 'Customer',
+                  is_luna: false,
+                  sent_at: new Date().toISOString()
+                },
+                {
+                  conversation_id: conversation.id,
+                  direction: 'outbound',
+                  content: errorMsg,
+                  sender_name: 'Luna',
+                  is_luna: true,
+                  sent_at: new Date().toISOString()
+                }
+              ]);
 
               // Keep metadata intact so customer can try again
               // Return early - skip OpenAI call
@@ -541,29 +575,29 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
             confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${metadata.current_order.product_name}\n• Price: ${metadata.current_order.price} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
           }
 
-          // Save incoming message
-          await supabase
-            .from('messages')
-            .insert({
-              conversation_id: conversation.id,
-              sender: 'customer',
-              content: finalMessage || '[Image]',
-              platform_message_id: messageId,
-              image_url: effectiveImageUrl || null,
-            });
-
           // Send confirmation message directly
           await sendDM(senderId, confirmationMsg, access_token);
           console.log(`✅ Sent to ${senderId}`);
 
-          // Save confirmation message
-          await supabase
-            .from('messages')
-            .insert({
+          // Save inbound + outbound messages
+          await supabase.from('messages').insert([
+            {
               conversation_id: conversation.id,
-              sender: 'ai',
+              direction: 'inbound',
+              content: finalMessage || '[Image]',
+              sender_name: profile.name || 'Customer',
+              is_luna: false,
+              sent_at: new Date().toISOString()
+            },
+            {
+              conversation_id: conversation.id,
+              direction: 'outbound',
               content: confirmationMsg,
-            });
+              sender_name: 'Luna',
+              is_luna: true,
+              sent_at: new Date().toISOString()
+            }
+          ]);
 
           // Reset metadata after successful order
           metadata = {
@@ -623,16 +657,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .order('created_at', { ascending: true })
       .limit(10);
 
-    // 8. Save incoming message
-    await supabase
-      .from('messages')
-      .insert({
-        conversation_id: conversation.id,
-        sender: 'customer',
-        content: finalMessage || '[Image]',
-        platform_message_id: messageId,
-        image_url: effectiveImageUrl || null,
-      });
+    // 8. Save incoming message (deferred - will batch with outbound after reply is generated)
 
     // 9. Map conversation history to OpenAI format
     const conversationHistory = (previousMessages || []).map(msg => ({
@@ -810,14 +835,55 @@ IMPORTANT:
     await sendDM(senderId, aiReply, access_token);
     console.log(`✅ Sent to ${senderId}`);
 
-    // 15. Save AI reply to database
-    await supabase
-      .from('messages')
-      .insert({
+    // 15. Save inbound + outbound messages and update last_message
+    await supabase.from('messages').insert([
+      {
         conversation_id: conversation.id,
-        sender: 'ai',
+        direction: 'inbound',
+        content: finalMessage || '[Image]',
+        sender_name: profile.name || 'Customer',
+        is_luna: false,
+        sent_at: new Date().toISOString()
+      },
+      {
+        conversation_id: conversation.id,
+        direction: 'outbound',
         content: aiReply,
-      });
+        sender_name: 'Luna',
+        is_luna: true,
+        sent_at: new Date().toISOString()
+      }
+    ]);
+
+    await supabase
+      .from('conversations')
+      .update({
+        last_message: aiReply,
+        last_message_at: new Date().toISOString()
+      })
+      .eq('id', conversation.id);
+
+    // 15b. Escalation detection based on customer message or Luna's reply
+    const escalationTriggers = [
+      'speak to human', 'real person', 'manager', 'supervisor',
+      'not helpful', 'useless', 'complaint', 'legal', 'lawsuit',
+      'كلم حد', 'مدير', 'شكوى', 'مش بتساعد'
+    ];
+
+    const shouldEscalate = escalationTriggers.some(trigger =>
+      finalMessage?.toLowerCase().includes(trigger)
+    ) || aiReply.includes('ESCALATE');
+
+    if (shouldEscalate) {
+      await supabase
+        .from('conversations')
+        .update({
+          status: 'escalated',
+          is_luna_active: false
+        })
+        .eq('id', conversation.id);
+      console.log(`🚨 Conversation escalated: ${conversation.id}`);
+    }
 
     // 16. Metadata sanity check before saving
     // Prevent saving invalid phone/address data

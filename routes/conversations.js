@@ -3,14 +3,107 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 // const { verifyToken } = require('../middleware/auth');
 
-// TODO: Implement conversation management routes
-// - GET /conversations - List all conversations for a brand (protected)
-// - GET /conversations/:id - Get single conversation with messages (protected)
-// - PUT /conversations/:id - Update conversation status (protected)
-// - POST /conversations/:id/messages - Send manual message (protected)
+// GET /conversations - List all conversations for the brand ordered by last_message_at DESC
+router.get('/', async (req, res) => {
+  try {
+    const { brand_id } = req.query;
+    if (!brand_id) {
+      return res.status(400).json({ error: 'brand_id query parameter is required' });
+    }
 
-router.get('/', (req, res) => {
-  res.status(501).json({ message: 'List conversations endpoint not yet implemented' });
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('id, customer_name, customer_username, status, last_message, last_message_at, channel, is_luna_active')
+      .eq('brand_id', brand_id)
+      .order('last_message_at', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch conversations', details: error.message });
+    }
+
+    res.json({ conversations: data || [] });
+  } catch (error) {
+    console.error(`❌ Error: ${error.message}`);
+    res.status(500).json({ error: 'Failed to fetch conversations', details: error.message });
+  }
+});
+
+// GET /conversations/:id/messages - Returns all messages for a conversation ordered by sent_at ASC
+router.get('/:id/messages', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', id)
+      .order('sent_at', { ascending: true });
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch messages', details: error.message });
+    }
+
+    res.json({ messages: data || [] });
+  } catch (error) {
+    console.error(`❌ Error: ${error.message}`);
+    res.status(500).json({ error: 'Failed to fetch messages', details: error.message });
+  }
+});
+
+// POST /conversations/:id/takeover - Human takes over, Luna stops responding
+router.post('/:id/takeover', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('conversations')
+      .update({ is_luna_active: false, status: 'escalated' })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to take over conversation', details: error.message });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    console.log(`🛑 Human took over conversation ${id}`);
+    res.json({ success: true, conversation: data });
+  } catch (error) {
+    console.error(`❌ Error: ${error.message}`);
+    res.status(500).json({ error: 'Failed to take over conversation', details: error.message });
+  }
+});
+
+// POST /conversations/:id/handback - Hand conversation back to Luna
+router.post('/:id/handback', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('conversations')
+      .update({ is_luna_active: true, status: 'active' })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to hand back conversation', details: error.message });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    console.log(`▶️ Luna resumed conversation ${id}`);
+    res.json({ success: true, conversation: data });
+  } catch (error) {
+    console.error(`❌ Error: ${error.message}`);
+    res.status(500).json({ error: 'Failed to hand back conversation', details: error.message });
+  }
 });
 
 router.get('/:id', (req, res) => {
@@ -30,7 +123,6 @@ router.post('/:id/reset-metadata', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Reset metadata to empty state
     const { data, error } = await supabase
       .from('conversations')
       .update({
