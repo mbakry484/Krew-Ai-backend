@@ -298,6 +298,7 @@ router.post('/:id/messages', verifyToken, async (req, res) => {
         .from('integrations')
         .select('access_token, instagram_page_id')
         .eq('brand_id', conv.brand_id)
+        .not('instagram_page_id', 'is', null)
         .maybeSingle();
 
       if (integError) {
