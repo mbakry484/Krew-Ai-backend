@@ -363,13 +363,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // 1b. Check if conversation is escalated (human has taken over)
     const { data: existingConv } = await supabase
       .from('conversations')
-      .select('is_escalated, status')
+      .select('is_escalated, is_luna_active, status')
       .eq('instagram_thread_id', senderId)
       .eq('brand_id', brand_id)
       .maybeSingle();
 
-    if (existingConv && existingConv.is_escalated === true) {
-      console.log(`⏸️ Luna is paused for ${senderId} - conversation is escalated`);
+    if (existingConv && (existingConv.is_escalated === true || existingConv.is_luna_active === false)) {
+      console.log(`⏸️ Luna is paused for ${senderId}`);
       return;
     }
 
@@ -404,22 +404,23 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       awaiting: null
     };
 
-    const { data: conversation, error: convError } = await supabase
-      .from('conversations')
-      .upsert({
-        brand_id,
-        instagram_thread_id: senderId,
-        customer_instagram_id: senderId,
-        customer_name: profile.name,
-        customer_username: profile.username,
-        status: 'active',
-        is_escalated: false,
-        last_message: finalMessage || '[Image]',
-        last_message_at: new Date().toISOString(),
-        channel: 'instagram'
-      }, { onConflict: 'instagram_thread_id' })
-      .select()
-      .maybeSingle();
+  const { data: conversation, error: convError } = await supabase
+    .from('conversations')
+    .upsert({
+      brand_id,
+      instagram_thread_id: senderId,
+      customer_id: senderId,          // ← was customer_instagram_id, correct is customer_id
+      customer_name: profile.name,
+      customer_username: profile.username,
+      status: 'active',
+      is_escalated: false,
+      is_luna_active: true,
+      last_message: finalMessage || '[Image]',
+      last_message_at: new Date().toISOString(),
+      channel: 'instagram'
+    }, { onConflict: 'instagram_thread_id' })
+    .select()
+    .maybeSingle();
 
     if (convError) {
       console.error('❌ Failed to upsert conversation:', convError.message);
