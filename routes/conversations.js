@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
+const { sendDM } = require('../lib/meta');
 
 /**
  * GET /conversations
@@ -289,7 +290,35 @@ router.post('/:id/messages', verifyToken, async (req, res) => {
       .update({ updated_at: new Date().toISOString() })
       .eq('id', id);
 
-    console.log(`✅ Agent message sent to conversation ${id}`);
+    // Send the message to Instagram — use same lookup pattern as the AI webhook
+    if (conv.platform === 'instagram') {
+      console.log(`📤 Attempting to send agent DM to Instagram user ${conv.customer_id} (brand: ${conv.brand_id})`);
+
+      const { data: integration, error: integError } = await supabase
+        .from('integrations')
+        .select('access_token, instagram_page_id')
+        .eq('brand_id', conv.brand_id)
+        .maybeSingle();
+
+      if (integError) {
+        console.error('❌ Integration query error:', integError.message);
+      } else if (!integration) {
+        console.error('❌ No integration row found for brand_id:', conv.brand_id);
+      } else if (!integration.access_token) {
+        console.error('❌ Integration found but access_token is empty for brand_id:', conv.brand_id);
+      } else {
+        console.log(`🔑 Using token for page ${integration.instagram_page_id}: ${integration.access_token.substring(0, 15)}...`);
+        try {
+          await sendDM(conv.customer_id, content.trim(), integration.access_token);
+          console.log(`✅ Agent DM delivered to Instagram user ${conv.customer_id}`);
+        } catch (dmErr) {
+          console.error('❌ sendDM failed:', dmErr.message);
+          // Message is already saved to DB — don't fail the HTTP response
+        }
+      }
+    }
+
+    console.log(`✅ Agent message saved to conversation ${id}`);
 
     res.status(201).json({
       message: {
