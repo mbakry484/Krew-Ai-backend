@@ -57,7 +57,7 @@ router.post('/:id/takeover', async (req, res) => {
 
     const { data, error } = await supabase
       .from('conversations')
-      .update({ is_luna_active: false, status: 'escalated' })
+      .update({ is_escalated: true, status: 'escalated' })
       .eq('id', id)
       .select()
       .single();
@@ -85,7 +85,7 @@ router.post('/:id/handback', async (req, res) => {
 
     const { data, error } = await supabase
       .from('conversations')
-      .update({ is_luna_active: true, status: 'active' })
+      .update({ is_escalated: false, status: 'active' })
       .eq('id', id)
       .select()
       .single();

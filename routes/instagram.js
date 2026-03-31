@@ -360,16 +360,16 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     const { brand_id, access_token } = integration;
     console.log(`🔍 Brand found: ${brand_id}`);
 
-    // 1b. Check if Luna is active for this conversation
+    // 1b. Check if conversation is escalated (human has taken over)
     const { data: existingConv } = await supabase
       .from('conversations')
-      .select('is_luna_active, status')
+      .select('is_escalated, status')
       .eq('instagram_thread_id', senderId)
       .eq('brand_id', brand_id)
       .maybeSingle();
 
-    if (existingConv && existingConv.is_luna_active === false) {
-      console.log(`⏸️ Luna is paused for ${senderId} - human has taken over`);
+    if (existingConv && existingConv.is_escalated === true) {
+      console.log(`⏸️ Luna is paused for ${senderId} - conversation is escalated`);
       return;
     }
 
@@ -413,10 +413,10 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         customer_name: profile.name,
         customer_username: profile.username,
         status: 'active',
+        is_escalated: false,
         last_message: finalMessage || '[Image]',
         last_message_at: new Date().toISOString(),
-        channel: 'instagram',
-        is_luna_active: true
+        channel: 'instagram'
       }, { onConflict: 'instagram_thread_id' })
       .select()
       .single();
@@ -879,7 +879,7 @@ IMPORTANT:
         .from('conversations')
         .update({
           status: 'escalated',
-          is_luna_active: false
+          is_escalated: true
         })
         .eq('id', conversation.id);
       console.log(`🚨 Conversation escalated: ${conversation.id}`);
