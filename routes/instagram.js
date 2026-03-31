@@ -366,9 +366,9 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .select('is_luna_active, status')
       .eq('instagram_thread_id', senderId)
       .eq('brand_id', brand_id)
-      .single();
+      .maybeSingle();
 
-    if (existingConv && !existingConv.is_luna_active) {
+    if (existingConv && existingConv.is_luna_active === false) {
       console.log(`⏸️ Luna is paused for ${senderId} - human has taken over`);
       return;
     }
