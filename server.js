@@ -15,6 +15,7 @@ const ordersRoutes = require('./routes/orders');
 const escalationsRoutes = require('./routes/escalations');
 const refundsRoutes = require('./routes/refunds');
 const exchangesRoutes = require('./routes/exchanges');
+const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
 
 const app = express();
 
@@ -74,6 +75,7 @@ app.use('/orders', ordersRoutes);
 app.use('/escalations', escalationsRoutes);
 app.use('/refunds', refundsRoutes);
 app.use('/exchanges', exchangesRoutes);
+app.use('/exchanges-refunds', exchangesRefundsRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
