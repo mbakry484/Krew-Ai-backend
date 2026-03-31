@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { generateReply, checkEscalation } = require('../lib/claude');
-const { sendDM } = require('../lib/meta');
+const { sendDM, getUserProfile } = require('../lib/meta');
 const OpenAI = require('openai');
 
 // Initialize OpenAI client for image similarity search
@@ -377,11 +377,16 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     };
 
     if (!conversation) {
+      // Fetch Instagram profile for display in the dashboard
+      const profile = await getUserProfile(senderId, access_token);
+
       const { data: newConv } = await supabase
         .from('conversations')
         .insert({
           brand_id,
           customer_id: senderId,
+          customer_name: profile?.name || null,
+          customer_username: profile?.username || null,
           platform: 'instagram',
           status: 'active',
           metadata: defaultMetadata
@@ -390,6 +395,20 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
         .single();
 
       conversation = newConv;
+    } else if (!conversation.customer_name && !conversation.customer_username) {
+      // Backfill profile for existing conversations that don't have it yet
+      const profile = await getUserProfile(senderId, access_token);
+      if (profile?.name || profile?.username) {
+        await supabase
+          .from('conversations')
+          .update({
+            customer_name: profile.name || null,
+            customer_username: profile.username || null,
+          })
+          .eq('id', conversation.id);
+        conversation.customer_name = profile.name;
+        conversation.customer_username = profile.username;
+      }
     }
 
     // Load metadata from database (CRITICAL - this is Luna's memory)
