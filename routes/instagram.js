@@ -439,23 +439,62 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
 
     // 5a. REFUND/EXCHANGE INFO COLLECTION STATE MACHINE
-    // Handle collecting order_id and reason for refund/exchange before escalating
-    if (finalMessage && ['refund_id', 'refund_reason', 'refund_ready',
-                          'exchange_id', 'exchange_reason', 'exchange_ready'].includes(metadata.awaiting)) {
+    // Fully deterministic — no AI involved, no regex guessing.
+    // Flow: detect intent → ask order ID → wait 10s → ask reason → escalate with both fields.
+    if (finalMessage) {
+      const msgLower = finalMessage.toLowerCase();
 
-      const isRefundFlow = metadata.awaiting.startsWith('refund');
+      // ── Step 1: Detect fresh intent (only when not already in a flow) ──────────────────
+      if (metadata.awaiting === null || metadata.awaiting === undefined) {
+        // Exchange keywords (checked FIRST to avoid misclassifying as refund)
+        const exchangeKeywords = ['exchange', 'swap', 'replace', 'تبديل', 'استبدال', 'مقاس تاني', 'عايز تغيير', 'بدل'];
+        // Refund keywords — only matched if NO exchange keyword present
+        const refundKeywords = ['refund', 'money back', 'return my money', 'استرجاع', 'استرداد', 'فلوسي ارجع', 'ارجع فلوسي', 'عايز فلوسي', 'رجعولي فلوسي'];
 
-      // Initialize pending info store if not present
-      if (!metadata.pending_request) {
-        metadata.pending_request = { order_id: null, reason: null };
+        const isExchangeRequest = exchangeKeywords.some(k => msgLower.includes(k));
+        const isRefundRequest = !isExchangeRequest && refundKeywords.some(k => msgLower.includes(k));
+
+        if (isExchangeRequest || isRefundRequest) {
+          const flowType = isExchangeRequest ? 'exchange' : 'refund';
+          console.log(`🔄 ${flowType.toUpperCase()} intent detected — starting collection flow`);
+
+          // Save customer message
+          await supabase.from('messages').insert({
+            conversation_id: conversation.id,
+            sender: 'customer',
+            content: finalMessage,
+            platform_message_id: messageId,
+            image_url: effectiveImageUrl || null,
+          });
+
+          // Set state to awaiting order ID
+          metadata.awaiting = flowType === 'refund' ? 'refund_id' : 'exchange_id';
+          metadata.pending_request = { order_id: null, reason: null, type: flowType };
+          await supabase.from('conversations').update({ metadata, updated_at: new Date().toISOString() }).eq('id', conversation.id);
+
+          // Ask for order ID
+          const askIdMsg = flowType === 'refund'
+            ? "I'm sorry to hear that! I want to make sure we sort this out for you. Could you please share your order ID? 🙏"
+            : "I'm sorry to hear that! I'd be happy to help with your exchange. Could you please share your order ID? 🙏";
+
+          await sendDM(senderId, askIdMsg, access_token);
+          await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: askIdMsg });
+          console.log(`✅ Asked for order ID (${flowType} flow)`);
+          return;
+        }
       }
 
+      // ── Step 2: Collect order ID ──────────────────────────────────────────────────────
       if (metadata.awaiting === 'refund_id' || metadata.awaiting === 'exchange_id') {
-        // Store what customer sent as order ID, then ask for reason
-        metadata.pending_request.order_id = finalMessage.trim();
-        metadata.awaiting = isRefundFlow ? 'refund_reason' : 'exchange_reason';
+        const isRefundFlow = metadata.awaiting === 'refund_id';
+        if (!metadata.pending_request) metadata.pending_request = { order_id: null, reason: null, type: isRefundFlow ? 'refund' : 'exchange' };
 
-        // Save incoming message
+        // Extract the numeric/alphanumeric order ID from the message
+        // Matches: "#2983987", "the order id is 83686873", "757576", "#908787389", "order #ABC-123"
+        const idMatch = finalMessage.match(/#?([A-Za-z0-9][\w\-]{2,})/);
+        const extractedId = idMatch ? idMatch[1] : null;
+
+        // Save customer message
         await supabase.from('messages').insert({
           conversation_id: conversation.id,
           sender: 'customer',
@@ -464,35 +503,59 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
           image_url: effectiveImageUrl || null,
         });
 
-        // Save metadata
-        await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
+        if (!extractedId) {
+          // No valid ID found — ask again after 10 seconds
+          console.log(`⚠️ No order ID found in: "${finalMessage}" — asking again`);
+          await supabase.from('conversations').update({ metadata, updated_at: new Date().toISOString() }).eq('id', conversation.id);
 
-        // Ask for reason after a brief pause
+          await new Promise(resolve => setTimeout(resolve, 10000));
+
+          const retryMsg = isRefundFlow
+            ? "I couldn't find an order ID in your message. Could you share just the order number? It usually looks like a number (e.g. 12345 or #12345) 🙏"
+            : "I couldn't find an order ID in your message. Could you share just the order number? It usually looks like a number (e.g. 12345 or #12345) 🙏";
+
+          await sendDM(senderId, retryMsg, access_token);
+          await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: retryMsg });
+          await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
+          return;
+        }
+
+        // Valid ID extracted — advance to reason collection
+        metadata.pending_request.order_id = extractedId;
+        metadata.awaiting = isRefundFlow ? 'refund_reason' : 'exchange_reason';
+
+        await supabase.from('conversations').update({ metadata, updated_at: new Date().toISOString() }).eq('id', conversation.id);
+        console.log(`📝 Order ID extracted: "${extractedId}" from message: "${finalMessage}" — waiting 10s then asking for reason`);
+
+        // Wait 10 seconds, then ask for the reason
         await new Promise(resolve => setTimeout(resolve, 10000));
 
         const askReasonMsg = isRefundFlow
-          ? "Got it! And could you please tell me the reason for your refund request? 🙏"
-          : "Got it! And could you please tell me the reason for the exchange? 🙏";
+          ? "Got it, thank you! And could you please tell me the reason for your refund request? 🙏"
+          : "Got it, thank you! And could you please tell me the reason for the exchange? 🙏";
 
         await sendDM(senderId, askReasonMsg, access_token);
-        await supabase.from('messages').insert({
-          conversation_id: conversation.id,
-          sender: 'ai',
-          content: askReasonMsg,
-        });
-        await supabase.from('conversations').update({
-          metadata,
-          updated_at: new Date().toISOString()
-        }).eq('id', conversation.id);
-
+        await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: askReasonMsg });
+        await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
+        console.log(`✅ Asked for reason (${isRefundFlow ? 'refund' : 'exchange'} flow)`);
         return;
+      }
 
-      } else if (metadata.awaiting === 'refund_reason' || metadata.awaiting === 'exchange_reason') {
-        // Store reason and mark as ready to escalate
+      // ── Step 3: Collect reason → escalate ────────────────────────────────────────────
+      if (metadata.awaiting === 'refund_reason' || metadata.awaiting === 'exchange_reason') {
+        const isRefundFlow = metadata.awaiting === 'refund_reason';
+        if (!metadata.pending_request) metadata.pending_request = { order_id: 'unknown', reason: null, type: isRefundFlow ? 'refund' : 'exchange' };
+
+        // Accept whatever the customer sends as the reason
         metadata.pending_request.reason = finalMessage.trim();
-        metadata.awaiting = isRefundFlow ? 'refund_ready' : 'exchange_ready';
 
-        // Save incoming message
+        const orderId = metadata.pending_request.order_id || 'not provided';
+        const reason = metadata.pending_request.reason;
+        const flowType = isRefundFlow ? 'refund' : 'exchange';
+
+        console.log(`📝 Reason collected: "${reason}" — escalating ${flowType}`);
+
+        // Save customer message
         await supabase.from('messages').insert({
           conversation_id: conversation.id,
           sender: 'customer',
@@ -501,211 +564,65 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
           image_url: effectiveImageUrl || null,
         });
 
-        // Save metadata first
-        await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
-
-        // Now escalate
-        const orderId = metadata.pending_request.order_id;
-        const reason = metadata.pending_request.reason;
-
+        // Mark conversation as escalated
         await supabase.from('conversations').update({
           is_escalated: true,
-          escalation_type: isRefundFlow ? 'refund' : 'exchange',
-          escalation_reason: isRefundFlow
-            ? `Customer requested refund - Order: ${orderId} - Reason: ${reason}`
-            : `Customer requested exchange - Order: ${orderId} - Reason: ${reason}`,
+          escalation_type: flowType,
+          escalation_reason: `Customer requested ${flowType} — Order ID: ${orderId} — Reason: ${reason}`,
           escalated_at: new Date().toISOString(),
           escalated_by: 'ai',
-          metadata: { ...metadata, awaiting: null, pending_request: null }
+          metadata: {
+            ...metadata,
+            awaiting: null,
+            pending_request: null
+          },
+          updated_at: new Date().toISOString()
         }).eq('id', conversation.id);
 
+        // Create the DB record with full details
         if (isRefundFlow) {
           await supabase.from('refunds').insert({
             brand_id,
             conversation_id: conversation.id,
             customer_id: senderId,
-            customer_name: metadata.collected_info?.name || null,
+            customer_name: conversation.customer_name || metadata.collected_info?.name || null,
             customer_phone: metadata.collected_info?.phone || null,
             original_order_number: orderId,
-            product_name: metadata.current_order?.product_name || 'Product not specified',
+            product_name: metadata.current_order?.product_name || 'Not specified',
             order_amount: metadata.current_order?.price || null,
             refund_amount: metadata.current_order?.price || null,
             refund_reason: 'other',
             refund_reason_details: reason,
             status: 'pending'
           });
-          console.log('✅ Auto-created refund record with order ID and reason');
+          console.log(`✅ Refund record created — Order: ${orderId}, Reason: ${reason}`);
         } else {
           await supabase.from('exchanges').insert({
             brand_id,
             conversation_id: conversation.id,
             customer_id: senderId,
-            customer_name: metadata.collected_info?.name || null,
+            customer_name: conversation.customer_name || metadata.collected_info?.name || null,
             customer_phone: metadata.collected_info?.phone || null,
             customer_address: metadata.collected_info?.address || null,
-            original_product_name: metadata.current_order?.product_name || 'Product not specified',
+            original_product_name: metadata.current_order?.product_name || 'Not specified',
             original_order_number: orderId,
             original_size: null,
             exchange_reason: 'other',
             exchange_reason_details: reason,
             status: 'pending'
           });
-          console.log('✅ Auto-created exchange record with order ID and reason');
+          console.log(`✅ Exchange record created — Order: ${orderId}, Reason: ${reason}`);
         }
 
+        // Send handoff message to customer
         const handoffMsg = isRefundFlow
-          ? "Thank you! I've passed your refund request to our team along with your order details. They'll get back to you as soon as possible 🙏"
-          : "Thank you! I've passed your exchange request to our team along with your order details. They'll get back to you as soon as possible 🙏";
+          ? "Thank you! I've passed your refund request to our team with your order details and reason. They'll get back to you as soon as possible 🙏"
+          : "Thank you! I've passed your exchange request to our team with your order details and reason. They'll get back to you as soon as possible 🙏";
 
         await sendDM(senderId, handoffMsg, access_token);
-        await supabase.from('messages').insert({
-          conversation_id: conversation.id,
-          sender: 'ai',
-          content: handoffMsg,
-        });
+        await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: handoffMsg });
         await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
-
         return;
-      }
-    }
-
-    // Detect fresh refund/exchange intent (not yet in the collection flow)
-    if (finalMessage && metadata.awaiting === null) {
-      const msgLower = finalMessage.toLowerCase();
-
-      // Exchange detection (must be checked BEFORE refund to avoid misclassification)
-      const exchangeKeywords = ['exchange', 'swap', 'change', 'replace', 'تبديل', 'تغيير', 'استبدال', 'مقاس تاني'];
-      const refundKeywords = ['refund', 'money back', 'استرجاع فلوس', 'ارجاع فلوس', 'عايز فلوسي', 'استرداد', 'فلوسي'];
-
-      const isExchangeRequest = exchangeKeywords.some(k => msgLower.includes(k));
-      // Only treat as refund if NO exchange keyword is present
-      const isRefundRequest = !isExchangeRequest && refundKeywords.some(k => msgLower.includes(k));
-
-      if (isExchangeRequest || isRefundRequest) {
-        const flowType = isExchangeRequest ? 'exchange' : 'refund';
-
-        // Try to extract order ID and reason from the same message
-        // Order ID heuristic: a sequence of digits (5+ chars) or alphanumeric token like #12345
-        const orderIdMatch = finalMessage.match(/#?([A-Za-z0-9\-]{4,})/);
-        // Reason: everything that isn't the order ID and isn't the intent keyword
-        const intentWords = [...exchangeKeywords, ...refundKeywords];
-        let detectedOrderId = null;
-        let detectedReason = null;
-
-        if (orderIdMatch) {
-          const candidate = orderIdMatch[1];
-          // Simple check: if it looks like an ID (mostly digits or short alphanumeric), treat it as order ID
-          if (/^\d{4,}$/.test(candidate) || /^[A-Z0-9\-]{4,}$/i.test(candidate)) {
-            detectedOrderId = candidate;
-          }
-        }
-
-        // Check if customer provided both ID and reason in one message
-        // Strip intent words and detected order ID from message to find reason
-        let strippedMsg = finalMessage;
-        intentWords.forEach(w => { strippedMsg = strippedMsg.replace(new RegExp(w, 'gi'), ''); });
-        if (detectedOrderId) strippedMsg = strippedMsg.replace(detectedOrderId, '');
-        strippedMsg = strippedMsg.replace(/[#\-]/g, ' ').replace(/\s+/g, ' ').trim();
-        if (strippedMsg.length >= 5) {
-          detectedReason = strippedMsg;
-        }
-
-        if (detectedOrderId && detectedReason) {
-          // Both provided in one message — skip collection, go straight to escalation
-          metadata.pending_request = { order_id: detectedOrderId, reason: detectedReason };
-          metadata.awaiting = flowType === 'refund' ? 'refund_ready' : 'exchange_ready';
-
-          await supabase.from('messages').insert({
-            conversation_id: conversation.id,
-            sender: 'customer',
-            content: finalMessage,
-            platform_message_id: messageId,
-            image_url: effectiveImageUrl || null,
-          });
-          await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
-
-          // Escalate immediately
-          await supabase.from('conversations').update({
-            is_escalated: true,
-            escalation_type: flowType,
-            escalation_reason: flowType === 'refund'
-              ? `Customer requested refund - Order: ${detectedOrderId} - Reason: ${detectedReason}`
-              : `Customer requested exchange - Order: ${detectedOrderId} - Reason: ${detectedReason}`,
-            escalated_at: new Date().toISOString(),
-            escalated_by: 'ai',
-            metadata: { ...metadata, awaiting: null, pending_request: null }
-          }).eq('id', conversation.id);
-
-          if (flowType === 'refund') {
-            await supabase.from('refunds').insert({
-              brand_id,
-              conversation_id: conversation.id,
-              customer_id: senderId,
-              customer_name: metadata.collected_info?.name || null,
-              customer_phone: metadata.collected_info?.phone || null,
-              original_order_number: detectedOrderId,
-              product_name: metadata.current_order?.product_name || 'Product not specified',
-              order_amount: metadata.current_order?.price || null,
-              refund_amount: metadata.current_order?.price || null,
-              refund_reason: 'other',
-              refund_reason_details: detectedReason,
-              status: 'pending'
-            });
-          } else {
-            await supabase.from('exchanges').insert({
-              brand_id,
-              conversation_id: conversation.id,
-              customer_id: senderId,
-              customer_name: metadata.collected_info?.name || null,
-              customer_phone: metadata.collected_info?.phone || null,
-              customer_address: metadata.collected_info?.address || null,
-              original_product_name: metadata.current_order?.product_name || 'Product not specified',
-              original_order_number: detectedOrderId,
-              original_size: null,
-              exchange_reason: 'other',
-              exchange_reason_details: detectedReason,
-              status: 'pending'
-            });
-          }
-
-          const handoffMsg = flowType === 'refund'
-            ? "Thank you! I've passed your refund request to our team along with your order details. They'll get back to you as soon as possible 🙏"
-            : "Thank you! I've passed your exchange request to our team along with your order details. They'll get back to you as soon as possible 🙏";
-
-          await sendDM(senderId, handoffMsg, access_token);
-          await supabase.from('messages').insert({
-            conversation_id: conversation.id, sender: 'ai', content: handoffMsg,
-          });
-          await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
-
-          return;
-
-        } else {
-          // Need to collect info step by step — ask for order ID first
-          metadata.awaiting = flowType === 'refund' ? 'refund_id' : 'exchange_id';
-          metadata.pending_request = { order_id: null, reason: null };
-
-          await supabase.from('messages').insert({
-            conversation_id: conversation.id,
-            sender: 'customer',
-            content: finalMessage,
-            platform_message_id: messageId,
-            image_url: effectiveImageUrl || null,
-          });
-          await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
-
-          const askIdMsg = flowType === 'refund'
-            ? "I'm sorry to hear that! I'd be happy to help with your refund. Could you please share your order ID? 🙏"
-            : "I'm sorry to hear that! I'd be happy to help with your exchange. Could you please share your order ID? 🙏";
-
-          await sendDM(senderId, askIdMsg, access_token);
-          await supabase.from('messages').insert({
-            conversation_id: conversation.id, sender: 'ai', content: askIdMsg,
-          });
-          await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
-
-          return;
-        }
       }
     }
 
@@ -1043,14 +960,15 @@ IMPORTANT:
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: metadata.collected_info?.name || null,
+          customer_name: metadata.collected_info?.name || conversation.customer_name || null,
+          customer_username: conversation.customer_username || null,
           customer_phone: metadata.collected_info?.phone || null,
-          original_order_number: metadata.current_order?.product_name ? 'From conversation' : null,
+          original_order_number: metadata.pending_request?.order_id || null,
           product_name: metadata.current_order?.product_name || 'Product name not captured',
           order_amount: metadata.current_order?.price || null,
           refund_amount: metadata.current_order?.price || null,
-          refund_reason: 'defective', // Default, can be updated by team
-          refund_reason_details: `Customer message: ${finalMessage}`,
+          refund_reason: 'other',
+          refund_reason_details: metadata.pending_request?.reason || `Customer message: ${finalMessage}`,
           status: 'pending'
         };
 
@@ -1063,13 +981,15 @@ IMPORTANT:
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: metadata.collected_info?.name || null,
+          customer_name: metadata.collected_info?.name || conversation.customer_name || null,
+          customer_username: conversation.customer_username || null,
           customer_phone: metadata.collected_info?.phone || null,
           customer_address: metadata.collected_info?.address || null,
           original_product_name: metadata.current_order?.product_name || 'Product name not captured',
-          original_size: null, // To be filled by team
-          exchange_reason: 'size_issue', // Default, can be updated by team
-          exchange_reason_details: `Customer message: ${finalMessage}`,
+          original_order_number: metadata.pending_request?.order_id || null,
+          original_size: null,
+          exchange_reason: 'other',
+          exchange_reason_details: metadata.pending_request?.reason || `Customer message: ${finalMessage}`,
           status: 'pending'
         };
 
