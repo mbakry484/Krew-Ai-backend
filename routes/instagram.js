@@ -4,6 +4,7 @@ const supabase = require('../lib/supabase');
 const { generateReply, checkEscalation } = require('../lib/claude');
 const { sendDM, getUserProfile } = require('../lib/meta');
 const OpenAI = require('openai');
+const langfuse = require('../lib/tracer');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -324,6 +325,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     storyContext = 'Customer replied to one of your stories';
   }
 
+  let trace = null;
   try {
     // 1. Look up the brand using recipient.id
     const { data: integration } = await supabase
@@ -415,6 +417,39 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       metadata = { ...defaultMetadata, ...conversation.metadata };
     }
     console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
+
+    // ── Langfuse Tracing ──────────────────────────────────────
+    const profile = {
+      name: conversation.customer_name || senderId,
+      username: conversation.customer_username || null
+    };
+
+    trace = langfuse.trace({
+      name: 'luna-message',
+      userId: senderId,
+      sessionId: conversation?.id || senderId,
+      metadata: {
+        brand_id: brand_id,
+        customer_name: profile.name,
+        customer_username: profile.username,
+        channel: 'instagram',
+        has_image: !!effectiveImageUrl,
+        has_audio: !!audioUrl,
+        metadata_state: JSON.stringify(metadata)
+      },
+      tags: ['luna', 'instagram', brand_id]
+    });
+
+    // Log the incoming customer message
+    trace.event({
+      name: 'customer-message',
+      input: finalMessage || '[Image/Audio]',
+      metadata: {
+        sender_id: senderId,
+        has_image: !!effectiveImageUrl,
+        has_audio: !!audioUrl
+      }
+    });
 
     // 4. ESCALATION CHECK - Skip AI response if conversation is escalated
     if (conversation.is_escalated) {
@@ -516,14 +551,42 @@ IMPORTANT:
 `;
 
         // Use GPT-4o-mini for the final response (we already did the heavy lifting with vision)
+        const imageMessages = [
+          { role: 'system', content: imageSystemPrompt },
+          ...conversationHistory,
+          { role: 'user', content: finalMessage || 'Do you have this product?' }
+        ];
+
+        // Wrap the OpenAI call with a Langfuse generation span
+        const imageGeneration = trace.generation({
+          name: 'luna-reply',
+          model: 'gpt-4o-mini',
+          input: imageMessages,
+          metadata: {
+            flow: 'image',
+            awaiting: metadata.awaiting,
+            current_order: metadata.current_order,
+            collected_info: metadata.collected_info,
+            history_length: conversationHistory.length
+          }
+        });
+
+        const imageStartTime = Date.now();
         const completion = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: imageSystemPrompt },
-            ...conversationHistory,
-            { role: 'user', content: finalMessage || 'Do you have this product?' }
-          ],
+          messages: imageMessages,
           max_tokens: 400
+        });
+        const imageLatency = Date.now() - imageStartTime;
+
+        imageGeneration.end({
+          output: completion.choices[0].message.content,
+          usage: {
+            input: completion.usage?.prompt_tokens,
+            output: completion.usage?.completion_tokens,
+            total: completion.usage?.total_tokens
+          },
+          metadata: { latency_ms: imageLatency }
         });
 
         aiReply = completion.choices[0].message.content;
@@ -537,6 +600,21 @@ IMPORTANT:
 
     } else {
       // TEXT FLOW: Normal conversation without image
+      // Wrap the text AI call with a Langfuse generation span
+      const textGeneration = trace.generation({
+        name: 'luna-reply',
+        model: 'gpt-4.1',
+        input: finalMessage,
+        metadata: {
+          flow: 'text',
+          awaiting: metadata.awaiting,
+          current_order: metadata.current_order,
+          collected_info: metadata.collected_info,
+          history_length: conversationHistory.length
+        }
+      });
+
+      const textStartTime = Date.now();
       aiReply = await generateReply(
         finalMessage,
         knowledgeBaseRows || [],
@@ -549,6 +627,13 @@ IMPORTANT:
         null,  // No image URL
         storyContext  // Story context if replying to story
       );
+      const textLatency = Date.now() - textStartTime;
+
+      textGeneration.end({
+        output: aiReply,
+        metadata: { latency_ms: textLatency }
+      });
+
       console.log(`🤖 Luna reply: "${aiReply}"`);
     }
 
@@ -621,6 +706,12 @@ IMPORTANT:
             confirmationMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
             await sendDM(senderId, confirmationMsg, access_token);
             await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
+            // Log Langfuse event before returning
+            trace.event({
+              name: 'action-taken',
+              input: { action: 'place_order', order_data: orderData },
+              metadata: { order_placed: false, shopify_error: true }
+            });
             return;
           }
 
@@ -654,6 +745,14 @@ IMPORTANT:
         console.log(`✅ Sent order confirmation to ${senderId}`);
         await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
 
+        // Log the order-placed event to Langfuse
+        trace.event({
+          name: 'order-placed',
+          input: orderData,
+          output: { shopify_order_number: shopifyOrderNumber || null },
+          level: 'DEFAULT'
+        });
+
         // Reset metadata after successful order
         metadata = { discussed_products: [], current_order: null };
         await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
@@ -665,6 +764,16 @@ IMPORTANT:
         aiReply = "Could you please confirm your order details one more time?";
       }
     }
+
+    // Log the action taken to Langfuse
+    trace.event({
+      name: 'action-taken',
+      input: { action: orderJsonMatch ? 'place_order' : 'reply', order_data: null },
+      metadata: {
+        order_placed: false,
+        shopify_order_number: null
+      }
+    });
 
     // 13. Check for escalation keywords in AI reply
     const escalationCheck = checkEscalation(aiReply);
@@ -757,6 +866,15 @@ IMPORTANT:
   } catch (error) {
     console.error(`❌ Error: ${error.message}`);
 
+    // Log the error to Langfuse
+    if (trace) {
+      trace.event({
+        name: 'error',
+        input: error.message,
+        level: 'ERROR'
+      });
+    }
+
     // Send fallback message
     try {
       const { data: integration } = await supabase
@@ -776,6 +894,9 @@ IMPORTANT:
     } catch (fallbackError) {
       console.error(`❌ Error: ${fallbackError.message}`);
     }
+  } finally {
+    // Always flush Langfuse to ensure all events are sent
+    await langfuse.flushAsync();
   }
 }
 
