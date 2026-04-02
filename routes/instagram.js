@@ -224,73 +224,6 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * Escalate a refund or exchange with both order ID and reason collected.
- * Creates the DB record, marks conversation escalated, and sends confirmation to customer.
- */
-async function escalateRefundExchange(supabase, conversation, metadata, senderId, brand_id, flowType, orderId, reason, sendDM, access_token) {
-  const isRefund = flowType === 'refund';
-
-  // Mark conversation as escalated and clear pending state
-  await supabase.from('conversations').update({
-    is_escalated: true,
-    escalation_type: flowType,
-    escalation_reason: `Customer requested ${flowType} — Order ID: ${orderId} — Reason: ${reason}`,
-    escalated_at: new Date().toISOString(),
-    escalated_by: 'ai',
-    metadata: {
-      ...metadata,
-      awaiting: null,
-      pending_request: null
-    },
-    updated_at: new Date().toISOString()
-  }).eq('id', conversation.id);
-
-  // Create the DB record
-  if (isRefund) {
-    await supabase.from('refunds').insert({
-      brand_id,
-      conversation_id: conversation.id,
-      customer_id: senderId,
-      customer_name: conversation.customer_name || metadata.collected_info?.name || null,
-      customer_phone: metadata.collected_info?.phone || null,
-      original_order_number: orderId,
-      product_name: metadata.current_order?.product_name || 'Not specified',
-      order_amount: metadata.current_order?.price || null,
-      refund_amount: metadata.current_order?.price || null,
-      refund_reason: 'other',
-      refund_reason_details: reason,
-      status: 'pending'
-    });
-    console.log(`✅ Refund record created — Order: ${orderId}, Reason: ${reason}`);
-  } else {
-    await supabase.from('exchanges').insert({
-      brand_id,
-      conversation_id: conversation.id,
-      customer_id: senderId,
-      customer_name: conversation.customer_name || metadata.collected_info?.name || null,
-      customer_phone: metadata.collected_info?.phone || null,
-      customer_address: metadata.collected_info?.address || null,
-      original_product_name: metadata.current_order?.product_name || 'Not specified',
-      original_order_number: orderId,
-      original_size: null,
-      exchange_reason: 'other',
-      exchange_reason_details: reason,
-      status: 'pending'
-    });
-    console.log(`✅ Exchange record created — Order: ${orderId}, Reason: ${reason}`);
-  }
-
-  // Send confirmation to customer
-  const handoffMsg = isRefund
-    ? "Thank you! I've passed your refund request to our team with your order details and reason. They'll get back to you as soon as possible 🙏"
-    : "Thank you! I've passed your exchange request to our team with your order details and reason. They'll get back to you as soon as possible 🙏";
-
-  await sendDM(senderId, handoffMsg, access_token);
-  await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: handoffMsg });
-  await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversation.id);
-}
-
-/**
  * Handle an incoming Instagram DM
  * NOTE: This function only receives validated messages with actual content
  */
@@ -438,9 +371,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
 
     const defaultMetadata = {
       discussed_products: [],
-      current_order: null,
-      collected_info: { name: null, phone: null, address: null },
-      awaiting: null
+      current_order: null
     };
 
     if (!conversation) {
@@ -505,421 +436,8 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       return;
     }
 
-    // 5a. REFUND/EXCHANGE INFO COLLECTION STATE MACHINE
-    // ─────────────────────────────────────────────────────────────────────────────
-    // Flow overview:
-    //   1. Detect intent → ask for BOTH order ID and reason in ONE message.
-    //   2. Parse next reply: try to extract an order ID (numeric) and a reason.
-    //      - Both found → escalate immediately.
-    //      - Only ID found → save ID, wait 10s, ask for the missing reason.
-    //      - Only reason found → save reason, wait 10s, ask for the missing ID.
-    //      - Neither found → wait 10s, ask for both again.
-    //   3. If waiting for one missing field → accept next reply for that field → escalate.
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Extract a numeric order ID from a message.
-     * Prioritises numbers (3+ digits) over alphanumeric tokens.
-     * Handles: "1003", "#1003", "order id is 1003", "my order #ABC-1234"
-     */
-    function extractOrderId(text) {
-      // 1. Try pure digit sequences (3+ digits) — most common order IDs
-      const digitMatch = text.match(/\b(\d{3,})\b/);
-      if (digitMatch) return digitMatch[1];
-
-      // 2. Try #-prefixed IDs like #ABC-123 or #1003
-      const hashMatch = text.match(/#([A-Za-z0-9][\w\-]{2,})/);
-      if (hashMatch) return hashMatch[1];
-
-      return null;
-    }
-
-    /**
-     * Extract a reason from a message by stripping out the order ID and intent keywords.
-     * Returns the leftover text if it has meaningful content (8+ chars).
-     */
-    function extractReason(text, orderId) {
-      // Common filler words that aren't reasons
-      const fillerWords = ['my', 'the', 'is', 'it', 'i', 'a', 'an', 'and', 'or', 'to', 'for', 'of', 'order', 'id', 'number', 'because', 'want', 'wanna', 'need', 'please', 'pls'];
-      const intentWords = ['exchange', 'swap', 'replace', 'refund', 'money back', 'return'];
-
-      let stripped = text;
-
-      // Remove the order ID from the text
-      if (orderId) stripped = stripped.replace(new RegExp(orderId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '');
-      // Remove # symbols
-      stripped = stripped.replace(/#/g, '');
-      // Remove intent keywords
-      intentWords.forEach(w => { stripped = stripped.replace(new RegExp(`\\b${w}\\b`, 'gi'), ''); });
-
-      // Clean up
-      stripped = stripped.replace(/\s+/g, ' ').trim();
-
-      // Check if what remains is meaningful (not just filler words)
-      const words = stripped.split(' ').filter(w => w.length > 0);
-      const meaningfulWords = words.filter(w => !fillerWords.includes(w.toLowerCase()));
-
-      // Need at least 2 meaningful words or 8+ chars of meaningful content to count as a reason
-      if (meaningfulWords.length >= 2 || stripped.length >= 8) {
-        return stripped;
-      }
-      return null;
-    }
-
-    if (finalMessage) {
-      const msgLower = finalMessage.toLowerCase();
-
-      // ── Step 1: Detect fresh refund/exchange intent ─────────────────────────────────
-      if (metadata.awaiting === null || metadata.awaiting === undefined) {
-        const exchangeKeywords = ['exchange', 'swap', 'replace', 'تبديل', 'استبدال', 'مقاس تاني', 'عايز تغيير', 'بدل'];
-        const refundKeywords = ['refund', 'money back', 'return my money', 'استرجاع', 'استرداد', 'فلوسي ارجع', 'ارجع فلوسي', 'عايز فلوسي', 'رجعولي فلوسي'];
-
-        const isExchangeRequest = exchangeKeywords.some(k => msgLower.includes(k));
-        const isRefundRequest = !isExchangeRequest && refundKeywords.some(k => msgLower.includes(k));
-
-        if (isExchangeRequest || isRefundRequest) {
-          const flowType = isExchangeRequest ? 'exchange' : 'refund';
-          console.log(`🔄 ${flowType.toUpperCase()} intent detected`);
-
-          // Save customer message
-          await supabase.from('messages').insert({
-            conversation_id: conversation.id,
-            sender: 'customer',
-            content: finalMessage,
-            platform_message_id: messageId,
-            image_url: effectiveImageUrl || null,
-          });
-
-          // Try to extract ID and reason from this first message itself
-          const detectedId = extractOrderId(finalMessage);
-          const detectedReason = extractReason(finalMessage, detectedId);
-
-          if (detectedId && detectedReason) {
-            // Both provided in one message → escalate immediately
-            console.log(`✅ Both ID ("${detectedId}") and reason ("${detectedReason}") found in initial message — escalating`);
-            metadata.pending_request = { order_id: detectedId, reason: detectedReason, type: flowType };
-            await escalateRefundExchange(supabase, conversation, metadata, senderId, brand_id, flowType, detectedId, detectedReason, sendDM, access_token);
-            return;
-          }
-
-          // Not both found — ask for both in one message
-          metadata.awaiting = flowType === 'refund' ? 'refund_collecting' : 'exchange_collecting';
-          metadata.pending_request = { order_id: detectedId, reason: detectedReason, type: flowType };
-          await supabase.from('conversations').update({ metadata, updated_at: new Date().toISOString() }).eq('id', conversation.id);
-
-          const askBothMsg = flowType === 'refund'
-            ? "I'm sorry to hear that! To help you with your refund, could you please share your order ID and the reason for the refund? 🙏"
-            : "I'd be happy to help with your exchange! Could you please share your order ID and the reason for the exchange? 🙏";
-
-          await sendDM(senderId, askBothMsg, access_token);
-          await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: askBothMsg });
-          console.log(`✅ Asked for both order ID and reason (${flowType} flow)`);
-          return;
-        }
-      }
-
-      // ── Step 2: Collecting both fields ─────────────────────────────────────────────
-      if (metadata.awaiting === 'refund_collecting' || metadata.awaiting === 'exchange_collecting') {
-        const isRefundFlow = metadata.awaiting === 'refund_collecting';
-        if (!metadata.pending_request) metadata.pending_request = { order_id: null, reason: null, type: isRefundFlow ? 'refund' : 'exchange' };
-        const flowType = metadata.pending_request.type || (isRefundFlow ? 'refund' : 'exchange');
-
-        // Save customer message
-        await supabase.from('messages').insert({
-          conversation_id: conversation.id,
-          sender: 'customer',
-          content: finalMessage,
-          platform_message_id: messageId,
-          image_url: effectiveImageUrl || null,
-        });
-
-        // Try to extract both from this reply
-        const detectedId = extractOrderId(finalMessage);
-        const detectedReason = extractReason(finalMessage, detectedId);
-
-        // Merge with anything we already had from the initial message
-        if (detectedId) metadata.pending_request.order_id = detectedId;
-        if (detectedReason) metadata.pending_request.reason = detectedReason;
-
-        const hasId = !!metadata.pending_request.order_id;
-        const hasReason = !!metadata.pending_request.reason;
-
-        if (hasId && hasReason) {
-          // Both collected → escalate
-          console.log(`✅ Both fields collected — ID: "${metadata.pending_request.order_id}", Reason: "${metadata.pending_request.reason}" — escalating`);
-          await escalateRefundExchange(supabase, conversation, metadata, senderId, brand_id, flowType, metadata.pending_request.order_id, metadata.pending_request.reason, sendDM, access_token);
-          return;
-        }
-
-        // Only one field found — save progress, wait 10s, ask for the missing one
-        await supabase.from('conversations').update({ metadata, updated_at: new Date().toISOString() }).eq('id', conversation.id);
-
-        if (hasId && !hasReason) {
-          metadata.awaiting = isRefundFlow ? 'refund_need_reason' : 'exchange_need_reason';
-          await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
-          console.log(`📝 Order ID collected: "${metadata.pending_request.order_id}" — waiting 10s then asking for reason`);
-          await new Promise(resolve => setTimeout(resolve, 10000));
-          const askReasonMsg = `Got it, order #${metadata.pending_request.order_id}! And what's the reason for the ${flowType}? 🙏`;
-          await sendDM(senderId, askReasonMsg, access_token);
-          await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: askReasonMsg });
-          return;
-        }
-
-        if (!hasId && hasReason) {
-          metadata.awaiting = isRefundFlow ? 'refund_need_id' : 'exchange_need_id';
-          await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
-          console.log(`📝 Reason collected: "${metadata.pending_request.reason}" — waiting 10s then asking for order ID`);
-          await new Promise(resolve => setTimeout(resolve, 10000));
-          const askIdMsg = `Thanks for explaining! Could you share your order ID so I can look into this? It's usually a number like 12345 or #12345 🙏`;
-          await sendDM(senderId, askIdMsg, access_token);
-          await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: askIdMsg });
-          return;
-        }
-
-        // Neither found — ask again
-        console.log(`⚠️ Could not extract ID or reason from: "${finalMessage}" — asking again`);
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        const retryMsg = `I need two things to process your ${flowType}:\n1. Your order ID (e.g. 12345 or #12345)\n2. The reason for the ${flowType}\n\nCould you share both? 🙏`;
-        await sendDM(senderId, retryMsg, access_token);
-        await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: retryMsg });
-        return;
-      }
-
-      // ── Step 3: Waiting for one missing field ──────────────────────────────────────
-      if (['refund_need_reason', 'exchange_need_reason', 'refund_need_id', 'exchange_need_id'].includes(metadata.awaiting)) {
-        const isRefundFlow = metadata.awaiting.startsWith('refund');
-        const needsReason = metadata.awaiting.endsWith('need_reason');
-        const flowType = metadata.pending_request?.type || (isRefundFlow ? 'refund' : 'exchange');
-
-        // Save customer message
-        await supabase.from('messages').insert({
-          conversation_id: conversation.id,
-          sender: 'customer',
-          content: finalMessage,
-          platform_message_id: messageId,
-          image_url: effectiveImageUrl || null,
-        });
-
-        if (needsReason) {
-          // We have the ID, customer should be sending the reason
-          metadata.pending_request.reason = finalMessage.trim();
-        } else {
-          // We have the reason, customer should be sending the ID
-          const detectedId = extractOrderId(finalMessage);
-          if (!detectedId) {
-            // Still no valid ID — ask again
-            console.log(`⚠️ Still no order ID in: "${finalMessage}" — asking again`);
-            await new Promise(resolve => setTimeout(resolve, 10000));
-            const retryIdMsg = `I still need your order ID to process the ${flowType}. Could you share the order number? It's usually a number like 12345 or #12345 🙏`;
-            await sendDM(senderId, retryIdMsg, access_token);
-            await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: retryIdMsg });
-            return;
-          }
-          metadata.pending_request.order_id = detectedId;
-        }
-
-        // Both fields now present → escalate
-        console.log(`✅ Missing field collected — ID: "${metadata.pending_request.order_id}", Reason: "${metadata.pending_request.reason}" — escalating`);
-        await escalateRefundExchange(supabase, conversation, metadata, senderId, brand_id, flowType, metadata.pending_request.order_id, metadata.pending_request.reason, sendDM, access_token);
-        return;
-      }
-    }
-
-    // 5. CONFIRMATION CHECK (MUST BE FIRST - BEFORE STATE MACHINE)
-    // If awaiting confirmation, check if customer confirmed and place order directly
-    if (metadata.awaiting === 'confirmation') {
-      // Null safe confirmation check
-      const msgText = finalMessage || '';
-      const confirmWords = ['yes', 'confirm', 'ok', 'sure', 'place', 'yep', 'yeah', 'تأكيد', 'نعم', 'اه', 'آه', 'موافق'];
-      const isConfirmed = confirmWords.some(word => msgText.toLowerCase().includes(word));
-
-      if (isConfirmed) {
-        // Customer confirmed - create Shopify order directly (skip OpenAI)
-        console.log(`🎉 Order confirmed! Creating Shopify order...`);
-
-        try {
-          // Fetch Shopify integration
-          const { data: shopifyIntegration } = await supabase
-            .from('integrations')
-            .select('shopify_shop_domain, access_token')
-            .eq('brand_id', brand_id)
-            .eq('platform', 'shopify')
-            .single();
-
-          let confirmationMsg;
-          let shopifyOrderNumber = null;
-
-          if (!shopifyIntegration) {
-            // No Shopify integration found - log warning and skip Shopify API call
-            console.log(`⚠️  No Shopify integration found for brand ${brand_id} - skipping Shopify order creation`);
-            confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${metadata.current_order?.product_name || 'N/A'}\n• Price: ${metadata.current_order?.price || 'N/A'} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
-          } else {
-            // Shopify integration found - create order via Shopify Admin API
-            // Format phone to E.164 format for Shopify
-            const formattedPhone = formatEgyptianPhone(metadata.collected_info.phone);
-
-            const shopifyResponse = await fetch(
-              `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
-              {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Shopify-Access-Token': shopifyIntegration.access_token
-                },
-                body: JSON.stringify({
-                  order: {
-                    line_items: [{
-                      title: metadata.current_order.product_name,
-                      quantity: 1,
-                      price: metadata.current_order.price
-                    }],
-                    customer: {
-                      first_name: metadata.collected_info.name
-                    },
-                    shipping_address: {
-                      name: metadata.collected_info.name,
-                      address1: metadata.collected_info.address,
-                      phone: formattedPhone,
-                      country: 'EG'
-                    },
-                    phone: formattedPhone,
-                    financial_status: 'pending',
-                    send_receipt: false,
-                    note: 'Order placed via Luna AI agent on Instagram/Messenger'
-                  }
-                })
-              }
-            );
-
-            const shopifyData = await shopifyResponse.json();
-            const shopifyOrder = shopifyData.order;
-            const shopifyOrderId = shopifyOrder?.id;
-            shopifyOrderNumber = shopifyOrder?.order_number;
-
-            if (!shopifyResponse.ok) {
-              console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
-
-              // Handle Shopify failure gracefully - don't fall back to OpenAI
-              const errorMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
-
-              // Send error message to customer
-              await supabase.from('messages').insert({
-                conversation_id: conversation.id,
-                sender: 'customer',
-                content: finalMessage || '[Image]',
-                platform_message_id: messageId,
-                image_url: effectiveImageUrl || null,
-              });
-
-              await sendDM(senderId, errorMsg, access_token);
-              console.log(`✅ Sent error message to ${senderId}`);
-
-              await supabase.from('messages').insert({
-                conversation_id: conversation.id,
-                sender: 'ai',
-                content: errorMsg,
-              });
-
-              // Keep metadata intact so customer can try again
-              // Return early - skip OpenAI call
-              return;
-            }
-
-            console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${metadata.current_order.product_name}`);
-
-            // Save to Supabase orders table
-            await supabase.from('orders').insert({
-              brand_id: brand_id,
-              conversation_id: conversation.id,
-              shopify_order_id: String(shopifyOrderId),
-              shopify_order_number: String(shopifyOrderNumber),
-              customer_name: metadata.collected_info.name,
-              customer_phone: metadata.collected_info.phone,
-              customer_address: metadata.collected_info.address,
-              product_name: metadata.current_order.product_name,
-              price: metadata.current_order.price,
-              currency: 'EGP',
-              status: 'pending',
-              created_at: new Date().toISOString()
-            });
-
-            // Build confirmation message with order number
-            confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${metadata.current_order.product_name}\n• Price: ${metadata.current_order.price} EGP\n• Name: ${metadata.collected_info.name}\n• Phone: ${metadata.collected_info.phone}\n• Address: ${metadata.collected_info.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
-          }
-
-          // Save incoming message
-          await supabase
-            .from('messages')
-            .insert({
-              conversation_id: conversation.id,
-              sender: 'customer',
-              content: finalMessage || '[Image]',
-              platform_message_id: messageId,
-              image_url: effectiveImageUrl || null,
-            });
-
-          // Send confirmation message directly
-          await sendDM(senderId, confirmationMsg, access_token);
-          console.log(`✅ Sent to ${senderId}`);
-
-          // Save confirmation message
-          await supabase
-            .from('messages')
-            .insert({
-              conversation_id: conversation.id,
-              sender: 'ai',
-              content: confirmationMsg,
-            });
-
-          // Reset metadata after successful order
-          metadata = {
-            discussed_products: [],
-            current_order: null,
-            collected_info: { name: null, phone: null, address: null },
-            awaiting: null
-          };
-
-          // Save reset metadata
-          await supabase
-            .from('conversations')
-            .update({ metadata })
-            .eq('id', conversation.id);
-
-          // Return early - skip OpenAI call entirely
-          return;
-
-        } catch (error) {
-          console.error(`❌ Error: ${error.message}`);
-          // Fall through to normal flow if order creation fails
-        }
-      }
-    }
-
-    // 6. DETERMINISTIC STATE MACHINE: Process customer input based on current awaiting state
-    // GUARD: Don't process through state machine if awaiting confirmation
-    // Let Luna handle rejections/corrections via OpenAI
-    // Null safe state machine - only process text messages for data collection
-    if (metadata.awaiting !== 'confirmation' && finalMessage) {
-      if (metadata.awaiting === 'name') {
-        metadata.collected_info.name = finalMessage.trim();
-        metadata.awaiting = 'phone';
-      } else if (metadata.awaiting === 'phone') {
-        // Validation: Phone must contain at least 5 digits
-        const phoneRegex = /\d{5,}/;
-        if (phoneRegex.test(finalMessage)) {
-          metadata.collected_info.phone = finalMessage.trim();
-          metadata.awaiting = 'address';
-        }
-        // If invalid, don't save, don't advance state - Luna will ask again
-      } else if (metadata.awaiting === 'address') {
-        // Validation: Address must be at least 10 characters
-        if (finalMessage.trim().length >= 10) {
-          metadata.collected_info.address = finalMessage.trim();
-          metadata.awaiting = 'confirmation';
-        }
-        // If invalid, don't save, don't advance state - Luna will ask again
-      }
-    }
+    // 5. All order collection, refund/exchange flows are now handled by the AI
+    //    The AI uses conversation history to track state — no state machine needed
 
     // 7. Fetch conversation history (last 10 messages)
     const { data: previousMessages } = await supabase
@@ -1034,7 +552,121 @@ IMPORTANT:
       console.log(`🤖 Luna reply: "${aiReply}"`);
     }
 
-    // 12. Check for escalation keywords in AI reply
+    // 12. Check if AI returned a PLACE_ORDER JSON
+    const orderJsonMatch = aiReply.match(/\{"action"\s*:\s*"PLACE_ORDER".*?\}/);
+
+    if (orderJsonMatch) {
+      try {
+        const orderData = JSON.parse(orderJsonMatch[0]);
+        console.log('🎉 Order ready:', JSON.stringify(orderData));
+
+        // Validate required fields
+        if (!orderData.product_name || !orderData.price || !orderData.name || !orderData.phone || !orderData.address) {
+          throw new Error('Missing required order fields');
+        }
+
+        // Fetch Shopify integration
+        const { data: shopifyIntegration } = await supabase
+          .from('integrations')
+          .select('shopify_shop_domain, access_token')
+          .eq('brand_id', brand_id)
+          .eq('platform', 'shopify')
+          .maybeSingle();
+
+        let confirmationMsg;
+
+        if (!shopifyIntegration) {
+          console.log(`⚠️  No Shopify integration found for brand ${brand_id} - recording order without Shopify`);
+          confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${orderData.product_name}\n• Price: ${orderData.price} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
+        } else {
+          const formattedPhone = formatEgyptianPhone(orderData.phone);
+
+          const shopifyResponse = await fetch(
+            `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': shopifyIntegration.access_token
+              },
+              body: JSON.stringify({
+                order: {
+                  line_items: [{
+                    title: orderData.product_name,
+                    quantity: 1,
+                    price: orderData.price
+                  }],
+                  customer: {
+                    first_name: orderData.name
+                  },
+                  shipping_address: {
+                    name: orderData.name,
+                    address1: orderData.address,
+                    phone: formattedPhone,
+                    country: 'EG'
+                  },
+                  phone: formattedPhone,
+                  financial_status: 'pending',
+                  send_receipt: false,
+                  note: 'Order placed via Luna AI agent on Instagram/Messenger'
+                }
+              })
+            }
+          );
+
+          const shopifyData = await shopifyResponse.json();
+
+          if (!shopifyResponse.ok) {
+            console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
+            confirmationMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
+            await sendDM(senderId, confirmationMsg, access_token);
+            await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
+            return;
+          }
+
+          const shopifyOrder = shopifyData.order;
+          const shopifyOrderId = shopifyOrder?.id;
+          const shopifyOrderNumber = shopifyOrder?.order_number;
+
+          console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${orderData.product_name}`);
+
+          // Save to Supabase orders table
+          await supabase.from('orders').insert({
+            brand_id,
+            conversation_id: conversation.id,
+            shopify_order_id: String(shopifyOrderId),
+            shopify_order_number: String(shopifyOrderNumber),
+            customer_name: orderData.name,
+            customer_phone: orderData.phone,
+            customer_address: orderData.address,
+            product_name: orderData.product_name,
+            price: orderData.price,
+            currency: 'EGP',
+            status: 'pending',
+            created_at: new Date().toISOString()
+          });
+
+          confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${orderData.product_name}\n• Price: ${orderData.price} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
+        }
+
+        // Send confirmation to customer (not the raw JSON)
+        await sendDM(senderId, confirmationMsg, access_token);
+        console.log(`✅ Sent order confirmation to ${senderId}`);
+        await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
+
+        // Reset metadata after successful order
+        metadata = { discussed_products: [], current_order: null };
+        await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
+        return;
+
+      } catch (e) {
+        console.error('Failed to parse order JSON:', e.message);
+        // Fall back to asking customer to confirm again
+        aiReply = "Could you please confirm your order details one more time?";
+      }
+    }
+
+    // 13. Check for escalation keywords in AI reply
     const escalationCheck = checkEscalation(aiReply);
 
     if (escalationCheck.shouldEscalate) {
@@ -1055,44 +687,35 @@ IMPORTANT:
 
       // Auto-create refund/exchange record based on type
       if (escalationCheck.type === 'refund') {
-        const refundData = {
+        await supabase.from('refunds').insert({
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: metadata.collected_info?.name || conversation.customer_name || null,
+          customer_name: conversation.customer_name || null,
           customer_username: conversation.customer_username || null,
-          customer_phone: metadata.collected_info?.phone || null,
-          original_order_number: metadata.pending_request?.order_id || null,
           product_name: metadata.current_order?.product_name || 'Product name not captured',
           order_amount: metadata.current_order?.price || null,
           refund_amount: metadata.current_order?.price || null,
           refund_reason: 'other',
-          refund_reason_details: metadata.pending_request?.reason || `Customer message: ${finalMessage}`,
+          refund_reason_details: `Customer message: ${finalMessage}`,
           status: 'pending'
-        };
-
-        await supabase.from('refunds').insert(refundData);
+        });
         console.log('✅ Auto-created refund record');
       }
 
       if (escalationCheck.type === 'exchange') {
-        const exchangeData = {
+        await supabase.from('exchanges').insert({
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: metadata.collected_info?.name || conversation.customer_name || null,
+          customer_name: conversation.customer_name || null,
           customer_username: conversation.customer_username || null,
-          customer_phone: metadata.collected_info?.phone || null,
-          customer_address: metadata.collected_info?.address || null,
           original_product_name: metadata.current_order?.product_name || 'Product name not captured',
-          original_order_number: metadata.pending_request?.order_id || null,
           original_size: null,
           exchange_reason: 'other',
-          exchange_reason_details: metadata.pending_request?.reason || `Customer message: ${finalMessage}`,
+          exchange_reason_details: `Customer message: ${finalMessage}`,
           status: 'pending'
-        };
-
-        await supabase.from('exchanges').insert(exchangeData);
+        });
         console.log('✅ Auto-created exchange record');
       }
 
@@ -1107,19 +730,16 @@ IMPORTANT:
       console.log(`🤖 Cleaned reply (escalation keywords removed): "${aiReply}"`);
     }
 
-    // 13. Update metadata based on AI reply (only if awaiting is null)
-    metadata = await updateMetadataFromConversation(
-      finalMessage,
-      aiReply,
-      metadata,
-      inStockProducts
-    );
+    // 14. Update discussed products from AI reply
+    metadata = updateProductTracking(aiReply, metadata, inStockProducts);
 
-    // 14. Send reply via Meta API
-    await sendDM(senderId, aiReply, access_token);
-    console.log(`✅ Sent to ${senderId}`);
+    // 15. Send reply via Meta API
+    if (aiReply) {
+      await sendDM(senderId, aiReply, access_token);
+      console.log(`✅ Sent to ${senderId}`);
+    }
 
-    // 15. Save AI reply to database
+    // 16. Save AI reply to database
     await supabase
       .from('messages')
       .insert({
@@ -1128,27 +748,7 @@ IMPORTANT:
         content: aiReply,
       });
 
-    // 16. Metadata sanity check before saving
-    // Prevent saving invalid phone/address data
-    if (metadata.collected_info.phone) {
-      const phoneRegex = /\d{5,}/;
-      if (!phoneRegex.test(metadata.collected_info.phone)) {
-        metadata.collected_info.phone = null; // Invalid phone, clear it
-        if (metadata.awaiting === 'address' || metadata.awaiting === 'confirmation') {
-          metadata.awaiting = 'phone'; // Go back to phone collection
-        }
-      }
-    }
-    if (metadata.collected_info.address) {
-      if (metadata.collected_info.address.trim().length < 10) {
-        metadata.collected_info.address = null; // Invalid address, clear it
-        if (metadata.awaiting === 'confirmation') {
-          metadata.awaiting = 'address'; // Go back to address collection
-        }
-      }
-    }
-
-    // 17. Save updated metadata (CRITICAL - this preserves order state across messages)
+    // 17. Save updated metadata (CRITICAL - this preserves product tracking across messages)
     await supabase
       .from('conversations')
       .update({ metadata })
@@ -1180,219 +780,32 @@ IMPORTANT:
 }
 
 /**
- * Update metadata based on conversation flow
- * Tracks discussed products, order state, and ONLY updates awaiting when it's null
+ * Update product tracking in metadata based on AI reply
+ * Tracks which products have been discussed in the conversation
  */
-async function updateMetadataFromConversation(customerMessage, aiReply, metadata, products) {
+function updateProductTracking(aiReply, metadata, products) {
   try {
-    // Extract product mentions from conversation
-    const productMentions = extractProductMentions(aiReply, products);
+    const lowerCaseReply = aiReply.toLowerCase();
 
-    // Add newly mentioned products to discussed_products
-    productMentions.forEach(product => {
-      const alreadyDiscussed = metadata.discussed_products.find(
-        p => p.product_id === product.product_id
-      );
-      if (!alreadyDiscussed) {
-        metadata.discussed_products.push({
-          index: metadata.discussed_products.length + 1,
-          ...product
-        });
+    (products || []).forEach(product => {
+      if (lowerCaseReply.includes(product.name.toLowerCase())) {
+        const alreadyDiscussed = metadata.discussed_products.find(
+          p => p.name === product.name
+        );
+        if (!alreadyDiscussed) {
+          metadata.discussed_products.push({
+            index: metadata.discussed_products.length + 1,
+            name: product.name,
+            price: product.price
+          });
+        }
       }
     });
-
-    // Detect if ordering a product (if not already ordering)
-    if (!metadata.current_order && detectOrderIntent(customerMessage, aiReply)) {
-      const orderedProduct = identifyOrderedProduct(
-        customerMessage,
-        aiReply,
-        metadata.discussed_products,
-        products
-      );
-      if (orderedProduct) {
-        metadata.current_order = orderedProduct;
-      }
-    }
-
-    // ONLY update awaiting if it's currently null (deterministic state machine handles transitions otherwise)
-    if (metadata.awaiting === null) {
-      const lowerReply = aiReply.toLowerCase();
-
-      // Detect what Luna is asking for
-      if (lowerReply.includes('full name') || lowerReply.includes('your name') || lowerReply.includes('اسمك')) {
-        metadata.awaiting = 'name';
-      } else if (lowerReply.includes('phone') || lowerReply.includes('رقم')) {
-        metadata.awaiting = 'phone';
-      }
-    }
 
     return metadata;
   } catch (error) {
-    console.error(`❌ Error: ${error.message}`);
-    return metadata; // Return unchanged on error
-  }
-}
-
-/**
- * Extract product mentions from AI reply
- */
-function extractProductMentions(aiReply, products) {
-  const mentions = [];
-  const lowerCaseReply = aiReply.toLowerCase();
-
-  products.forEach(product => {
-    const productNameLower = product.name.toLowerCase();
-    // Check if product is mentioned in AI reply
-    if (lowerCaseReply.includes(productNameLower)) {
-      mentions.push({
-        name: product.name,
-        product_id: product.id,
-        variant_id: product.shopify_product_id || null,
-        price: product.price
-      });
-    }
-  });
-
-  return mentions;
-}
-
-/**
- * Detect if customer wants to place an order
- */
-function detectOrderIntent(customerMessage, aiReply) {
-  const lowerMsg = customerMessage.toLowerCase();
-  const orderKeywords = [
-    'order', 'buy', 'purchase', 'take', 'want',
-    '3ayez', '3ayz', 'عايز', 'بدي', 'خد', 'اشتري'
-  ];
-
-  return orderKeywords.some(keyword => lowerMsg.includes(keyword));
-}
-
-/**
- * Identify which product the customer wants to order
- */
-function identifyOrderedProduct(customerMessage, aiReply, discussedProducts, allProducts) {
-  const lowerMsg = customerMessage.toLowerCase();
-
-  // Check if customer references by number (e.g., "the first one", "number 2", "الأول")
-  const numberMatch = lowerMsg.match(/\b(first|1st|one|الأول|awel)\b/i);
-  if (numberMatch && discussedProducts.length > 0) {
-    const product = discussedProducts[0];
-    return {
-      product_name: product.name,
-      product_id: product.product_id,
-      variant_id: product.variant_id,
-      price: product.price
-    };
-  }
-
-  // Check if customer mentions a specific product name
-  for (const product of discussedProducts) {
-    if (lowerMsg.includes(product.name.toLowerCase())) {
-      return {
-        product_name: product.name,
-        product_id: product.product_id,
-        variant_id: product.variant_id,
-        price: product.price
-      };
-    }
-  }
-
-  // If only one product discussed, assume that's what they want
-  if (discussedProducts.length === 1) {
-    const product = discussedProducts[0];
-    return {
-      product_name: product.name,
-      product_id: product.product_id,
-      variant_id: product.variant_id,
-      price: product.price
-    };
-  }
-
-  return null;
-}
-
-/**
- * Handle order creation when ORDER_READY is detected
- */
-async function handleOrderCreation(brandId, metadata, aiReply) {
-  try {
-    const { createShopifyOrder } = require('../lib/shopify');
-
-    // Validate order data
-    if (!metadata.current_order) {
-      return aiReply.replace('ORDER_READY',
-        '⚠️ There was an issue processing your order. Please try again or contact our team.');
-    }
-
-    if (!metadata.collected_info.name ||
-        !metadata.collected_info.phone ||
-        !metadata.collected_info.address) {
-      return aiReply.replace('ORDER_READY',
-        '⚠️ We need a bit more information to complete your order. Please provide your full details.');
-    }
-
-    // Fetch Shopify integration
-    const { data: shopifyIntegration } = await supabase
-      .from('integrations')
-      .select('shopify_shop_domain, access_token')
-      .eq('brand_id', brandId)
-      .eq('platform', 'shopify')
-      .maybeSingle();
-
-    if (!shopifyIntegration) {
-      return aiReply.replace('ORDER_READY',
-        '✅ Your order details have been recorded! Our team will contact you shortly to complete the order.');
-    }
-
-    // Create Shopify order
-    const shopifyOrder = await createShopifyOrder({
-      shopDomain: shopifyIntegration.shopify_shop_domain,
-      accessToken: shopifyIntegration.access_token,
-      order: {
-        variant_id: metadata.current_order.variant_id,
-        product_name: metadata.current_order.product_name,
-        price: metadata.current_order.price,
-        customer_name: metadata.collected_info.name,
-        customer_phone: metadata.collected_info.phone,
-        customer_address: metadata.collected_info.address
-      }
-    });
-
-    // Save order to database
-    await supabase
-      .from('orders')
-      .insert({
-        brand_id: brandId,
-        shopify_order_id: shopifyOrder.id.toString(),
-        product_name: metadata.current_order.product_name,
-        product_id: metadata.current_order.product_id,
-        variant_id: metadata.current_order.variant_id,
-        price: metadata.current_order.price,
-        currency: 'EGP',
-        customer_name: metadata.collected_info.name,
-        customer_phone: metadata.collected_info.phone,
-        customer_address: metadata.collected_info.address,
-        status: 'pending',
-        order_number: shopifyOrder.order_number || shopifyOrder.id
-      });
-
-    // Build confirmation message
-    const confirmationMessage = `
-✅ Your order has been placed! Order #${shopifyOrder.order_number || shopifyOrder.id}
-
-${metadata.current_order.product_name} — ${metadata.current_order.price} EGP
-Delivering to: ${metadata.collected_info.address}
-
-We'll contact you on ${metadata.collected_info.phone} to confirm. Thank you! 🎉
-    `.trim();
-
-    return aiReply.replace('ORDER_READY', confirmationMessage);
-  } catch (error) {
-    console.error('❌ Error creating order:', error);
-    return aiReply.replace('ORDER_READY',
-      '⚠️ There was an issue creating your order. Our team has been notified and will contact you shortly.');
+    console.error(`❌ Error updating product tracking: ${error.message}`);
+    return metadata;
   }
 }
 
