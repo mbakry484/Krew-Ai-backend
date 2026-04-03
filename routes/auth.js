@@ -416,7 +416,7 @@ router.get('/instagram/callback', async (req, res) => {
         page_access_token: pageAccessToken,
         long_lived_user_token: longLivedUserToken,
         token_expires_at: expiresAt,
-        instagram_page_id: fbPageId,
+        instagram_page_id: instagramBusinessAccountId,
         instagram_business_account_id: instagramBusinessAccountId
       })
       .eq('id', brand_id);
@@ -442,7 +442,7 @@ router.get('/instagram/callback', async (req, res) => {
     if (existingIntegration) {
       await supabase
         .from('integrations')
-        .update({ instagram_page_id: fbPageId, access_token: pageAccessToken })
+        .update({ instagram_page_id: instagramBusinessAccountId, access_token: pageAccessToken })
         .eq('id', existingIntegration.id);
     } else {
       const { error: insertError } = await supabase
@@ -450,7 +450,7 @@ router.get('/instagram/callback', async (req, res) => {
         .insert({
           brand_id,
           platform: 'instagram',
-          instagram_page_id: fbPageId,
+          instagram_page_id: instagramBusinessAccountId,
           access_token: pageAccessToken
         });
 
