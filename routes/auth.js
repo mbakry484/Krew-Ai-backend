@@ -267,10 +267,10 @@ router.get('/instagram', (req, res) => {
     }
 
     // Encode brand_id + user_id in the state param so the callback knows which brand to update
-    const state = Buffer.from(JSON.stringify({
-      brand_id: brandId,
-      user_id: decoded.user_id
-    })).toString('base64');
+    const statePayload = { brand_id: brandId, user_id: decoded.user_id };
+    console.log('🔐 [instagram] Encoding state:', statePayload);
+    const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
+    console.log('🔐 [instagram] Encoded state:', state);
 
     const scopes = [
       'instagram_basic',
@@ -320,17 +320,21 @@ router.get('/instagram/callback', async (req, res) => {
 
     // Decode state to get brand_id
     // Note: Express already URL-decodes req.query values, so no decodeURIComponent needed
+    console.log('🔐 [callback] Raw state from query:', state);
     let stateData;
     try {
-      stateData = JSON.parse(Buffer.from(state, 'base64').toString());
-    } catch {
-      console.error('Invalid state parameter');
+      const decoded = Buffer.from(state, 'base64').toString();
+      console.log('🔐 [callback] Decoded state string:', decoded);
+      stateData = JSON.parse(decoded);
+      console.log('🔐 [callback] Parsed stateData:', stateData);
+    } catch (e) {
+      console.error('Invalid state parameter:', e.message);
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
     const { brand_id } = stateData;
     if (!brand_id) {
-      console.error('No brand_id in state');
+      console.error('No brand_id in state. stateData was:', stateData);
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
