@@ -806,36 +806,44 @@ IMPORTANT:
 
       // Auto-create refund/exchange record based on type
       if (escalationCheck.type === 'refund') {
-        await supabase.from('refunds').insert({
+        const { data: refundData, error: refundError } = await supabase.from('refunds').insert({
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
           customer_name: conversation.customer_name || null,
-          customer_username: conversation.customer_username || null,
           product_name: metadata.current_order?.product_name || 'Product name not captured',
           order_amount: metadata.current_order?.price || null,
           refund_amount: metadata.current_order?.price || null,
           refund_reason: 'other',
           refund_reason_details: `Customer message: ${finalMessage}`,
           status: 'pending'
-        });
-        console.log('✅ Auto-created refund record');
+        }).select().single();
+
+        if (refundError) {
+          console.error('❌ Failed to create refund record:', refundError);
+        } else {
+          console.log('✅ Auto-created refund record:', refundData.id);
+        }
       }
 
       if (escalationCheck.type === 'exchange') {
-        await supabase.from('exchanges').insert({
+        const { data: exchangeData, error: exchangeError } = await supabase.from('exchanges').insert({
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
           customer_name: conversation.customer_name || null,
-          customer_username: conversation.customer_username || null,
           original_product_name: metadata.current_order?.product_name || 'Product name not captured',
           original_size: null,
           exchange_reason: 'other',
           exchange_reason_details: `Customer message: ${finalMessage}`,
           status: 'pending'
-        });
-        console.log('✅ Auto-created exchange record');
+        }).select().single();
+
+        if (exchangeError) {
+          console.error('❌ Failed to create exchange record:', exchangeError);
+        } else {
+          console.log('✅ Auto-created exchange record:', exchangeData.id);
+        }
       }
 
       // Remove escalation keywords from reply before sending to customer
