@@ -8,6 +8,9 @@ const META_GRAPH_BASE = 'https://graph.facebook.com/v20.0';
  * @returns {Promise<{access_token: string, expires_in: number}>}
  */
 async function exchangeForLongLivedToken(shortLivedToken) {
+  console.log('META_APP_ID:', process.env.META_APP_ID?.slice(0, 6) + '...');
+  console.log('META_APP_SECRET set:', !!process.env.META_APP_SECRET);
+
   const url = `${META_GRAPH_BASE}/oauth/access_token`
     + `?grant_type=fb_exchange_token`
     + `&client_id=${process.env.META_APP_ID}`
