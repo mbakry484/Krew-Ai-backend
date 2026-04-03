@@ -217,7 +217,7 @@ router.get('/me', verifyToken, async (req, res) => {
     // Fetch user from database, excluding password
     const { data: user, error: fetchError } = await supabase
       .from('users')
-      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, created_at')
+      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, brand_id, created_at')
       .eq('id', userId)
       .single();
 
