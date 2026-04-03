@@ -267,10 +267,10 @@ router.get('/instagram', (req, res) => {
     }
 
     // Encode brand_id + user_id in the state param so the callback knows which brand to update
-    const statePayload = { brand_id: brandId, user_id: decoded.user_id };
-    console.log('🔐 [instagram] Encoding state:', statePayload);
-    const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
-    console.log('🔐 [instagram] Encoded state:', state);
+    const state = Buffer.from(JSON.stringify({
+      brand_id: brandId,
+      user_id: decoded.user_id
+    })).toString('base64');
 
     const scopes = [
       'instagram_basic',
@@ -320,21 +320,17 @@ router.get('/instagram/callback', async (req, res) => {
 
     // Decode state to get brand_id
     // Note: Express already URL-decodes req.query values, so no decodeURIComponent needed
-    console.log('🔐 [callback] Raw state from query:', state);
     let stateData;
     try {
-      const decoded = Buffer.from(state, 'base64').toString();
-      console.log('🔐 [callback] Decoded state string:', decoded);
-      stateData = JSON.parse(decoded);
-      console.log('🔐 [callback] Parsed stateData:', stateData);
-    } catch (e) {
-      console.error('Invalid state parameter:', e.message);
+      stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    } catch {
+      console.error('Invalid state parameter');
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
     const { brand_id } = stateData;
     if (!brand_id) {
-      console.error('No brand_id in state. stateData was:', stateData);
+      console.error('No brand_id in state');
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
@@ -435,21 +431,32 @@ router.get('/instagram/callback', async (req, res) => {
     // Step 6: Sync page token to integrations table
     await syncTokenToIntegrations(brand_id, pageAccessToken);
 
-    // Also upsert the integrations row so the webhook can find this brand
-    const { error: integrationError } = await supabase
+    // Ensure an integrations row exists so the webhook can find this brand
+    const { data: existingIntegration } = await supabase
       .from('integrations')
-      .upsert({
-        brand_id,
-        platform: 'instagram',
-        instagram_page_id: fbPageId,
-        access_token: pageAccessToken
-      }, {
-        onConflict: 'brand_id,platform'
-      });
+      .select('id')
+      .eq('brand_id', brand_id)
+      .eq('platform', 'instagram')
+      .maybeSingle();
 
-    if (integrationError) {
-      console.error(`⚠️ [${brand_id}] Failed to upsert integration:`, integrationError.message);
-      // Non-fatal — the brand table is already updated
+    if (existingIntegration) {
+      await supabase
+        .from('integrations')
+        .update({ instagram_page_id: fbPageId, access_token: pageAccessToken })
+        .eq('id', existingIntegration.id);
+    } else {
+      const { error: insertError } = await supabase
+        .from('integrations')
+        .insert({
+          brand_id,
+          platform: 'instagram',
+          instagram_page_id: fbPageId,
+          access_token: pageAccessToken
+        });
+
+      if (insertError) {
+        console.error(`⚠️ [${brand_id}] Failed to insert integration:`, insertError.message);
+      }
     }
 
     console.log(`✅ [${brand_id}] Instagram OAuth complete!`);
