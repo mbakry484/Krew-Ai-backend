@@ -16,6 +16,8 @@ const escalationsRoutes = require('./routes/escalations');
 const refundsRoutes = require('./routes/refunds');
 const exchangesRoutes = require('./routes/exchanges');
 const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
+const metaTokenRoutes = require('./routes/meta-token');
+const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 
 const app = express();
 
@@ -76,6 +78,7 @@ app.use('/escalations', escalationsRoutes);
 app.use('/refunds', refundsRoutes);
 app.use('/exchanges', exchangesRoutes);
 app.use('/exchanges-refunds', exchangesRefundsRoutes);
+app.use('/api/meta', metaTokenRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -87,4 +90,7 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Krew Backend API listening on port ${PORT}`);
+
+  // Start daily token refresh cron job
+  startTokenRefreshCron();
 });

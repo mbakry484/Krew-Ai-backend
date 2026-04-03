@@ -5,11 +5,12 @@ const { generateReply, checkEscalation } = require('../lib/claude');
 const { sendDM, getUserProfile } = require('../lib/meta');
 const OpenAI = require('openai');
 const langfuse = require('../lib/tracer');
+const { getValidPageToken } = require('../src/utils/metaToken');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY?.trim(),
-});
+});  
 
 /**
  * Find products similar to a customer's image using vector similarity search
@@ -340,8 +341,17 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       return;
     }
 
-    const { brand_id, access_token } = integration;
+    const { brand_id, access_token: integrationToken } = integration;
     console.log(`🔍 Brand found: ${brand_id}`);
+
+    // Try to get a managed long-lived page token, fall back to integrations table token
+    let access_token = integrationToken;
+    try {
+      access_token = await getValidPageToken(brand_id);
+      console.log(`🔑 Using managed page token for brand ${brand_id}`);
+    } catch (tokenErr) {
+      console.log(`ℹ️  No managed token for brand ${brand_id}, using integrations token`);
+    }
 
     // 2. Fetch knowledge base and products
     const { data: knowledgeBaseRows } = await supabase
@@ -877,18 +887,30 @@ IMPORTANT:
 
     // Send fallback message
     try {
-      const { data: integration } = await supabase
-        .from('integrations')
-        .select('access_token')
-        .eq('instagram_page_id', recipientId)
-        .eq('platform', 'instagram')
-        .maybeSingle();
+      // Try managed token first for fallback DM
+      let fallbackToken = null;
+      try {
+        const { data: integration } = await supabase
+          .from('integrations')
+          .select('brand_id, access_token')
+          .eq('instagram_page_id', recipientId)
+          .eq('platform', 'instagram')
+          .maybeSingle();
 
-      if (integration?.access_token) {
+        if (integration?.brand_id) {
+          try {
+            fallbackToken = await getValidPageToken(integration.brand_id);
+          } catch {
+            fallbackToken = integration?.access_token;
+          }
+        }
+      } catch (_) {}
+
+      if (fallbackToken) {
         await sendDM(
           senderId,
           "Sorry, I'm having trouble processing your message right now. Please try again later or contact our support team.",
-          integration.access_token
+          fallbackToken
         );
       }
     } catch (fallbackError) {
