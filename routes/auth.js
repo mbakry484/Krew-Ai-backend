@@ -319,9 +319,10 @@ router.get('/instagram/callback', async (req, res) => {
     }
 
     // Decode state to get brand_id
+    // Note: Express already URL-decodes req.query values, so no decodeURIComponent needed
     let stateData;
     try {
-      stateData = JSON.parse(Buffer.from(decodeURIComponent(state), 'base64').toString());
+      stateData = JSON.parse(Buffer.from(state, 'base64').toString());
     } catch {
       console.error('Invalid state parameter');
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
