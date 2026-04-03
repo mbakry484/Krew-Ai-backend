@@ -25,14 +25,24 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
       });
     }
 
-    // Log and set BACKEND_URL with fallback
-    console.log('BACKEND_URL from env:', process.env.BACKEND_URL);
-    const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
-    console.log('Using BACKEND_URL:', backendUrl);
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
 
-    // Generate state parameter by signing user_id and shop_domain with JWT_SECRET
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
+    const brandId = user.brand_id;
+
+    const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
+
+    // Generate state parameter by signing brand_id and shop_domain with JWT_SECRET
     const state = jwt.sign(
-      { user_id: userId, shop_domain },
+      { brand_id: brandId, user_id: userId, shop_domain },
       process.env.JWT_SECRET,
       { expiresIn: '10m' } // State expires in 10 minutes for security
     );
@@ -74,7 +84,12 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=invalid_state`);
     }
 
-    const { user_id, shop_domain } = decoded;
+    const { brand_id, shop_domain } = decoded;
+
+    if (!brand_id) {
+      console.error('No brand_id in state');
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=invalid_state`);
+    }
 
     // Verify that the shop matches the one in the state
     if (shop !== shop_domain) {
@@ -109,11 +124,11 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
 
-    // Upsert into integrations table
+    // Upsert into integrations table using the authenticated brand_id
     const { error: upsertError } = await supabase
       .from('integrations')
       .upsert({
-        brand_id: user_id,
+        brand_id,
         shopify_shop_domain: shop,
         access_token,
         platform: 'shopify'
@@ -149,6 +164,17 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'shop_domain is required' });
     }
 
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
     // Look up the integration in Supabase
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
@@ -163,10 +189,10 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
       });
     }
 
-    // Update the integration to link it to the user
+    // Update the integration to link it to the brand
     const { error: updateError } = await supabase
       .from('integrations')
-      .update({ brand_id: userId })
+      .update({ brand_id: user.brand_id })
       .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify');
 
@@ -195,11 +221,22 @@ router.get('/shopify/status', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
 
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.json({ linked: false });
+    }
+
     // Query the integrations table by brand_id
     const { data: integration, error: fetchError } = await supabase
       .from('integrations')
       .select('brand_id')
-      .eq('brand_id', userId)
+      .eq('brand_id', user.brand_id)
       .eq('platform', 'shopify')
       .maybeSingle();
 
