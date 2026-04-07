@@ -166,13 +166,13 @@ router.post('/login', async (req, res) => {
  */
 router.post('/onboarding', verifyToken, async (req, res) => {
   try {
-    const { business_type, revenue_range, dm_volume, pain_point } = req.body;
+    const { business_type, revenue_range, dm_volume, pain_point, brand_description } = req.body;
     const userId = req.user.user_id;
 
     // Validate that at least one field is provided
-    if (!business_type && !revenue_range && !dm_volume && !pain_point) {
+    if (!business_type && !revenue_range && !dm_volume && !pain_point && !brand_description) {
       return res.status(400).json({
-        error: 'At least one field is required: business_type, revenue_range, dm_volume, pain_point'
+        error: 'At least one field is required: business_type, revenue_range, dm_volume, pain_point, brand_description'
       });
     }
 
@@ -182,13 +182,14 @@ router.post('/onboarding', verifyToken, async (req, res) => {
     if (revenue_range !== undefined) updateData.revenue_range = revenue_range;
     if (dm_volume !== undefined) updateData.dm_volume = dm_volume;
     if (pain_point !== undefined) updateData.pain_point = pain_point;
+    if (brand_description !== undefined) updateData.brand_description = brand_description;
 
     // Update user in database
     const { data: updatedUser, error: updateError } = await supabase
       .from('users')
       .update(updateData)
       .eq('id', userId)
-      .select('id, email, business_type, revenue_range, dm_volume, pain_point')
+      .select('id, email, business_type, revenue_range, dm_volume, pain_point, brand_description')
       .single();
 
     if (updateError) {
@@ -217,7 +218,7 @@ router.get('/me', verifyToken, async (req, res) => {
     // Fetch user from database, excluding password
     const { data: user, error: fetchError } = await supabase
       .from('users')
-      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, brand_id, created_at')
+      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, brand_description, brand_id, created_at')
       .eq('id', userId)
       .single();
 
@@ -230,6 +231,41 @@ router.get('/me', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Get user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /auth/brand-description
+ * Update the brand description (used from settings page)
+ */
+router.put('/brand-description', verifyToken, async (req, res) => {
+  try {
+    const { brand_description } = req.body;
+    const userId = req.user.user_id;
+
+    if (brand_description === undefined || brand_description === null) {
+      return res.status(400).json({ error: 'brand_description is required' });
+    }
+
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update({ brand_description })
+      .eq('id', userId)
+      .select('id, brand_description')
+      .single();
+
+    if (updateError) {
+      console.error('Error updating brand description:', updateError);
+      return res.status(500).json({ error: 'Failed to update brand description' });
+    }
+
+    res.json({
+      message: 'Brand description updated successfully',
+      brand_description: updatedUser.brand_description
+    });
+  } catch (error) {
+    console.error('Brand description update error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
