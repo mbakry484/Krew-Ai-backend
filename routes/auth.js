@@ -232,7 +232,8 @@ router.get('/me', verifyToken, async (req, res) => {
       .select(`
         id, email, first_name, last_name, business_name, brand_id, created_at,
         brands:brand_id (
-          id, name, business_type, revenue_range, dm_volume, pain_point, brand_description
+          id, name, business_type, revenue_range, dm_volume, pain_point, brand_description,
+          instagram_business_account_id, fb_page_id
         )
       `)
       .eq('id', userId)
@@ -257,6 +258,8 @@ router.get('/me', verifyToken, async (req, res) => {
       dm_volume: brand.dm_volume || null,
       pain_point: brand.pain_point || null,
       brand_description: brand.brand_description || null,
+      instagram_connected: !!brand.instagram_business_account_id,
+      fb_page_connected: !!brand.fb_page_id,
     };
 
     res.json({ user: response });
