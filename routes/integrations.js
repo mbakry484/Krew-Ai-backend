@@ -38,6 +38,18 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
 
     const brandId = user.brand_id;
 
+    // Check if this Shopify store is already connected to another brand
+    const { data: existingShopify } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .maybeSingle();
+
+    if (existingShopify && existingShopify.brand_id !== brandId) {
+      return res.status(409).json({ error: 'This Shopify store is already connected to another brand' });
+    }
+
     const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
 
     // Generate state parameter by signing brand_id and shop_domain with JWT_SECRET
@@ -290,6 +302,64 @@ router.get('/shopify/app-status', async (req, res) => {
     res.json({ linked: true });
   } catch (error) {
     console.error('Shopify app-status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /integrations/status
+ * Get all integration statuses for the authenticated user's brand
+ */
+router.get('/status', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.json({ shopify: { linked: false }, meta: { linked: false } });
+    }
+
+    const brandId = user.brand_id;
+
+    // Query all integrations for this brand
+    const { data: integrations, error: fetchError } = await supabase
+      .from('integrations')
+      .select('platform, shopify_shop_domain, instagram_page_id')
+      .eq('brand_id', brandId);
+
+    if (fetchError) {
+      console.error('Error fetching integrations:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch integration status' });
+    }
+
+    const shopify = integrations?.find(i => i.platform === 'shopify');
+    const meta = integrations?.find(i => i.platform === 'instagram');
+
+    // Also check brands table for Meta connection info
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('fb_page_id, instagram_business_account_id')
+      .eq('id', brandId)
+      .single();
+
+    res.json({
+      shopify: {
+        linked: !!shopify,
+        shop_domain: shopify?.shopify_shop_domain || null,
+      },
+      meta: {
+        linked: !!(meta || brand?.instagram_business_account_id),
+        instagram_id: meta?.instagram_page_id || brand?.instagram_business_account_id || null,
+      },
+    });
+  } catch (error) {
+    console.error('Integration status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

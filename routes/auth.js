@@ -162,7 +162,7 @@ router.post('/login', async (req, res) => {
 
 /**
  * POST /auth/onboarding
- * Update user's onboarding information (protected route)
+ * Update brand's onboarding information (protected route)
  */
 router.post('/onboarding', verifyToken, async (req, res) => {
   try {
@@ -176,6 +176,17 @@ router.post('/onboarding', verifyToken, async (req, res) => {
       });
     }
 
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
     // Build update object with only provided fields
     const updateData = {};
     if (business_type !== undefined) updateData.business_type = business_type;
@@ -184,22 +195,22 @@ router.post('/onboarding', verifyToken, async (req, res) => {
     if (pain_point !== undefined) updateData.pain_point = pain_point;
     if (brand_description !== undefined) updateData.brand_description = brand_description;
 
-    // Update user in database
-    const { data: updatedUser, error: updateError } = await supabase
-      .from('users')
+    // Update brand in database
+    const { data: updatedBrand, error: updateError } = await supabase
+      .from('brands')
       .update(updateData)
-      .eq('id', userId)
-      .select('id, email, business_type, revenue_range, dm_volume, pain_point, brand_description')
+      .eq('id', user.brand_id)
+      .select('id, name, business_type, revenue_range, dm_volume, pain_point, brand_description')
       .single();
 
     if (updateError) {
-      console.error('Error updating user:', updateError);
-      return res.status(500).json({ error: 'Failed to update user information' });
+      console.error('Error updating brand:', updateError);
+      return res.status(500).json({ error: 'Failed to update brand information' });
     }
 
     res.json({
       message: 'Onboarding information updated successfully',
-      user: updatedUser
+      brand: updatedBrand
     });
   } catch (error) {
     console.error('Onboarding error:', error);
@@ -209,16 +220,21 @@ router.post('/onboarding', verifyToken, async (req, res) => {
 
 /**
  * GET /auth/me
- * Get authenticated user's profile (protected route)
+ * Get authenticated user's profile with brand data (protected route)
  */
 router.get('/me', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
 
-    // Fetch user from database, excluding password
+    // Fetch user with brand data via join
     const { data: user, error: fetchError } = await supabase
       .from('users')
-      .select('id, email, first_name, last_name, business_name, business_type, revenue_range, dm_volume, pain_point, brand_description, brand_id, created_at')
+      .select(`
+        id, email, first_name, last_name, business_name, brand_id, created_at,
+        brands:brand_id (
+          id, name, business_type, revenue_range, dm_volume, pain_point, brand_description
+        )
+      `)
       .eq('id', userId)
       .single();
 
@@ -226,9 +242,24 @@ router.get('/me', verifyToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({
-      user
-    });
+    // Flatten brand data into user response for backward compatibility
+    const brand = user.brands || {};
+    const response = {
+      id: user.id,
+      email: user.email,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      business_name: user.business_name,
+      brand_id: user.brand_id,
+      created_at: user.created_at,
+      business_type: brand.business_type || null,
+      revenue_range: brand.revenue_range || null,
+      dm_volume: brand.dm_volume || null,
+      pain_point: brand.pain_point || null,
+      brand_description: brand.brand_description || null,
+    };
+
+    res.json({ user: response });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -248,10 +279,21 @@ router.put('/brand-description', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'brand_description is required' });
     }
 
-    const { data: updatedUser, error: updateError } = await supabase
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
       .from('users')
-      .update({ brand_description })
+      .select('brand_id')
       .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
+    const { data: updatedBrand, error: updateError } = await supabase
+      .from('brands')
+      .update({ brand_description })
+      .eq('id', user.brand_id)
       .select('id, brand_description')
       .single();
 
@@ -262,7 +304,7 @@ router.put('/brand-description', verifyToken, async (req, res) => {
 
     res.json({
       message: 'Brand description updated successfully',
-      brand_description: updatedUser.brand_description
+      brand_description: updatedBrand.brand_description
     });
   } catch (error) {
     console.error('Brand description update error:', error);
@@ -441,6 +483,19 @@ router.get('/instagram/callback', async (req, res) => {
     }
 
     console.log(`📸 [${brand_id}] Instagram Business Account: ${instagramBusinessAccountId}`);
+
+    // Check if this Instagram account is already connected to another brand
+    const { data: existingIg } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('instagram_page_id', instagramBusinessAccountId)
+      .eq('platform', 'instagram')
+      .maybeSingle();
+
+    if (existingIg && existingIg.brand_id !== brand_id) {
+      console.error(`❌ [${brand_id}] Instagram account ${instagramBusinessAccountId} is already connected to brand ${existingIg.brand_id}`);
+      return res.redirect(`${dashboardUrl}?error=instagram_already_connected`);
+    }
 
     // Step 5: Save to brands table
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
