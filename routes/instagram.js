@@ -323,16 +323,21 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   const audioUrl = audioAttachment?.payload?.url || null;
 
   // Detect shared Instagram posts (template type)
+  // Shared posts are the brand's own content — treat them like story replies (context analysis),
+  // NOT like a customer's product search image (vector search). Keep effectiveImageUrl for
+  // direct image attachments only.
   const templateAttachment = attachments.find(a => a.type === 'template');
   const sharedPostImageUrl = templateAttachment?.payload?.elements?.[0]?.image_url
     || templateAttachment?.payload?.elements?.[0]?.url
     || null;
+  const sharedPostTitle = templateAttachment?.payload?.elements?.[0]?.title || null;
+  const sharedPostSubtitle = templateAttachment?.payload?.elements?.[0]?.subtitle || null;
 
-  // Use shared post image if no direct image was sent
-  const effectiveImageUrl = imageUrl || sharedPostImageUrl;
+  // effectiveImageUrl = only direct image attachments (for vector search)
+  const effectiveImageUrl = imageUrl || null;
 
   if (sharedPostImageUrl) {
-    console.log('📤 Customer shared a post, extracting image for vector search...');
+    console.log(`📤 Customer shared a brand post: "${sharedPostTitle || 'no title'}"`);
   }
 
   // Detect story replies
@@ -345,7 +350,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   }
 
   // Guard: ignore events with no content
-  if (!customerMessage && !effectiveImageUrl && !audioUrl && !storyReply) {
+  if (!customerMessage && !effectiveImageUrl && !audioUrl && !storyReply && !sharedPostImageUrl) {
     console.log(`ℹ️  Ignoring event with no content from ${senderId}`);
     return;
   }
@@ -355,44 +360,39 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
   let finalMessage = customerMessage;
 
   // If story reply with no text, set a default message
-  if (!finalMessage && storyReply) {
+  if (!finalMessage && storyReply && !sharedPostImageUrl) {
     finalMessage = 'The customer replied to your story without adding text.';
   }
 
-  // Handle story replies - describe the story for context
+  // Download story or shared post image for brand-aware analysis after products are fetched
   let storyContext = '';
-  if (storyImageUrl) {
+  let storyImageBase64 = null;
+  let storyImageContentType = null;
+  let storyHints = ''; // any text hints from the source (post title, subtitle)
+
+  // Priority: story reply image > shared post image
+  const contextImageUrl = storyImageUrl || sharedPostImageUrl || null;
+  if (sharedPostTitle || sharedPostSubtitle) {
+    storyHints = [sharedPostTitle, sharedPostSubtitle].filter(Boolean).join(' — ');
+  }
+
+  if (contextImageUrl) {
     try {
-      console.log('📖 Processing story image for context...');
-      // Download and describe the story
-      const response = await fetch(storyImageUrl);
-      if (!response.ok) throw new Error(`Failed to download story: ${response.status}`);
-
+      console.log(`📖 Downloading context image (${storyImageUrl ? 'story' : 'shared post'})...`);
+      const response = await fetch(contextImageUrl);
+      if (!response.ok) throw new Error(`Failed to download: ${response.status}`);
       const buffer = await response.arrayBuffer();
-      const base64 = Buffer.from(buffer).toString('base64');
-      const contentType = response.headers.get('content-type') || 'image/jpeg';
-
-      const visionResponse = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        max_tokens: 100,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: 'Describe this Instagram story briefly - what product or content is shown?' },
-            { type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}`, detail: 'low' } }
-          ]
-        }]
-      });
-
-      storyContext = visionResponse.choices[0].message.content;
-      console.log(`📖 Story content: ${storyContext}`);
+      storyImageBase64 = Buffer.from(buffer).toString('base64');
+      storyImageContentType = response.headers.get('content-type') || 'image/jpeg';
+      console.log('📖 Context image downloaded, will analyze after products are fetched');
     } catch (err) {
-      console.error('❌ Story image processing failed:', err.message);
-      storyContext = 'Customer replied to one of your stories';
+      console.error('❌ Context image download failed:', err.message);
+      if (storyReply) storyContext = '__no_image__';
     }
   } else if (storyReply) {
-    // Story reply but no image URL available
-    storyContext = 'Customer replied to one of your stories';
+    // Story reply but image URL not accessible (expired or private)
+    storyContext = '__no_image__';
+    console.log('📖 Story reply with no accessible image URL');
   }
 
   let trace = null;
@@ -440,6 +440,43 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // Separate into available and unavailable
     const inStockProducts = products?.filter(p => p.in_stock) || [];
     const outOfStockProducts = products?.filter(p => !p.in_stock) || [];
+
+    // Brand-aware story analysis — now that we have the product catalog
+    if (storyImageBase64 && storyImageContentType) {
+      try {
+        const productList = (products || []).map(p => p.name).join(', ') || 'no products listed';
+        const hintsLine = storyHints ? `\nText visible in the post/story: "${storyHints}"` : '';
+        const visionResponse = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          max_tokens: 200,
+          messages: [{
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `You are analyzing an Instagram story or post from a fashion/clothing brand. The brand's products are: ${productList}.${hintsLine}
+
+Look at this image and answer concisely:
+1. What is shown? (product type, colors, text overlays, design details — be specific)
+2. If one of the brand's listed products appears to be shown, name it exactly. If uncertain, say so.
+3. Is this a product showcase, a lifestyle/mood shot, a promotion, or something else?
+
+Do not invent product names. Only match against the listed products above.`
+              },
+              {
+                type: 'image_url',
+                image_url: { url: `data:${storyImageContentType};base64,${storyImageBase64}`, detail: 'high' }
+              }
+            ]
+          }]
+        });
+        storyContext = visionResponse.choices[0].message.content;
+        console.log(`📖 Story analysis: ${storyContext}`);
+      } catch (err) {
+        console.error('❌ Story analysis failed:', err.message);
+        storyContext = '__no_image__';
+      }
+    }
 
     // Transcribe voice note now that we have product names to prime Whisper
     if (audioUrl) {
