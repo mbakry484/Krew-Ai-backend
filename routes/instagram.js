@@ -963,18 +963,45 @@ Customer's image looks like: ${queryDescription}
         })
         .eq('id', conversation.id);
 
+      // Parse the collected fields from Luna's summary in the AI reply.
+      // Luna is instructed to produce a structured summary before escalating, e.g.:
+      //   📋 Exchange Request:
+      //   👤 Name: Ahmed Mohamed
+      //   🧾 Order ID: #1234
+      //   📦 Product: DOVED
+      //   📝 Reason: Wrong size
+      const parseField = (text, emoji, label) => {
+        const pattern = new RegExp(`(?:${emoji}\\s*)?${label}:\\s*(.+)`, 'i');
+        const match = text.match(pattern);
+        return match ? match[1].replace(/ESCALATE_\w+/gi, '').trim() : null;
+      };
+
+      const collectedName    = parseField(aiReply, '👤', 'Name');
+      const collectedOrderId = parseField(aiReply, '🧾', 'Order ID');
+      const collectedProduct = parseField(aiReply, '📦', 'Product');
+      const collectedReason  = parseField(aiReply, '📝', 'Reason');
+
+      // Fallbacks: use conversation metadata or the customer's last message
+      const resolvedName    = collectedName    || conversation.customer_name || null;
+      const resolvedOrderId = collectedOrderId || null;
+      const resolvedProduct = collectedProduct || metadata.current_order?.product_name || null;
+      const resolvedReason  = collectedReason  || finalMessage || null;
+
+      console.log(`📋 Escalation data — name: "${resolvedName}", orderId: "${resolvedOrderId}", product: "${resolvedProduct}", reason: "${resolvedReason}"`);
+
       // Auto-create refund/exchange record based on type
       if (escalationCheck.type === 'refund') {
         const { data: refundData, error: refundError } = await supabase.from('refunds').insert({
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: conversation.customer_name || null,
-          product_name: metadata.current_order?.product_name || 'Product name not captured',
+          customer_name: resolvedName,
+          order_id: resolvedOrderId,
+          product_name: resolvedProduct,
           order_amount: metadata.current_order?.price || null,
           refund_amount: metadata.current_order?.price || null,
           refund_reason: 'other',
-          refund_reason_details: `Customer message: ${finalMessage}`,
+          refund_reason_details: resolvedReason,
           status: 'pending'
         }).select().single();
 
@@ -990,11 +1017,12 @@ Customer's image looks like: ${queryDescription}
           brand_id,
           conversation_id: conversation.id,
           customer_id: senderId,
-          customer_name: conversation.customer_name || null,
-          original_product_name: metadata.current_order?.product_name || 'Product name not captured',
+          customer_name: resolvedName,
+          order_id: resolvedOrderId,
+          original_product_name: resolvedProduct,
           original_size: null,
           exchange_reason: 'other',
-          exchange_reason_details: `Customer message: ${finalMessage}`,
+          exchange_reason_details: resolvedReason,
           status: 'pending'
         }).select().single();
 
