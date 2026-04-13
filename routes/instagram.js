@@ -4,6 +4,7 @@ const supabase = require('../lib/supabase');
 const { generateReply, checkEscalation } = require('../lib/claude');
 const { sendDM, getUserProfile } = require('../lib/meta');
 const OpenAI = require('openai');
+const { toFile } = require('openai');
 const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 
@@ -93,6 +94,11 @@ async function findSimilarProducts(imageUrl, brandId) {
 
     const best = matches[0]?.similarity?.toFixed(2) || 'none';
     console.log(`🎯 Found ${matches.length} confident matches above ${SIMILARITY_THRESHOLD} (best: ${best})`);
+    if (matches.length > 0) {
+      matches.forEach(m => {
+        console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
+      });
+    }
     return { matches, queryDescription };
 
   } catch (err) {
@@ -106,28 +112,45 @@ async function findSimilarProducts(imageUrl, brandId) {
  * @param {string} audioUrl - URL of the audio file from Instagram
  * @returns {Promise<string|null>} Transcribed text or null if failed
  */
-async function transcribeAudio(audioUrl) {
+async function transcribeAudio(audioUrl, whisperPrompt = '') {
   try {
-    // Download audio file
+    // Download audio file and detect its content type
     const response = await fetch(audioUrl);
     if (!response.ok) throw new Error(`Failed to download audio: ${response.status}`);
 
+    const contentType = response.headers.get('content-type') || 'audio/ogg';
     const buffer = await response.arrayBuffer();
     const audioBuffer = Buffer.from(buffer);
 
-    // Create a File object for OpenAI
-    const { toFile } = await import('openai');
-    const audioFile = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' });
+    // Map content-type to a file extension Whisper understands
+    const extMap = {
+      'audio/ogg': 'ogg',
+      'audio/mpeg': 'mp3',
+      'audio/mp4': 'mp4',
+      'audio/aac': 'aac',
+      'audio/wav': 'wav',
+      'audio/webm': 'webm',
+      'video/mp4': 'mp4',
+    };
+    const ext = extMap[contentType] || 'ogg';
+    const audioFile = await toFile(audioBuffer, `audio.${ext}`, { type: contentType });
 
-    // Transcribe with Whisper (supports Arabic, English, Franco Arabic)
-    const transcription = await openai.audio.transcriptions.create({
+    // Omit language so Whisper auto-detects (handles English, Arabic, Franco Arabic correctly)
+    // Provide a context prompt to prime Whisper with domain vocabulary for better accuracy
+    const transcriptionRequest = {
       file: audioFile,
       model: 'whisper-1',
-      language: 'ar' // Primary language hint (auto-detects others)
-    });
+      response_format: 'text',
+    };
+    if (whisperPrompt) {
+      transcriptionRequest.prompt = whisperPrompt;
+    }
 
-    console.log(`🎤 Transcribed: "${transcription.text}"`);
-    return transcription.text;
+    const transcription = await openai.audio.transcriptions.create(transcriptionRequest);
+    const text = typeof transcription === 'string' ? transcription.trim() : transcription.text?.trim();
+
+    console.log(`🎤 Transcribed (${ext}): "${text}"`);
+    return text || null;
   } catch (err) {
     console.error('❌ Transcription failed:', err.message);
     return null;
@@ -327,25 +350,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     return;
   }
 
-  // Handle voice notes - transcribe to text
+  // Handle voice notes - transcription happens later after products are fetched
+  // so we can prime Whisper with product name vocabulary for better accuracy
   let finalMessage = customerMessage;
 
   // If story reply with no text, set a default message
   if (!finalMessage && storyReply) {
     finalMessage = 'The customer replied to your story without adding text.';
-  }
-
-  if (audioUrl) {
-    console.log('🎤 Voice note received, transcribing...');
-    const transcribed = await transcribeAudio(audioUrl);
-    if (transcribed) {
-      finalMessage = transcribed;
-      console.log(`✅ Using transcription: "${transcribed}"`);
-    } else {
-      // Fallback if transcription fails
-      finalMessage = 'The customer sent a voice note that could not be transcribed.';
-      console.log('⚠️  Transcription failed, using fallback message');
-    }
   }
 
   // Handle story replies - describe the story for context
@@ -429,6 +440,26 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // Separate into available and unavailable
     const inStockProducts = products?.filter(p => p.in_stock) || [];
     const outOfStockProducts = products?.filter(p => !p.in_stock) || [];
+
+    // Transcribe voice note now that we have product names to prime Whisper
+    if (audioUrl) {
+      console.log('🎤 Voice note received, transcribing...');
+      const productNames = (products || []).map(p => p.name).join(', ');
+      const whisperPrompt = productNames
+        ? `Customer service conversation. Brand products: ${productNames}.`
+        : 'Customer service conversation.';
+      const transcribed = await transcribeAudio(audioUrl, whisperPrompt);
+      if (transcribed) {
+        finalMessage = transcribed;
+        console.log(`✅ Transcription: "${transcribed}"`);
+      } else {
+        // Transcription failed — reply directly and skip AI
+        console.log('⚠️  Transcription failed, sending fallback reply');
+        const fallback = "Sorry, I couldn't catch that voice note! Could you type it out for me? 😊";
+        await sendDM(senderId, fallback, access_token);
+        return;
+      }
+    }
 
     // 3. Get or create conversation
     let { data: conversation } = await supabase
@@ -610,9 +641,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       // Build the image system prompt with vector search results appended
       let imageSearchSection = '';
       if (matches && matches.length > 0) {
-        const matchList = matches.map(p =>
-          `- ${p.name}: ${p.price} EGP, ${p.in_stock ? 'In Stock ✅' : 'Out of Stock ❌'}\n  Visual match: ${p.image_description || 'N/A'}\n  Similarity: ${(p.similarity * 100).toFixed(0)}%`
-        ).join('\n\n');
+        const matchList = matches.map(p => {
+          if (p.in_stock) {
+            return `- ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
+          } else {
+            return `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
+          }
+        }).join('\n\n');
 
         imageSearchSection = `
 
@@ -625,12 +660,10 @@ ${matchList}
 
 Customer's image looks like: ${queryDescription}
 
-IMPORTANT:
-- Confirm which product matches best based on the similarity scores and descriptions
-- State availability and price clearly
-- If product is OUT OF STOCK ❌: acknowledge it and suggest the closest IN STOCK alternatives
-- If product is IN STOCK ✅: confirm it's available and ask if they want to order
-- If match quality is low (similarity < 50%), note it might not be an exact match`;
+⛔ STRICT RULES FOR IMAGE MATCHES:
+- IN STOCK ✅: confirm the product name, state price and availability, ask if they want to order
+- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock
+- If no match feels right visually, say so honestly — do not force a bad match`;
       }
 
       const imageSystemPrompt = imageSearchSection
