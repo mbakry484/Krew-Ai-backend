@@ -10,7 +10,12 @@ const { getValidPageToken } = require('../src/utils/metaToken');
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY?.trim(),
-});  
+});
+
+// Pending image buffer: holds images waiting for a follow-up text message
+// Key: senderId, Value: { messaging, recipientId, timer }
+const pendingImages = new Map();
+const IMAGE_WAIT_MS = 15000;
 
 /**
  * Find products similar to a customer's image using vector similarity search
@@ -214,7 +219,46 @@ router.post('/', async (req, res) => {
         const logMessage = customerMessage || (effectiveImageUrl ? '[Image]' : (storyReply ? '[Story Reply]' : '[Voice Note]'));
         console.log(`📨 ${senderId}: "${logMessage}"`);
 
-        // Process the message
+        // IMAGE WAIT LOGIC:
+        // If this is a pure image (no text), buffer it and wait IMAGE_WAIT_MS for a follow-up text.
+        // If a text message arrives while an image is pending, combine them and process together.
+        const isImageOnly = effectiveImageUrl && !customerMessage && !audioUrl && !storyReply;
+        const hasPendingImage = pendingImages.has(senderId);
+
+        if (isImageOnly) {
+          // Cancel any existing pending image for this sender (replace with latest)
+          if (hasPendingImage) {
+            clearTimeout(pendingImages.get(senderId).timer);
+          }
+          console.log(`⏳ Image received from ${senderId} — waiting ${IMAGE_WAIT_MS / 1000}s for follow-up text`);
+          const timer = setTimeout(async () => {
+            pendingImages.delete(senderId);
+            console.log(`⏰ No follow-up received — processing image alone for ${senderId}`);
+            await handleIncomingMessage(messaging, recipientId);
+          }, IMAGE_WAIT_MS);
+          pendingImages.set(senderId, { messaging, recipientId, timer });
+          continue; // Don't process yet
+        }
+
+        if (customerMessage && hasPendingImage) {
+          // Text arrived while an image was pending — combine them
+          const pending = pendingImages.get(senderId);
+          clearTimeout(pending.timer);
+          pendingImages.delete(senderId);
+          console.log(`✅ Follow-up text received — combining with pending image for ${senderId}`);
+          // Merge the text into the pending image messaging event
+          const combinedMessaging = {
+            ...pending.messaging,
+            message: {
+              ...pending.messaging.message,
+              text: customerMessage
+            }
+          };
+          await handleIncomingMessage(combinedMessaging, pending.recipientId);
+          continue;
+        }
+
+        // Normal message (text, audio, story — no pending image involved)
         await handleIncomingMessage(messaging, recipientId);
       }
     }
@@ -509,13 +553,21 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       content: msg.content
     }));
 
-    // 10. Fetch business name for system prompt
+    // 10. Fetch business name and type for system prompt
     const { data: user } = await supabase
       .from('users')
-      .select('business_name')
+      .select('business_name, brand_id')
       .eq('id', brand_id)
       .maybeSingle();
     const businessName = user?.business_name || 'our business';
+
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('business_type, brand_description')
+      .eq('id', brand_id)
+      .maybeSingle();
+    const businessType = brand?.business_type || null;
+    const brandDescription = brand?.brand_description || null;
 
     // 11. Generate AI reply
     let aiReply;
@@ -525,22 +577,30 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       console.log('📸 Processing customer image with vector search...');
       const { matches, queryDescription } = await findSimilarProducts(effectiveImageUrl, brand_id);
 
+      // Build the base system prompt using the optimized prompt builder
+      const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
+      const baseSystemPrompt = buildOptimizedPrompt({
+        businessName,
+        businessType,
+        brandDescription,
+        customerMessage: finalMessage || 'Do you have this product?',
+        conversationHistory,
+        metadata,
+        inStockProducts,
+        outOfStockProducts,
+        knowledgeBaseRows: knowledgeBaseRows || [],
+        hasImage: true,
+        storyContext
+      });
+
+      // Build the image system prompt with vector search results appended
+      let imageSearchSection = '';
       if (matches && matches.length > 0) {
-        // Found similar products - build focused prompt with matches
         const matchList = matches.map(p =>
           `- ${p.name}: ${p.price} EGP, ${p.in_stock ? 'In Stock ✅' : 'Out of Stock ❌'}\n  Visual match: ${p.image_description || 'N/A'}\n  Similarity: ${(p.similarity * 100).toFixed(0)}%`
         ).join('\n\n');
 
-        // Build system prompt with knowledge base and matched products
-        const { buildSystemPrompt } = require('../lib/claude');
-        const baseSystemPrompt = buildSystemPrompt(businessName, knowledgeBaseRows || [], inStockProducts, outOfStockProducts, metadata);
-
-        // Add story context if available
-        const storySection = storyContext
-          ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📖 STORY CONTEXT\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe customer is replying to your story that shows: ${storyContext}\nUse this context to understand what they're asking about.\n`
-          : '';
-
-        const imageSystemPrompt = `${baseSystemPrompt}${storySection}
+        imageSearchSection = `
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 IMAGE SEARCH RESULTS
@@ -553,60 +613,73 @@ Customer's image looks like: ${queryDescription}
 
 IMPORTANT:
 - Confirm which product matches best based on the similarity scores and descriptions
-- State availability and price clearly - VERY IMPORTANT!
-- If product is OUT OF STOCK ❌: Tell customer "This looks like our [Product Name] (PRICE EGP), but unfortunately it's currently out of stock. Would you like me to suggest similar items that are available?"
-- If product is IN STOCK ✅: Confirm it's available and ask if they want to order
-- If the match quality seems low (similarity < 50%), acknowledge it might not be an exact match
-- If ALL matches are out of stock, acknowledge the product but suggest checking back later or looking at alternatives
-`;
-
-        // Use GPT-4o-mini for the final response (we already did the heavy lifting with vision)
-        const imageMessages = [
-          { role: 'system', content: imageSystemPrompt },
-          ...conversationHistory,
-          { role: 'user', content: finalMessage || 'Do you have this product?' }
-        ];
-
-        // Wrap the OpenAI call with a Langfuse generation span
-        const imageGeneration = trace.generation({
-          name: 'luna-reply',
-          model: 'gpt-4o-mini',
-          input: imageMessages,
-          metadata: {
-            flow: 'image',
-            awaiting: metadata.awaiting,
-            current_order: metadata.current_order,
-            collected_info: metadata.collected_info,
-            history_length: conversationHistory.length
-          }
-        });
-
-        const imageStartTime = Date.now();
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: imageMessages,
-          max_tokens: 400
-        });
-        const imageLatency = Date.now() - imageStartTime;
-
-        imageGeneration.end({
-          output: completion.choices[0].message.content,
-          usage: {
-            input: completion.usage?.prompt_tokens,
-            output: completion.usage?.completion_tokens,
-            total: completion.usage?.total_tokens
-          },
-          metadata: { latency_ms: imageLatency }
-        });
-
-        aiReply = completion.choices[0].message.content;
-        console.log(`🤖 Luna reply (image match): "${aiReply}"`);
-
-      } else {
-        // No matches found - fallback to friendly message
-        aiReply = "Sorry, I couldn't find an exact match for this item in our current collection. Could you describe what you're looking for? For example, the color, style, or type of product? That way I can help you find something similar! 😊";
-        console.log(`🤖 Luna reply (no match): "${aiReply}"`);
+- State availability and price clearly
+- If product is OUT OF STOCK ❌: acknowledge it and suggest the closest IN STOCK alternatives
+- If product is IN STOCK ✅: confirm it's available and ask if they want to order
+- If match quality is low (similarity < 50%), note it might not be an exact match`;
       }
+
+      const imageSystemPrompt = imageSearchSection
+        ? `${baseSystemPrompt}${imageSearchSection}`
+        : baseSystemPrompt;
+
+      // Download image and send to vision model
+      let imageUserContent;
+      try {
+        const imgResponse = await fetch(effectiveImageUrl);
+        if (!imgResponse.ok) throw new Error(`Failed to download: ${imgResponse.status}`);
+        const imgBuffer = await imgResponse.arrayBuffer();
+        const imgBase64 = Buffer.from(imgBuffer).toString('base64');
+        const imgContentType = imgResponse.headers.get('content-type') || 'image/jpeg';
+        imageUserContent = [
+          { type: 'text', text: finalMessage || 'Do you have this product?' },
+          { type: 'image_url', image_url: { url: `data:${imgContentType};base64,${imgBase64}`, detail: 'low' } }
+        ];
+      } catch (imgErr) {
+        console.error('❌ Failed to attach image to vision request:', imgErr.message);
+        imageUserContent = finalMessage || 'The customer sent an image about a product.';
+      }
+
+      const imageMessages = [
+        { role: 'system', content: imageSystemPrompt },
+        ...conversationHistory,
+        { role: 'user', content: imageUserContent }
+      ];
+
+      // Wrap the OpenAI call with a Langfuse generation span
+      const imageGeneration = trace.generation({
+        name: 'luna-reply',
+        model: 'gpt-4o-mini',
+        input: imageMessages,
+        metadata: {
+          flow: matches && matches.length > 0 ? 'image-match' : 'image-vision',
+          awaiting: metadata.awaiting,
+          current_order: metadata.current_order,
+          collected_info: metadata.collected_info,
+          history_length: conversationHistory.length
+        }
+      });
+
+      const imageStartTime = Date.now();
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: imageMessages,
+        max_tokens: 400
+      });
+      const imageLatency = Date.now() - imageStartTime;
+
+      imageGeneration.end({
+        output: completion.choices[0].message.content,
+        usage: {
+          input: completion.usage?.prompt_tokens,
+          output: completion.usage?.completion_tokens,
+          total: completion.usage?.total_tokens
+        },
+        metadata: { latency_ms: imageLatency }
+      });
+
+      aiReply = completion.choices[0].message.content;
+      console.log(`🤖 Luna reply (image): "${aiReply}"`);
 
     } else {
       // TEXT FLOW: Normal conversation without image
@@ -635,7 +708,9 @@ IMPORTANT:
         metadata,
         businessName,
         null,  // No image URL
-        storyContext  // Story context if replying to story
+        storyContext,
+        businessType,
+        brandDescription
       );
       const textLatency = Date.now() - textStartTime;
 
