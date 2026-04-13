@@ -58,7 +58,10 @@ async function findSimilarProducts(imageUrl, brandId) {
     const queryDescription = visionResponse.choices[0].message.content;
     console.log(`🔍 Customer image described as: ${queryDescription}`);
 
-    // Generate embedding for customer's image description
+    // Generate embedding using the same format as stored product embeddings:
+    // stored embeddings were created as "${product.name}. ${description}"
+    // so we embed just the description here and let the DB sort by raw similarity.
+    // We do NOT prepend a product name since we don't know it yet.
     const embeddingResponse = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: queryDescription
@@ -66,11 +69,13 @@ async function findSimilarProducts(imageUrl, brandId) {
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
     // Search for similar products using pgvector
-    const { data: matches, error } = await supabase.rpc('match_products_by_embedding', {
+    // Use a higher threshold (0.5) to avoid weak matches being presented as real results
+    // Fetch more candidates (5) so we can filter client-side
+    const { data: rawMatches, error } = await supabase.rpc('match_products_by_embedding', {
       query_embedding: queryEmbedding,
       match_brand_id: brandId,
-      match_threshold: 0.4,
-      match_count: 3
+      match_threshold: 0.35,
+      match_count: 5
     });
 
     if (error) {
@@ -78,8 +83,17 @@ async function findSimilarProducts(imageUrl, brandId) {
       return { matches: [], queryDescription };
     }
 
-    console.log(`🎯 Found ${matches?.length || 0} similar products`);
-    return { matches: matches || [], queryDescription };
+    // Sort strictly by similarity score (ignore the SQL's in_stock-first ordering)
+    // Only return matches that are genuinely similar (≥ 0.50) to avoid forcing bad matches
+    const SIMILARITY_THRESHOLD = 0.50;
+    const matches = (rawMatches || [])
+      .sort((a, b) => b.similarity - a.similarity)
+      .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
+      .slice(0, 3);
+
+    const best = matches[0]?.similarity?.toFixed(2) || 'none';
+    console.log(`🎯 Found ${matches.length} confident matches above ${SIMILARITY_THRESHOLD} (best: ${best})`);
+    return { matches, queryDescription };
 
   } catch (err) {
     console.error('❌ Image similarity search failed:', err.message);

@@ -106,9 +106,47 @@ router.post('/', (req, res) => {
   res.status(501).json({ message: 'Create product endpoint not yet implemented' });
 });
 
-// PUT /products/:id - Update product (protected)
-router.put('/:id', (req, res) => {
-  res.status(501).json({ message: 'Update product endpoint not yet implemented' });
+// PUT /products/:id - Update product in_stock status (protected)
+router.put('/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { in_stock } = req.body;
+
+    if (typeof in_stock !== 'boolean') {
+      return res.status(400).json({ error: 'in_stock must be a boolean' });
+    }
+
+    // Verify the product belongs to the authenticated user's brand
+    const { data: userData } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', req.user.user_id)
+      .single();
+
+    if (!userData?.brand_id) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { data: product, error } = await supabase
+      .from('products')
+      .update({
+        in_stock,
+        availability: in_stock ? 'in_stock' : 'out_of_stock',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .eq('brand_id', userData.brand_id)
+      .select('id, name, in_stock, availability')
+      .single();
+
+    if (error) throw error;
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    res.json({ success: true, product });
+  } catch (error) {
+    console.error('Error updating product:', error);
+    res.status(500).json({ error: 'Failed to update product', details: error.message });
+  }
 });
 
 // DELETE /products/:id - Delete product (protected)
