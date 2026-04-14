@@ -610,13 +610,13 @@ Do not invent product names. Only match against the listed products above.`
     // 5. All order collection, refund/exchange flows are now handled by the AI
     //    The AI uses conversation history to track state — no state machine needed
 
-    // 7. Fetch conversation history (last 10 messages)
+    // 7. Fetch conversation history (last 20 messages)
     const { data: previousMessages } = await supabase
       .from('messages')
       .select('sender, content')
       .eq('conversation_id', conversation.id)
       .order('created_at', { ascending: true })
-      .limit(10);
+      .limit(20);
 
     // 8. Save incoming message
     await supabase
