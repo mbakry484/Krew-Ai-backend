@@ -366,6 +366,44 @@ router.post('/shop/redact', async (req, res) => {
   }
 });
 
+// GET /webhook/shopify/sync-status?shop_domain=x — poll sync state from embedded app
+router.get('/sync-status', async (req, res) => {
+  try {
+    const { shop_domain } = req.query;
+    if (!shop_domain) return res.status(400).json({ error: 'shop_domain required' });
+
+    const { data: integration } = await supabase
+      .from('integrations')
+      .select('brand_id')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    if (!integration?.brand_id) return res.json({ synced: false, count: 0, last_synced: null });
+
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('synced_at')
+      .eq('brand_id', integration.brand_id)
+      .order('synced_at', { ascending: false })
+      .limit(1);
+
+    if (error || !products || products.length === 0) {
+      return res.json({ synced: false, count: 0, last_synced: null });
+    }
+
+    const { count } = await supabase
+      .from('products')
+      .select('id', { count: 'exact', head: true })
+      .eq('brand_id', integration.brand_id);
+
+    res.json({ synced: true, count: count || 0, last_synced: products[0].synced_at });
+  } catch (error) {
+    console.error('Error fetching sync status:', error);
+    res.status(500).json({ error: 'Failed to fetch sync status' });
+  }
+});
+
 // Legacy webhook endpoints (not yet implemented)
 router.post('/orders/create', (req, res) => {
   res.status(501).json({ message: 'Shopify order creation webhook not yet implemented' });

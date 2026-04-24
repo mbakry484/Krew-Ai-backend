@@ -10,7 +10,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
   console.log(`🔄 Auto-syncing products for ${shop}...`);
 
   const response = await fetch(
-    `https://${shop}/admin/api/2026-04/graphql.json`,
+    `https://${shop}/admin/api/2024-10/graphql.json`,
     {
       method: 'POST',
       headers: {
