@@ -3,6 +3,85 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
+const { generateEmbeddingsForBrand } = require('../lib/embeddings');
+
+// Fetch all products from Shopify and upsert them into Supabase
+async function autoSyncProducts({ shop, access_token, brand_id }) {
+  console.log(`🔄 Auto-syncing products for ${shop}...`);
+
+  const response = await fetch(
+    `https://${shop}/admin/api/2026-04/graphql.json`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': access_token,
+      },
+      body: JSON.stringify({
+        query: `{
+          products(first: 50) {
+            edges {
+              node {
+                id title description
+                images(first: 20) { edges { node { url altText width height } } }
+                variants(first: 10) { edges { node { price inventoryQuantity } } }
+              }
+            }
+          }
+        }`
+      }),
+    }
+  );
+
+  if (!response.ok) throw new Error(`Shopify GraphQL error: ${response.status}`);
+
+  const json = await response.json();
+  const products = json.data?.products?.edges || [];
+  if (products.length === 0) return;
+
+  const syncedAt = new Date().toISOString();
+
+  const productsToUpsert = products.map(({ node }) => {
+    const variants = node.variants.edges.map(e => e.node);
+    const images = node.images.edges.map(e => ({
+      url: e.node.url,
+      altText: e.node.altText || '',
+      width: e.node.width,
+      height: e.node.height,
+    })).filter(img => img.url);
+    const inStock = variants.some(v => (v.inventoryQuantity ?? 0) > 0);
+
+    return {
+      user_id: brand_id,
+      brand_id,
+      shopify_product_id: node.id,
+      name: node.title,
+      description: node.description || null,
+      price: parseFloat(variants[0]?.price || '0'),
+      currency: 'EGP',
+      variants,
+      in_stock: inStock,
+      availability: inStock ? 'in_stock' : 'out_of_stock',
+      image_url: images[0]?.url || null,
+      images,
+      synced_at: syncedAt,
+      updated_at: syncedAt,
+    };
+  });
+
+  const { error } = await supabase
+    .from('products')
+    .upsert(productsToUpsert, { onConflict: 'shopify_product_id', ignoreDuplicates: false });
+
+  if (error) throw error;
+
+  console.log(`✅ Auto-synced ${products.length} products for brand ${brand_id}`);
+
+  // Generate embeddings in background
+  generateEmbeddingsForBrand(brand_id).catch(err =>
+    console.error('❌ Embedding error after auto-sync:', err.message)
+  );
+}
 
 /**
  * POST /integrations/shopify/connect
@@ -153,8 +232,13 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=db_error`);
     }
 
-    // Redirect to frontend with success
-    res.redirect(`${frontendUrl}/dashboard?shopify=connected`);
+    // Redirect to frontend immediately — don't wait for sync
+    res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=connected`);
+
+    // Auto-sync products in background after OAuth completes
+    autoSyncProducts({ shop, access_token, brand_id }).catch(err =>
+      console.error('❌ Auto-sync failed after OAuth:', err.message)
+    );
   } catch (error) {
     console.error('Shopify OAuth callback error:', error);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
