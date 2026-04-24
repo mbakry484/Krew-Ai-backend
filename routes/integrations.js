@@ -232,8 +232,9 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=db_error`);
     }
 
-    // Redirect to frontend immediately — don't wait for sync
-    res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=connected`);
+    // Redirect to the Shopify embedded app so user sees the progress bar
+    const shopifyAppUrl = `https://${shop}/admin/apps/${process.env.SHOPIFY_API_KEY}`;
+    res.redirect(shopifyAppUrl);
 
     // Auto-sync products in background after OAuth completes
     autoSyncProducts({ shop, access_token, brand_id }).catch(err =>

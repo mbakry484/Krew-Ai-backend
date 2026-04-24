@@ -46,6 +46,19 @@ const corsOptions = {
       return callback(null, true);
     }
 
+    // Allow Railway-hosted services (Shopify app polling sync-status)
+    const railwayPattern = /^https:\/\/[\w-]+\.up\.railway\.app$/;
+    if (railwayPattern.test(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow Shopify admin (embedded app iframe)
+    const shopifyPattern = /^https:\/\/[\w-]+\.myshopify\.com$/;
+    const shopifyAdminPattern = /^https:\/\/admin\.shopify\.com$/;
+    if (shopifyPattern.test(origin) || shopifyAdminPattern.test(origin)) {
+      return callback(null, true);
+    }
+
     callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
