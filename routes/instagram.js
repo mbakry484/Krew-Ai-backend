@@ -1128,12 +1128,15 @@ Customer's image looks like: ${queryDescription}
           console.log(`📏 isSizeQuestion: ${isSizeQuestion} (message: "${finalMessage}")`);
 
           if (isSizeQuestion) {
-            // Match by product name in the customer message, fall back to all guides
+            // Match by any product name in the customer message, fall back to all guides
             let guidesToSend = validGuides;
             if (validGuides.length > 1) {
-              const matched = validGuides.filter(g =>
-                msgLower.includes(g.product_name.toLowerCase())
-              );
+              const matched = validGuides.filter(g => {
+                const names = Array.isArray(g.product_names) && g.product_names.length > 0
+                  ? g.product_names
+                  : (g.product_name ? [g.product_name] : []);
+                return names.some(n => msgLower.includes(n.toLowerCase()));
+              });
               if (matched.length > 0) guidesToSend = matched;
             }
 
