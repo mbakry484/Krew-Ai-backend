@@ -828,6 +828,7 @@ Customer's image looks like: ${queryDescription}
           .maybeSingle();
 
         let confirmationMsg;
+        let shopifyOrderNumber = null;
 
         if (!shopifyIntegration) {
           console.log(`⚠️  No Shopify integration found for brand ${brand_id} - recording order without Shopify`);
@@ -872,21 +873,51 @@ Customer's image looks like: ${queryDescription}
 
           if (!shopifyResponse.ok) {
             console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
-            confirmationMsg = "Sorry, we couldn't place your order right now. Please try again or contact us directly.";
+
+            // Parse Shopify error details into a human-readable message
+            let errorDetail = '';
+            if (shopifyData?.errors) {
+              const errors = shopifyData.errors;
+              if (typeof errors === 'string') {
+                errorDetail = errors;
+              } else {
+                const parts = [];
+                for (const [field, messages] of Object.entries(errors)) {
+                  const msgs = Array.isArray(messages) ? messages.join(', ') : String(messages);
+                  parts.push(`${field}: ${msgs}`);
+                }
+                errorDetail = parts.join(' | ');
+              }
+            }
+            console.error(`❌ Shopify error details: ${errorDetail}`);
+
+            // Build user-facing message based on which field failed
+            const errLower = errorDetail.toLowerCase();
+            if (errLower.includes('phone')) {
+              confirmationMsg = `There's an issue with the phone number you provided. Could you double-check it and send it again? (e.g. 01012345678)`;
+            } else if (errLower.includes('address') || errLower.includes('shipping')) {
+              confirmationMsg = `There's an issue with the delivery address. Could you send it again with more detail? (street, area, city)`;
+            } else if (errLower.includes('email')) {
+              confirmationMsg = `There's an issue with the email address. Could you check it and try again?`;
+            } else if (errorDetail) {
+              confirmationMsg = `There was a problem placing your order: ${errorDetail}. Could you check your details and try again?`;
+            } else {
+              confirmationMsg = `Sorry, we couldn't place your order right now. Please try again or contact us directly.`;
+            }
+
             await sendDM(senderId, confirmationMsg, access_token);
             await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
-            // Log Langfuse event before returning
             trace.event({
               name: 'action-taken',
               input: { action: 'place_order', order_data: orderData },
-              metadata: { order_placed: false, shopify_error: true }
+              metadata: { order_placed: false, shopify_error: true, error_detail: errorDetail }
             });
             return;
           }
 
           const shopifyOrder = shopifyData.order;
           const shopifyOrderId = shopifyOrder?.id;
-          const shopifyOrderNumber = shopifyOrder?.order_number;
+          shopifyOrderNumber = shopifyOrder?.order_number;
 
           console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${orderData.product_name}`);
 
@@ -918,7 +949,7 @@ Customer's image looks like: ${queryDescription}
         trace.event({
           name: 'order-placed',
           input: orderData,
-          output: { shopify_order_number: shopifyOrderNumber || null },
+          output: { shopify_order_number: shopifyOrderNumber },
           level: 'DEFAULT'
         });
 
