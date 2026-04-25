@@ -63,6 +63,36 @@ router.post('/sync', async (req, res) => {
   }
 });
 
+// GET /products/mine - List products for the authenticated user's brand (protected)
+router.get('/mine', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('id, name, price, in_stock, image_url')
+      .eq('brand_id', userData.brand_id)
+      .order('name', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, products: products || [] });
+  } catch (error) {
+    console.error('Error fetching products:', error);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+
 // GET /products - List all products for a brand
 router.get('/', async (req, res) => {
   try {
