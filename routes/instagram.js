@@ -1112,31 +1112,31 @@ Customer's image looks like: ${queryDescription}
 
     // 15. Send reply via Meta API
     if (aiReply) {
-      // If size guides are active, check if Luna referenced a size chart image URL and send it as an attachment
+      // If size guides are active, check if the CUSTOMER message was size-related and send chart(s)
       if (sizeGuidesEnabled && sizeGuides && sizeGuides.length > 0) {
-        const guideImageUrls = sizeGuides
-          .filter(g => g.image_url)
-          .map(g => ({ productName: g.product_name, url: g.image_url }));
+        // Only guides that have a real public HTTP URL (never base64/data URIs)
+        const validGuides = sizeGuides.filter(g => g.image_url && g.image_url.startsWith('http'));
 
-        if (guideImageUrls.length > 0) {
-          // Detect if the AI reply mentions any size-chart URLs or size-related intent
-          const replyLower = aiReply.toLowerCase();
-          const isSizeReply = ['size', 'chart', 'measurement', 'sizing', 'مقاس', 'قياس'].some(kw => replyLower.includes(kw));
+        if (validGuides.length > 0) {
+          const msgLower = (finalMessage || '').toLowerCase();
+          const sizeKeywords = ['size', 'sizing', 'fit', 'fits', 'chart', 'measurement', 'measure',
+            'length', 'chest', 'waist', 'hips', 'shoulder', 'مقاس', 'مقاسات', 'قياس', 'قياسات', 'طول'];
+          const isSizeQuestion = sizeKeywords.some(kw => msgLower.includes(kw));
 
-          if (isSizeReply) {
-            // Find which guide(s) are relevant — match by product name mention or send all if only one
-            let guidesToSend = guideImageUrls;
-            if (guideImageUrls.length > 1) {
-              guidesToSend = guideImageUrls.filter(g =>
-                replyLower.includes(g.productName.toLowerCase())
+          if (isSizeQuestion) {
+            // Match by product name in the customer message, fall back to all guides
+            let guidesToSend = validGuides;
+            if (validGuides.length > 1) {
+              const matched = validGuides.filter(g =>
+                msgLower.includes(g.product_name.toLowerCase())
               );
-              if (guidesToSend.length === 0) guidesToSend = guideImageUrls; // fallback: send all
+              if (matched.length > 0) guidesToSend = matched;
             }
 
             for (const guide of guidesToSend) {
               try {
-                await sendImageDM(senderId, guide.url, access_token);
-                console.log(`📏 Sent size chart for "${guide.productName}" to ${senderId}`);
+                await sendImageDM(senderId, guide.image_url, access_token);
+                console.log(`📏 Sent size chart for "${guide.product_name}" to ${senderId}`);
               } catch (imgErr) {
                 console.error(`❌ Failed to send size chart image: ${imgErr.message}`);
               }
