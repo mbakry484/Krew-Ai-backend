@@ -1,18 +1,20 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
+
+// Use memory storage so we can upload the buffer to Supabase Storage
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 /**
  * GET /knowledge-base
  * Get knowledge base for the authenticated user's brand
- * Returns FAQs as array of Q&A pairs
  */
 router.get('/', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
 
-    // Get the user's brand_id from users table
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select('brand_id')
@@ -25,7 +27,6 @@ router.get('/', verifyToken, async (req, res) => {
 
     const brandId = userData.brand_id;
 
-    // Get knowledge base for this brand
     const { data: kb, error: kbError } = await supabase
       .from('knowledge_base')
       .select('*')
@@ -33,21 +34,27 @@ router.get('/', verifyToken, async (req, res) => {
       .single();
 
     if (kbError) {
-      // If no knowledge base exists, return empty structure
       if (kbError.code === 'PGRST116') {
         return res.status(200).json({
-          faqs: []
+          faqs: [],
+          situations_enabled: false,
+          situations: [],
+          size_guides_enabled: false,
+          size_guides: []
         });
       }
       console.error('Error fetching knowledge base:', kbError);
       return res.status(500).json({ error: 'Failed to fetch knowledge base' });
     }
 
-    // Return FAQs as array
     res.status(200).json({
       id: kb.id,
       brand_id: kb.brand_id,
-      faqs: kb.faqs || []
+      faqs: kb.faqs || [],
+      situations_enabled: kb.situations_enabled || false,
+      situations: kb.situations || [],
+      size_guides_enabled: kb.size_guides_enabled || false,
+      size_guides: kb.size_guides || []
     });
   } catch (error) {
     console.error('Get knowledge base error:', error);
@@ -57,20 +64,24 @@ router.get('/', verifyToken, async (req, res) => {
 
 /**
  * POST /knowledge-base
- * Save/update knowledge base FAQs for the authenticated user's brand
- * Body: { faqs: [{ question: string, answer: string }, ...] }
+ * Save/update knowledge base for the authenticated user's brand
+ * Body: { faqs, situations_enabled, situations, size_guides_enabled, size_guides }
  */
 router.post('/', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
-    const { faqs } = req.body;
+    const {
+      faqs,
+      situations_enabled = false,
+      situations = [],
+      size_guides_enabled = false,
+      size_guides = []
+    } = req.body;
 
-    // Validate input
     if (!Array.isArray(faqs)) {
       return res.status(400).json({ error: 'faqs must be an array' });
     }
 
-    // Validate each FAQ item
     for (const faq of faqs) {
       if (!faq.question || typeof faq.question !== 'string') {
         return res.status(400).json({ error: 'Each FAQ must have a question string' });
@@ -80,7 +91,6 @@ router.post('/', verifyToken, async (req, res) => {
       }
     }
 
-    // Get the user's brand_id from users table
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select('brand_id, business_name')
@@ -94,23 +104,27 @@ router.post('/', verifyToken, async (req, res) => {
     const brandId = userData.brand_id;
     const businessName = userData.business_name;
 
-    // Check if knowledge base already exists
     const { data: existingKb } = await supabase
       .from('knowledge_base')
       .select('id')
       .eq('brand_id', brandId)
       .single();
 
+    const payload = {
+      faqs,
+      situations_enabled: !!situations_enabled,
+      situations: Array.isArray(situations) ? situations : [],
+      size_guides_enabled: !!size_guides_enabled,
+      size_guides: Array.isArray(size_guides) ? size_guides : [],
+      updated_at: new Date().toISOString()
+    };
+
     let result;
 
     if (existingKb) {
-      // Update existing knowledge base
       const { data, error } = await supabase
         .from('knowledge_base')
-        .update({
-          faqs,
-          updated_at: new Date().toISOString()
-        })
+        .update(payload)
         .eq('brand_id', brandId)
         .select()
         .single();
@@ -119,21 +133,11 @@ router.post('/', verifyToken, async (req, res) => {
         console.error('Error updating knowledge base:', error);
         return res.status(500).json({ error: 'Failed to update knowledge base' });
       }
-
       result = data;
     } else {
-      // Create new knowledge base
       const { data, error } = await supabase
         .from('knowledge_base')
-        .insert([
-          {
-            brand_id: brandId,
-            brand_name: businessName,
-            faqs,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }
-        ])
+        .insert([{ brand_id: brandId, brand_name: businessName, ...payload, created_at: new Date().toISOString() }])
         .select()
         .single();
 
@@ -141,7 +145,6 @@ router.post('/', verifyToken, async (req, res) => {
         console.error('Error creating knowledge base:', error);
         return res.status(500).json({ error: 'Failed to create knowledge base' });
       }
-
       result = data;
     }
 
@@ -149,7 +152,11 @@ router.post('/', verifyToken, async (req, res) => {
       message: 'Knowledge base saved successfully',
       id: result.id,
       brand_id: result.brand_id,
-      faqs: result.faqs
+      faqs: result.faqs,
+      situations_enabled: result.situations_enabled,
+      situations: result.situations,
+      size_guides_enabled: result.size_guides_enabled,
+      size_guides: result.size_guides
     });
   } catch (error) {
     console.error('Save knowledge base error:', error);
@@ -158,21 +165,67 @@ router.post('/', verifyToken, async (req, res) => {
 });
 
 /**
+ * POST /knowledge-base/upload-image
+ * Upload a size guide image to Supabase Storage
+ * Returns: { url: string }
+ */
+router.post('/upload-image', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const userId = req.user.user_id;
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const brandId = userData.brand_id;
+    const ext = req.file.originalname.split('.').pop() || 'jpg';
+    const fileName = `size-guides/${brandId}/${Date.now()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('knowledge-base')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
+
+    if (uploadError) {
+      console.error('Storage upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to upload image' });
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from('knowledge-base')
+      .getPublicUrl(fileName);
+
+    res.status(200).json({ url: publicUrlData.publicUrl });
+  } catch (error) {
+    console.error('Upload image error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * DELETE /knowledge-base/:index
- * Delete a specific FAQ item from knowledge base by index
- * Query param: ?index=0
+ * Delete a specific FAQ item by index
  */
 router.delete('/:index', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
     const faqIndex = parseInt(req.params.index);
 
-    // Validate index is a number
     if (isNaN(faqIndex) || faqIndex < 0) {
       return res.status(400).json({ error: 'Invalid FAQ index' });
     }
 
-    // Get the user's brand_id from users table
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select('brand_id')
@@ -185,7 +238,6 @@ router.delete('/:index', verifyToken, async (req, res) => {
 
     const brandId = userData.brand_id;
 
-    // Get current knowledge base
     const { data: kb, error: kbError } = await supabase
       .from('knowledge_base')
       .select('faqs')
@@ -198,21 +250,15 @@ router.delete('/:index', verifyToken, async (req, res) => {
 
     const faqs = kb.faqs || [];
 
-    // Check if index exists
     if (faqIndex >= faqs.length) {
       return res.status(400).json({ error: 'FAQ index out of range' });
     }
 
-    // Remove the FAQ at the specified index
     const updatedFaqs = faqs.filter((_, index) => index !== faqIndex);
 
-    // Update knowledge base with new FAQs
     const { data, error } = await supabase
       .from('knowledge_base')
-      .update({
-        faqs: updatedFaqs,
-        updated_at: new Date().toISOString()
-      })
+      .update({ faqs: updatedFaqs, updated_at: new Date().toISOString() })
       .eq('brand_id', brandId)
       .select()
       .single();
@@ -222,10 +268,7 @@ router.delete('/:index', verifyToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to delete FAQ' });
     }
 
-    res.status(200).json({
-      message: 'FAQ deleted successfully',
-      faqs: data.faqs
-    });
+    res.status(200).json({ message: 'FAQ deleted successfully', faqs: data.faqs });
   } catch (error) {
     console.error('Delete FAQ error:', error);
     res.status(500).json({ error: 'Internal server error' });

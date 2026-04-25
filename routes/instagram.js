@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { generateReply, checkEscalation } = require('../lib/claude');
-const { sendDM, getUserProfile } = require('../lib/meta');
+const { sendDM, sendImageDM, getUserProfile } = require('../lib/meta');
 const OpenAI = require('openai');
 const { toFile } = require('openai');
 const langfuse = require('../lib/tracer');
@@ -428,6 +428,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
       .select('*')
       .eq('brand_id', brand_id);
 
+    // Extract situations and size guides from the knowledge base row
+    const kbRow = knowledgeBaseRows && knowledgeBaseRows[0];
+    const situationsEnabled = kbRow?.situations_enabled || false;
+    const situations = kbRow?.situations || [];
+    const sizeGuidesEnabled = kbRow?.size_guides_enabled || false;
+    const sizeGuides = kbRow?.size_guides || [];
+
     // Fetch ALL products - both in stock and out of stock
     const { data: products } = await supabase
       .from('products')
@@ -672,7 +679,11 @@ Do not invent product names. Only match against the listed products above.`
         outOfStockProducts,
         knowledgeBaseRows: knowledgeBaseRows || [],
         hasImage: true,
-        storyContext
+        storyContext,
+        situationsEnabled,
+        situations,
+        sizeGuidesEnabled,
+        sizeGuides
       });
 
       // Build the image system prompt with vector search results appended
@@ -794,7 +805,11 @@ Customer's image looks like: ${queryDescription}
         null,  // No image URL
         storyContext,
         businessType,
-        brandDescription
+        brandDescription,
+        situationsEnabled,
+        situations,
+        sizeGuidesEnabled,
+        sizeGuides
       );
       const textLatency = Date.now() - textStartTime;
 
@@ -1097,6 +1112,39 @@ Customer's image looks like: ${queryDescription}
 
     // 15. Send reply via Meta API
     if (aiReply) {
+      // If size guides are active, check if Luna referenced a size chart image URL and send it as an attachment
+      if (sizeGuidesEnabled && sizeGuides && sizeGuides.length > 0) {
+        const guideImageUrls = sizeGuides
+          .filter(g => g.image_url)
+          .map(g => ({ productName: g.product_name, url: g.image_url }));
+
+        if (guideImageUrls.length > 0) {
+          // Detect if the AI reply mentions any size-chart URLs or size-related intent
+          const replyLower = aiReply.toLowerCase();
+          const isSizeReply = ['size', 'chart', 'measurement', 'sizing', 'مقاس', 'قياس'].some(kw => replyLower.includes(kw));
+
+          if (isSizeReply) {
+            // Find which guide(s) are relevant — match by product name mention or send all if only one
+            let guidesToSend = guideImageUrls;
+            if (guideImageUrls.length > 1) {
+              guidesToSend = guideImageUrls.filter(g =>
+                replyLower.includes(g.productName.toLowerCase())
+              );
+              if (guidesToSend.length === 0) guidesToSend = guideImageUrls; // fallback: send all
+            }
+
+            for (const guide of guidesToSend) {
+              try {
+                await sendImageDM(senderId, guide.url, access_token);
+                console.log(`📏 Sent size chart for "${guide.productName}" to ${senderId}`);
+              } catch (imgErr) {
+                console.error(`❌ Failed to send size chart image: ${imgErr.message}`);
+              }
+            }
+          }
+        }
+      }
+
       await sendDM(senderId, aiReply, access_token);
       console.log(`✅ Sent to ${senderId}`);
     }
