@@ -1114,14 +1114,18 @@ Customer's image looks like: ${queryDescription}
     if (aiReply) {
       // If size guides are active, check if the CUSTOMER message was size-related and send chart(s)
       if (sizeGuidesEnabled && sizeGuides && sizeGuides.length > 0) {
+        console.log(`📏 Size guides active (${sizeGuides.length} total). Checking customer message for size intent...`);
         // Only guides that have a real public HTTP URL (never base64/data URIs)
         const validGuides = sizeGuides.filter(g => g.image_url && g.image_url.startsWith('http'));
+        console.log(`📏 Valid guides with HTTP image URLs: ${validGuides.length}`);
+        sizeGuides.forEach(g => console.log(`   - "${g.product_name}": image_url starts with "${(g.image_url || '').substring(0, 30)}"`));
 
         if (validGuides.length > 0) {
           const msgLower = (finalMessage || '').toLowerCase();
           const sizeKeywords = ['size', 'sizing', 'fit', 'fits', 'chart', 'measurement', 'measure',
             'length', 'chest', 'waist', 'hips', 'shoulder', 'مقاس', 'مقاسات', 'قياس', 'قياسات', 'طول'];
           const isSizeQuestion = sizeKeywords.some(kw => msgLower.includes(kw));
+          console.log(`📏 isSizeQuestion: ${isSizeQuestion} (message: "${finalMessage}")`);
 
           if (isSizeQuestion) {
             // Match by product name in the customer message, fall back to all guides
@@ -1135,6 +1139,7 @@ Customer's image looks like: ${queryDescription}
 
             for (const guide of guidesToSend) {
               try {
+                console.log(`📏 Sending size chart image: ${guide.image_url}`);
                 await sendImageDM(senderId, guide.image_url, access_token);
                 console.log(`📏 Sent size chart for "${guide.product_name}" to ${senderId}`);
               } catch (imgErr) {
@@ -1142,6 +1147,8 @@ Customer's image looks like: ${queryDescription}
               }
             }
           }
+        } else {
+          console.log(`📏 No valid HTTP image URLs found — image send skipped`);
         }
       }
 
