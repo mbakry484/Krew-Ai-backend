@@ -832,6 +832,23 @@ Customer's image looks like: ${queryDescription}
 
         if (!shopifyIntegration) {
           console.log(`⚠️  No Shopify integration found for brand ${brand_id} - recording order without Shopify`);
+
+          // Save order to DB even without Shopify
+          await supabase.from('orders').insert({
+            brand_id,
+            conversation_id: conversation.id,
+            shopify_order_id: null,
+            shopify_order_number: null,
+            customer_name: orderData.name,
+            customer_phone: orderData.phone,
+            customer_address: orderData.address,
+            product_name: orderData.product_name,
+            price: orderData.price,
+            currency: 'EGP',
+            status: 'pending',
+            created_at: new Date().toISOString()
+          });
+
           confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${orderData.product_name}\n• Price: ${orderData.price} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
         } else {
           const formattedPhone = formatEgyptianPhone(orderData.phone);

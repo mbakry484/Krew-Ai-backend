@@ -9,7 +9,20 @@ const { verifyToken } = require('../middleware/auth');
  */
 router.get('/', verifyToken, async (req, res) => {
   try {
-    const brandId = req.user.user_id;
+    const userId = req.user.user_id;
+
+    // Look up brand_id for this user
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(404).json({ error: 'User or brand not found' });
+    }
+
+    const brandId = user.brand_id;
 
     // Fetch all orders for this brand, ordered by created_at DESC
     const { data: orders, error } = await supabase
@@ -39,7 +52,20 @@ router.get('/', verifyToken, async (req, res) => {
  */
 router.get('/stats', verifyToken, async (req, res) => {
   try {
-    const brandId = req.user.user_id;
+    const userId = req.user.user_id;
+
+    // Look up brand_id for this user
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(404).json({ error: 'User or brand not found' });
+    }
+
+    const brandId = user.brand_id;
 
     // Fetch all orders for this brand
     const { data: orders, error } = await supabase
