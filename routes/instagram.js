@@ -7,6 +7,7 @@ const OpenAI = require('openai');
 const { toFile } = require('openai');
 const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
+const { logUsage } = require('../lib/usage-logger');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -24,7 +25,7 @@ const IMAGE_WAIT_MS = 15000;
  * @param {string} brandId - Brand ID to search within
  * @returns {Promise<{matches: Array, queryDescription: string|null}>}
  */
-async function findSimilarProducts(imageUrl, brandId) {
+async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
   try {
     // Download and encode customer's image as base64
     const response = await fetch(imageUrl);
@@ -58,6 +59,16 @@ async function findSimilarProducts(imageUrl, brandId) {
 
     const queryDescription = visionResponse.choices[0].message.content;
     console.log(`🔍 Customer image described as: ${queryDescription}`);
+
+    logUsage({
+      brandId,
+      conversationId,
+      messageType: 'image',
+      model: 'gpt-4o',
+      promptTokens: visionResponse.usage?.prompt_tokens ?? 0,
+      completionTokens: visionResponse.usage?.completion_tokens ?? 0,
+      totalTokens: visionResponse.usage?.total_tokens ?? 0
+    });
 
     // Generate embedding using the same format as stored product embeddings:
     // stored embeddings were created as "${product.name}. ${description}"
@@ -110,7 +121,8 @@ async function findSimilarProducts(imageUrl, brandId) {
 /**
  * Transcribe audio/voice note using OpenAI Whisper
  * @param {string} audioUrl - URL of the audio file from Instagram
- * @returns {Promise<string|null>} Transcribed text or null if failed
+ * @param {string} [whisperPrompt] - Optional context prompt for Whisper
+ * @returns {Promise<{text: string|null, durationSeconds: number}>}
  */
 async function transcribeAudio(audioUrl, whisperPrompt = '') {
   try {
@@ -135,25 +147,26 @@ async function transcribeAudio(audioUrl, whisperPrompt = '') {
     const ext = extMap[contentType] || 'ogg';
     const audioFile = await toFile(audioBuffer, `audio.${ext}`, { type: contentType });
 
+    // Use verbose_json to get audio duration for usage logging
     // Omit language so Whisper auto-detects (handles English, Arabic, Franco Arabic correctly)
-    // Provide a context prompt to prime Whisper with domain vocabulary for better accuracy
     const transcriptionRequest = {
       file: audioFile,
       model: 'whisper-1',
-      response_format: 'text',
+      response_format: 'verbose_json',
     };
     if (whisperPrompt) {
       transcriptionRequest.prompt = whisperPrompt;
     }
 
     const transcription = await openai.audio.transcriptions.create(transcriptionRequest);
-    const text = typeof transcription === 'string' ? transcription.trim() : transcription.text?.trim();
+    const text = transcription.text?.trim() || null;
+    const durationSeconds = transcription.duration ?? 0;
 
     console.log(`🎤 Transcribed (${ext}): "${text}"`);
-    return text || null;
+    return { text: text || null, durationSeconds };
   } catch (err) {
     console.error('❌ Transcription failed:', err.message);
-    return null;
+    return { text: null, durationSeconds: 0 };
   }
 }
 
@@ -479,6 +492,16 @@ Do not invent product names. Only match against the listed products above.`
         });
         storyContext = visionResponse.choices[0].message.content;
         console.log(`📖 Story analysis: ${storyContext}`);
+
+        logUsage({
+          brandId: brand_id,
+          conversationId: null, // conversation not yet fetched at this point
+          messageType: 'story',
+          model: 'gpt-4o',
+          promptTokens: visionResponse.usage?.prompt_tokens ?? 0,
+          completionTokens: visionResponse.usage?.completion_tokens ?? 0,
+          totalTokens: visionResponse.usage?.total_tokens ?? 0
+        });
       } catch (err) {
         console.error('❌ Story analysis failed:', err.message);
         storyContext = '__no_image__';
@@ -486,13 +509,15 @@ Do not invent product names. Only match against the listed products above.`
     }
 
     // Transcribe voice note now that we have product names to prime Whisper
+    let whisperDurationSeconds = 0;
     if (audioUrl) {
       console.log('🎤 Voice note received, transcribing...');
       const productNames = (products || []).map(p => p.name).join(', ');
       const whisperPrompt = productNames
         ? `Customer service conversation. Brand products: ${productNames}.`
         : 'Customer service conversation.';
-      const transcribed = await transcribeAudio(audioUrl, whisperPrompt);
+      const { text: transcribed, durationSeconds } = await transcribeAudio(audioUrl, whisperPrompt);
+      whisperDurationSeconds = durationSeconds;
       if (transcribed) {
         finalMessage = transcribed;
         console.log(`✅ Transcription: "${transcribed}"`);
@@ -552,6 +577,17 @@ Do not invent product names. Only match against the listed products above.`
         conversation.customer_name = profile.name;
         conversation.customer_username = profile.username;
       }
+    }
+
+    // Log Whisper usage now that we have a conversation ID
+    if (audioUrl && whisperDurationSeconds >= 0) {
+      logUsage({
+        brandId: brand_id,
+        conversationId: conversation.id,
+        messageType: 'voice',
+        model: 'whisper-1',
+        audioDurationSeconds: whisperDurationSeconds
+      });
     }
 
     // Load metadata from database (CRITICAL - this is Luna's memory)
@@ -664,7 +700,7 @@ Do not invent product names. Only match against the listed products above.`
     if (effectiveImageUrl) {
       // IMAGE FLOW: Use vector similarity search to find matching products
       console.log('📸 Processing customer image with vector search...');
-      const { matches, queryDescription } = await findSimilarProducts(effectiveImageUrl, brand_id);
+      const { matches, queryDescription } = await findSimilarProducts(effectiveImageUrl, brand_id, conversation.id);
 
       // Build the base system prompt using the optimized prompt builder
       const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
@@ -776,6 +812,16 @@ Customer's image looks like: ${queryDescription}
       aiReply = completion.choices[0].message.content;
       console.log(`🤖 Luna reply (image): "${aiReply}"`);
 
+      logUsage({
+        brandId: brand_id,
+        conversationId: conversation.id,
+        messageType: 'image',
+        model: 'gpt-4o-mini',
+        promptTokens: completion.usage?.prompt_tokens ?? 0,
+        completionTokens: completion.usage?.completion_tokens ?? 0,
+        totalTokens: completion.usage?.total_tokens ?? 0
+      });
+
     } else {
       // TEXT FLOW: Normal conversation without image
       // Wrap the text AI call with a Langfuse generation span
@@ -809,7 +855,8 @@ Customer's image looks like: ${queryDescription}
         situationsEnabled,
         situations,
         sizeGuidesEnabled,
-        sizeGuides
+        sizeGuides,
+        conversation.id
       );
       const textLatency = Date.now() - textStartTime;
 
