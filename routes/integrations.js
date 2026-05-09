@@ -449,4 +449,80 @@ router.get('/status', verifyToken, async (req, res) => {
   }
 });
 
+/**
+ * DELETE /integrations/disconnect
+ * Disconnect Shopify, Instagram, or both integrations for the authenticated user's brand.
+ * Body: { platform: 'shopify' | 'instagram' | 'all' }
+ */
+router.delete('/disconnect', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { platform } = req.body;
+
+    if (!platform || !['shopify', 'instagram', 'all'].includes(platform)) {
+      return res.status(400).json({ error: "platform must be 'shopify', 'instagram', or 'all'" });
+    }
+
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(404).json({ error: 'Brand not found for this user' });
+    }
+
+    const brandId = user.brand_id;
+    const platformsToRemove = platform === 'all' ? ['shopify', 'instagram'] : [platform];
+
+    // Delete rows from integrations table
+    const { error: deleteError } = await supabase
+      .from('integrations')
+      .delete()
+      .eq('brand_id', brandId)
+      .in('platform', platformsToRemove);
+
+    if (deleteError) {
+      console.error('Error deleting integrations:', deleteError);
+      return res.status(500).json({ error: 'Failed to disconnect integration(s)' });
+    }
+
+    // Clear related columns on the brands table
+    const brandUpdates = {};
+    if (platformsToRemove.includes('instagram')) {
+      brandUpdates.fb_page_id = null;
+      brandUpdates.page_access_token = null;
+      brandUpdates.long_lived_user_token = null;
+      brandUpdates.token_expires_at = null;
+      brandUpdates.instagram_page_id = null;
+      brandUpdates.instagram_business_account_id = null;
+    }
+    if (platformsToRemove.includes('shopify')) {
+      brandUpdates.shopify_shop_domain = null;
+    }
+
+    if (Object.keys(brandUpdates).length > 0) {
+      const { error: brandUpdateError } = await supabase
+        .from('brands')
+        .update(brandUpdates)
+        .eq('id', brandId);
+
+      if (brandUpdateError) {
+        console.error('Error clearing brand integration fields:', brandUpdateError);
+        // Non-fatal: integrations row already deleted, log and continue
+      }
+    }
+
+    res.json({
+      success: true,
+      disconnected: platformsToRemove,
+    });
+  } catch (error) {
+    console.error('Disconnect integration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;
