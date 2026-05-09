@@ -673,10 +673,14 @@ Do not invent product names. Only match against the listed products above.`
       });
 
     // 9. Map conversation history to OpenAI format
-    const conversationHistory = (previousMessages || []).map(msg => ({
-      role: msg.sender === 'customer' ? 'user' : 'assistant',
-      content: msg.content
-    }));
+    // Filter out image-only placeholder messages — they have no useful text context
+    const IMAGE_PLACEHOLDERS = ['[Image]', '[Image/Audio]', '[Voice Note]', '[Story Reply]'];
+    const conversationHistory = (previousMessages || [])
+      .filter(msg => !IMAGE_PLACEHOLDERS.includes(msg.content?.trim()))
+      .map(msg => ({
+        role: msg.sender === 'customer' ? 'user' : 'assistant',
+        content: msg.content
+      }));
 
     // 10. Fetch business name and type for system prompt
     const { data: user } = await supabase
