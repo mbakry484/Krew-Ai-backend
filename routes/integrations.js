@@ -415,7 +415,7 @@ router.get('/status', verifyToken, async (req, res) => {
     // Query all integrations for this brand
     const { data: integrations, error: fetchError } = await supabase
       .from('integrations')
-      .select('platform, shopify_shop_domain, instagram_page_id')
+      .select('platform, shopify_shop_domain, instagram_page_id, access_token')
       .eq('brand_id', brandId);
 
     if (fetchError) {
@@ -429,18 +429,55 @@ router.get('/status', verifyToken, async (req, res) => {
     // Also check brands table for Meta connection info
     const { data: brand } = await supabase
       .from('brands')
-      .select('fb_page_id, instagram_business_account_id')
+      .select('fb_page_id, instagram_business_account_id, page_access_token')
       .eq('id', brandId)
       .single();
+
+    // Fetch Shopify store name from Shopify REST API
+    let shopName = null;
+    if (shopify?.shopify_shop_domain && shopify?.access_token) {
+      try {
+        const shopRes = await fetch(
+          `https://${shopify.shopify_shop_domain}/admin/api/2024-10/shop.json`,
+          { headers: { 'X-Shopify-Access-Token': shopify.access_token } }
+        );
+        if (shopRes.ok) {
+          const shopData = await shopRes.json();
+          shopName = shopData.shop?.name || null;
+        }
+      } catch (err) {
+        console.error('Failed to fetch Shopify shop name:', err.message);
+      }
+    }
+
+    // Fetch Instagram username from Graph API
+    let instagramUsername = null;
+    const igAccountId = meta?.instagram_page_id || brand?.instagram_business_account_id;
+    const igAccessToken = meta?.access_token || brand?.page_access_token;
+    if (igAccountId && igAccessToken) {
+      try {
+        const igRes = await fetch(
+          `https://graph.facebook.com/v21.0/${igAccountId}?fields=username&access_token=${igAccessToken}`
+        );
+        if (igRes.ok) {
+          const igData = await igRes.json();
+          instagramUsername = igData.username || null;
+        }
+      } catch (err) {
+        console.error('Failed to fetch Instagram username:', err.message);
+      }
+    }
 
     res.json({
       shopify: {
         linked: !!shopify,
         shop_domain: shopify?.shopify_shop_domain || null,
+        shop_name: shopName,
       },
       meta: {
         linked: !!(meta || brand?.instagram_business_account_id),
-        instagram_id: meta?.instagram_page_id || brand?.instagram_business_account_id || null,
+        instagram_id: igAccountId || null,
+        instagram_username: instagramUsername,
       },
     });
   } catch (error) {
