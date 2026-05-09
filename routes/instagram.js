@@ -14,6 +14,29 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY?.trim(),
 });
 
+/**
+ * Download an image from a URL and upload it to Supabase Storage.
+ * Returns a permanent public URL, or the original URL if upload fails.
+ */
+async function uploadImageToStorage(imageUrl, brandId) {
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) return imageUrl;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const ext = contentType.split('/')[1]?.split(';')[0] || 'jpg';
+    const fileName = `conversation-images/${brandId}/${Date.now()}.${ext}`;
+    const { error } = await supabase.storage
+      .from('knowledge-base')
+      .upload(fileName, buffer, { contentType, upsert: false });
+    if (error) return imageUrl;
+    const { data } = supabase.storage.from('knowledge-base').getPublicUrl(fileName);
+    return data.publicUrl || imageUrl;
+  } catch {
+    return imageUrl;
+  }
+}
+
 // Pending image buffer: holds images waiting for a follow-up text message
 // Key: senderId, Value: { messaging, recipientId, timer }
 const pendingImages = new Map();
@@ -579,6 +602,12 @@ Do not invent product names. Only match against the listed products above.`
       }
     }
 
+    // Upload customer image to Supabase Storage for a permanent URL
+    let storedImageUrl = null;
+    if (effectiveImageUrl) {
+      storedImageUrl = await uploadImageToStorage(effectiveImageUrl, brand_id);
+    }
+
     // Log Whisper usage now that we have a conversation ID
     if (audioUrl && whisperDurationSeconds >= 0) {
       logUsage({
@@ -643,7 +672,7 @@ Do not invent product names. Only match against the listed products above.`
           sender: 'customer',
           content: finalMessage || null,
           platform_message_id: messageId,
-          image_url: effectiveImageUrl || null,
+          image_url: storedImageUrl,
         });
 
       // Don't send any reply - let human team handle it
@@ -669,7 +698,7 @@ Do not invent product names. Only match against the listed products above.`
         sender: 'customer',
         content: finalMessage || null,
         platform_message_id: messageId,
-        image_url: effectiveImageUrl || null,
+        image_url: storedImageUrl,
       });
 
     // 9. Map conversation history to OpenAI format
