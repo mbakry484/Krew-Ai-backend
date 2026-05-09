@@ -41,11 +41,9 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
 
   const syncedAt = new Date().toISOString();
 
-  const productsToUpsert = products.reduce((acc, { node }) => {
+  const productsToUpsert = products.map(({ node }) => {
     const variants = node.variants.edges.map(e => e.node);
     const inStock = variants.some(v => (v.inventoryQuantity ?? 0) > 0);
-    if (!inStock) return acc; // skip out-of-stock products
-
     const images = node.images.edges.map(e => ({
       url: e.node.url,
       altText: e.node.altText || '',
@@ -53,7 +51,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
       height: e.node.height,
     })).filter(img => img.url);
 
-    acc.push({
+    return {
       user_id: brand_id,
       brand_id,
       shopify_product_id: node.id,
@@ -62,20 +60,14 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
       price: parseFloat(variants[0]?.price || '0'),
       currency: 'EGP',
       variants,
-      in_stock: true,
-      availability: 'in_stock',
+      in_stock: inStock,
+      availability: inStock ? 'in_stock' : 'out_of_stock',
       image_url: images[0]?.url || null,
       images,
       synced_at: syncedAt,
       updated_at: syncedAt,
-    });
-    return acc;
-  }, []);
-
-  if (productsToUpsert.length === 0) {
-    console.log(`⚠️ No active in-stock products to sync for brand ${brand_id}`);
-    return;
-  }
+    };
+  });
 
   const { error } = await supabase
     .from('products')
@@ -83,7 +75,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
 
   if (error) throw error;
 
-  console.log(`✅ Auto-synced ${productsToUpsert.length}/${products.length} active in-stock products for brand ${brand_id}`);
+  console.log(`✅ Auto-synced ${productsToUpsert.length} active products for brand ${brand_id}`);
 
   // Generate embeddings in background
   generateEmbeddingsForBrand(brand_id).catch(err =>
