@@ -641,7 +641,7 @@ Do not invent product names. Only match against the listed products above.`
         .insert({
           conversation_id: conversation.id,
           sender: 'customer',
-          content: finalMessage || '[Image]',
+          content: finalMessage || null,
           platform_message_id: messageId,
           image_url: effectiveImageUrl || null,
         });
@@ -667,7 +667,7 @@ Do not invent product names. Only match against the listed products above.`
       .insert({
         conversation_id: conversation.id,
         sender: 'customer',
-        content: finalMessage || '[Image]',
+        content: finalMessage || null,
         platform_message_id: messageId,
         image_url: effectiveImageUrl || null,
       });
