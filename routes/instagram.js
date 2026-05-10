@@ -1187,19 +1187,23 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
         console.log(`🔁 Re-invoking AI with validation result...`);
 
         // Add the validation attempt and result to conversation history for context
+        // The validation result is injected as a system message so the AI treats it as internal feedback
         const validationHistory = [
           ...conversationHistory,
           { role: 'user', content: finalMessage },
-          { role: 'assistant', content: aiReply.replace(validateOrderMatch[0], '').trim() || 'Let me verify your order...' },
-          { role: 'user', content: validationResult }
+          { role: 'assistant', content: 'Let me verify your order details...' },
+          { role: 'system', content: validationResult }
         ];
 
+        // Force exchange/refund context by using the original customer message
+        // (which contained exchange/refund keywords) so the prompt manager includes
+        // the exchange/refund prompt in the re-invocation
         const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
         const validationSystemPrompt = buildOptimizedPrompt({
           businessName,
           businessType,
           brandDescription,
-          customerMessage: validationResult,
+          customerMessage: finalMessage,
           conversationHistory: validationHistory,
           metadata,
           inStockProducts,
