@@ -1110,10 +1110,143 @@ Customer's image looks like: ${queryDescription}
       }
     }
 
+    // 12b. Check if AI returned a VALIDATE_ORDER JSON (exchange/refund order validation)
+    const validateOrderMatch = aiReply.match(/\{"action"\s*:\s*"VALIDATE_ORDER".*\}/);
+
+    if (validateOrderMatch) {
+      try {
+        const validateData = JSON.parse(validateOrderMatch[0]);
+        console.log('🔍 Order validation requested:', JSON.stringify(validateData));
+
+        const requestedOrderId = (validateData.order_id || '').replace(/^#/, '').trim();
+        const requestedName = (validateData.customer_name || '').trim();
+
+        if (!requestedOrderId || !requestedName) {
+          throw new Error('Missing order_id or customer_name in VALIDATE_ORDER');
+        }
+
+        // Look up order by order number or shopify_order_number for this brand
+        const { data: matchedOrders, error: orderLookupError } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('brand_id', brand_id)
+          .or(`shopify_order_number.eq.${requestedOrderId},order_number.eq.${requestedOrderId},shopify_order_number.eq.#${requestedOrderId}`);
+
+        let validationResult;
+
+        if (orderLookupError || !matchedOrders || matchedOrders.length === 0) {
+          console.log(`❌ Order not found: ${requestedOrderId}`);
+          validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — No order found with ID "${requestedOrderId}". Ask the customer to double-check their order number.`;
+        } else {
+          // Fuzzy name matching — check if any matched order has a similar customer name
+          const normalizeStr = (s) => s.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]/g, '');
+          const requestedNameNorm = normalizeStr(requestedName);
+
+          // Simple fuzzy match: check if names are similar (Levenshtein-like tolerance)
+          const fuzzyNameMatch = (a, b) => {
+            if (a === b) return true;
+            if (a.includes(b) || b.includes(a)) return true;
+            // Allow up to 2 character differences for names > 4 chars
+            if (a.length > 4 && b.length > 4) {
+              let differences = 0;
+              const longer = a.length >= b.length ? a : b;
+              const shorter = a.length < b.length ? a : b;
+              for (let i = 0; i < longer.length; i++) {
+                if (longer[i] !== shorter[i]) differences++;
+              }
+              if (Math.abs(a.length - b.length) + differences <= 2) return true;
+            }
+            return false;
+          };
+
+          const matchedOrder = matchedOrders.find(o => {
+            const orderName = normalizeStr(o.customer_name || '');
+            return fuzzyNameMatch(requestedNameNorm, orderName);
+          });
+
+          if (!matchedOrder) {
+            console.log(`❌ Name mismatch: "${requestedName}" vs orders: ${matchedOrders.map(o => o.customer_name).join(', ')}`);
+            validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — Order #${requestedOrderId} exists but the name "${requestedName}" does not match the name on the order. Ask the customer to check the exact name they used when ordering (there might be a typo).`;
+          } else {
+            console.log(`✅ Order validated: #${requestedOrderId} for "${matchedOrder.customer_name}"`);
+            // Return order details including products
+            const productInfo = matchedOrder.product_name || 'Unknown product';
+            validationResult = `SYSTEM_VALIDATION_RESULT: VALID — Order #${requestedOrderId} confirmed for "${matchedOrder.customer_name}".
+ORDER DETAILS:
+- Order Number: #${requestedOrderId}
+- Customer Name: ${matchedOrder.customer_name}
+- Products Ordered: ${productInfo}
+- Order Date: ${matchedOrder.created_at ? new Date(matchedOrder.created_at).toLocaleDateString() : 'N/A'}
+- Status: ${matchedOrder.status || 'N/A'}
+
+Now show these products to the customer and proceed with Step 2 of the exchange/refund flow.`;
+          }
+        }
+
+        // Re-invoke AI with the validation result so Luna can continue the conversation
+        console.log(`🔁 Re-invoking AI with validation result...`);
+
+        // Add the validation attempt and result to conversation history for context
+        const validationHistory = [
+          ...conversationHistory,
+          { role: 'user', content: finalMessage },
+          { role: 'assistant', content: aiReply.replace(validateOrderMatch[0], '').trim() || 'Let me verify your order...' },
+          { role: 'user', content: validationResult }
+        ];
+
+        const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
+        const validationSystemPrompt = buildOptimizedPrompt({
+          businessName,
+          businessType,
+          brandDescription,
+          customerMessage: validationResult,
+          conversationHistory: validationHistory,
+          metadata,
+          inStockProducts,
+          outOfStockProducts,
+          knowledgeBaseRows: knowledgeBaseRows || [],
+          hasImage: false,
+          storyContext: '',
+          situationsEnabled,
+          situations,
+          sizeGuidesEnabled,
+          sizeGuides
+        });
+
+        const validationMessages = [
+          { role: 'system', content: validationSystemPrompt },
+          ...validationHistory
+        ];
+
+        const validationCompletion = await openai.chat.completions.create({
+          model: 'gpt-4.1',
+          messages: validationMessages,
+          max_tokens: 700
+        });
+
+        aiReply = validationCompletion.choices[0].message.content;
+        console.log(`🤖 Luna reply (post-validation): "${aiReply}"`);
+
+        logUsage({
+          brandId: brand_id,
+          conversationId: conversation.id,
+          messageType: 'text',
+          model: 'gpt-4.1',
+          promptTokens: validationCompletion.usage?.prompt_tokens ?? 0,
+          completionTokens: validationCompletion.usage?.completion_tokens ?? 0,
+          totalTokens: validationCompletion.usage?.total_tokens ?? 0
+        });
+
+      } catch (e) {
+        console.error('Failed to process VALIDATE_ORDER:', e.message);
+        aiReply = "Let me check that for you... Could you please confirm your order number and name again?";
+      }
+    }
+
     // Log the action taken to Langfuse
     trace.event({
       name: 'action-taken',
-      input: { action: orderJsonMatch ? 'place_order' : 'reply', order_data: null },
+      input: { action: orderJsonMatch ? 'place_order' : validateOrderMatch ? 'validate_order' : 'reply', order_data: null },
       metadata: {
         order_placed: false,
         shopify_order_number: null
