@@ -24,7 +24,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
               node {
                 id title description
                 images(first: 20) { edges { node { url altText width height } } }
-                variants(first: 10) { edges { node { price inventoryQuantity } } }
+                variants(first: 10) { edges { node { id title price inventoryQuantity } } }
               }
             }
           }

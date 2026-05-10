@@ -902,17 +902,33 @@ Customer's image looks like: ${queryDescription}
     }
 
     // 12. Check if AI returned a PLACE_ORDER JSON
-    const orderJsonMatch = aiReply.match(/\{"action"\s*:\s*"PLACE_ORDER".*?\}/);
+    const orderJsonMatch = aiReply.match(/\{"action"\s*:\s*"PLACE_ORDER".*\}/);
 
     if (orderJsonMatch) {
       try {
         const orderData = JSON.parse(orderJsonMatch[0]);
         console.log('🎉 Order ready:', JSON.stringify(orderData));
 
+        // Normalize to items array format (backward-compatible with old single-product format)
+        if (!orderData.items && orderData.product_name) {
+          orderData.items = [{
+            variant_id: orderData.variant_id || null,
+            product_name: orderData.product_name,
+            quantity: orderData.quantity || 1,
+            price: orderData.price
+          }];
+        }
+
         // Validate required fields
-        if (!orderData.product_name || !orderData.price || !orderData.name || !orderData.phone || !orderData.address) {
+        if (!orderData.items || orderData.items.length === 0 || !orderData.name || !orderData.phone || !orderData.address) {
           throw new Error('Missing required order fields');
         }
+
+        // Calculate total price and build product summary
+        const totalPrice = orderData.items.reduce((sum, item) => sum + (item.price * (item.quantity || 1)), 0);
+        const productSummary = orderData.items.map(item =>
+          `${item.quantity || 1}x ${item.product_name}`
+        ).join(', ');
 
         // Fetch Shopify integration
         const { data: shopifyIntegration } = await supabase
@@ -937,16 +953,36 @@ Customer's image looks like: ${queryDescription}
             customer_name: orderData.name,
             customer_phone: orderData.phone,
             customer_address: orderData.address,
-            product_name: orderData.product_name,
-            price: orderData.price,
+            product_name: productSummary,
+            price: totalPrice,
             currency: 'EGP',
             status: 'pending',
             created_at: new Date().toISOString()
           });
 
-          confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${orderData.product_name}\n• Price: ${orderData.price} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
+          confirmationMsg = `✅ Your order has been recorded!\n\n• Product: ${productSummary}\n• Price: ${totalPrice} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nOur team will contact you soon to confirm. Thank you! 🎉`;
         } else {
           const formattedPhone = formatEgyptianPhone(orderData.phone);
+
+          // Build line_items using real variant IDs when available
+          const line_items = orderData.items.map(item => {
+            if (item.variant_id) {
+              // Extract numeric ID from GID format (gid://shopify/ProductVariant/12345 → 12345)
+              const numericId = item.variant_id.includes('gid://')
+                ? item.variant_id.split('/').pop()
+                : item.variant_id;
+              return {
+                variant_id: parseInt(numericId, 10),
+                quantity: item.quantity || 1
+              };
+            }
+            // Fallback for items without variant_id (shouldn't happen with updated prompts)
+            return {
+              title: item.product_name,
+              quantity: item.quantity || 1,
+              price: item.price
+            };
+          });
 
           const shopifyResponse = await fetch(
             `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
@@ -958,11 +994,7 @@ Customer's image looks like: ${queryDescription}
               },
               body: JSON.stringify({
                 order: {
-                  line_items: [{
-                    title: orderData.product_name,
-                    quantity: 1,
-                    price: orderData.price
-                  }],
+                  line_items,
                   customer: {
                     first_name: orderData.name
                   },
@@ -974,6 +1006,7 @@ Customer's image looks like: ${queryDescription}
                   },
                   phone: formattedPhone,
                   financial_status: 'pending',
+                  inventory_behaviour: 'decrement_obeying_policy',
                   send_receipt: false,
                   note: 'Order placed via Luna AI agent on Instagram/Messenger'
                 }
@@ -1031,7 +1064,7 @@ Customer's image looks like: ${queryDescription}
           const shopifyOrderId = shopifyOrder?.id;
           shopifyOrderNumber = shopifyOrder?.order_number;
 
-          console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${orderData.product_name}`);
+          console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${productSummary}`);
 
           // Save to Supabase orders table
           await supabase.from('orders').insert({
@@ -1042,14 +1075,14 @@ Customer's image looks like: ${queryDescription}
             customer_name: orderData.name,
             customer_phone: orderData.phone,
             customer_address: orderData.address,
-            product_name: orderData.product_name,
-            price: orderData.price,
+            product_name: productSummary,
+            price: totalPrice,
             currency: 'EGP',
             status: 'pending',
             created_at: new Date().toISOString()
           });
 
-          confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${orderData.product_name}\n• Price: ${orderData.price} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
+          confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${productSummary}\n• Price: ${totalPrice} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
         }
 
         // Send confirmation to customer (not the raw JSON)
