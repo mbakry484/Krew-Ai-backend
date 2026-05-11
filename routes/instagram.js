@@ -1497,7 +1497,7 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
     // 16. Save AI reply to database
     await supabase
       .from('messages')
-      .insert({
+      .insert([{
         conversation_id: conversation.id,
         direction: 'inbound',
         content: finalMessage || '[Image]',
@@ -1512,8 +1512,7 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
         sender_name: 'Luna',
         is_luna: true,
         sent_at: new Date().toISOString()
-      }
-    ]);
+      }]);
 
     await supabase
       .from('conversations')
