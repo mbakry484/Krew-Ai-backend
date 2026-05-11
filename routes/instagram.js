@@ -1175,9 +1175,49 @@ Customer's image looks like: ${queryDescription}
             validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — Order #${requestedOrderId} exists but the name "${requestedName}" does not match the name on the order. Ask the customer to check the exact name they used when ordering (there might be a typo).`;
           } else {
             console.log(`✅ Order validated: #${requestedOrderId} for "${matchedOrder.customer_name}"`);
-            // Return order details including products
-            const productInfo = matchedOrder.product_name || 'Unknown product';
-            validationResult = `SYSTEM_VALIDATION_RESULT: VALID — Order #${requestedOrderId} confirmed for "${matchedOrder.customer_name}".
+
+            // Check if there's already an active exchange or refund for this order
+            const { data: existingExchanges } = await supabase
+              .from('exchanges')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('order_id', matchedOrder.id)
+              .in('status', ['pending', 'approved', 'shipped']);
+
+            const { data: existingRefunds } = await supabase
+              .from('refunds')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('order_id', matchedOrder.id)
+              .in('status', ['pending', 'approved', 'processed']);
+
+            // Also check by original_order_number in case order_id UUID wasn't set
+            const orderIdClean = requestedOrderId.replace(/^#/, '').trim();
+            const { data: existingExchangesByNumber } = await supabase
+              .from('exchanges')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('original_order_number', orderIdClean)
+              .in('status', ['pending', 'approved', 'shipped']);
+
+            const { data: existingRefundsByNumber } = await supabase
+              .from('refunds')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('original_order_number', orderIdClean)
+              .in('status', ['pending', 'approved', 'processed']);
+
+            const hasActiveExchange = (existingExchanges && existingExchanges.length > 0) || (existingExchangesByNumber && existingExchangesByNumber.length > 0);
+            const hasActiveRefund = (existingRefunds && existingRefunds.length > 0) || (existingRefundsByNumber && existingRefundsByNumber.length > 0);
+
+            if (hasActiveExchange || hasActiveRefund) {
+              const activeType = hasActiveExchange ? 'exchange' : 'refund';
+              console.log(`⚠️ Order #${requestedOrderId} already has an active ${activeType} request`);
+              validationResult = `SYSTEM_VALIDATION_RESULT: ALREADY_EXISTS — Order #${requestedOrderId} already has an active ${activeType} request being processed by the team. Tell the customer that their ${activeType} request for this order is already being handled and the team will be in touch. Do NOT create another request. Do NOT escalate.`;
+            } else {
+              // Return order details including products
+              const productInfo = matchedOrder.product_name || 'Unknown product';
+              validationResult = `SYSTEM_VALIDATION_RESULT: VALID — Order #${requestedOrderId} confirmed for "${matchedOrder.customer_name}".
 ORDER DETAILS:
 - Order Number: #${requestedOrderId}
 - Customer Name: ${matchedOrder.customer_name}
@@ -1186,6 +1226,7 @@ ORDER DETAILS:
 - Status: ${matchedOrder.status || 'N/A'}
 
 Now show these products to the customer and proceed with Step 2 of the exchange/refund flow.`;
+            }
           }
         }
 
@@ -1308,6 +1349,19 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
 
       console.log(`📋 Escalation data — name: "${resolvedName}", orderId: "${resolvedOrderId}", product: "${resolvedProduct}", reason: "${resolvedReason}"`);
 
+      // Look up the actual order UUID from the orders table using the shopify_order_number
+      let resolvedOrderUUID = null;
+      if (resolvedOrderId) {
+        const orderIdClean = resolvedOrderId.replace(/^#/, '').trim();
+        const { data: orderRow } = await supabase
+          .from('orders')
+          .select('id')
+          .eq('brand_id', brand_id)
+          .in('shopify_order_number', [orderIdClean, `#${orderIdClean}`])
+          .maybeSingle();
+        resolvedOrderUUID = orderRow?.id || null;
+      }
+
       // Auto-create refund/exchange record based on type
       if (escalationCheck.type === 'refund') {
         const { data: refundData, error: refundError } = await supabase.from('refunds').insert({
@@ -1315,7 +1369,8 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
           conversation_id: conversation.id,
           customer_id: senderId,
           customer_name: resolvedName,
-          order_id: resolvedOrderId,
+          order_id: resolvedOrderUUID,
+          original_order_number: resolvedOrderId,
           product_name: resolvedProduct,
           order_amount: metadata.current_order?.price || null,
           refund_amount: metadata.current_order?.price || null,
@@ -1337,7 +1392,8 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
           conversation_id: conversation.id,
           customer_id: senderId,
           customer_name: resolvedName,
-          order_id: resolvedOrderId,
+          order_id: resolvedOrderUUID,
+          original_order_number: resolvedOrderId,
           original_product_name: resolvedProduct,
           original_size: null,
           exchange_reason: 'other',
@@ -1369,7 +1425,11 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
     // 15. Send reply via Meta API
     if (aiReply) {
       // If size guides are active, check if the CUSTOMER message was size-related and send chart(s)
-      if (sizeGuidesEnabled && sizeGuides && sizeGuides.length > 0) {
+      // Skip size chart sending during exchange/refund flows (words like "fit", "size", "small" appear naturally)
+      const isExchangeRefundFlow = (conversationHistory || []).some(m =>
+        /exchange|refund|swap|replace|return|تبديل|استرجاع/i.test(m.content || '')
+      ) || /exchange|refund|swap|replace|return|تبديل|استرجاع/i.test(finalMessage || '');
+      if (sizeGuidesEnabled && sizeGuides && sizeGuides.length > 0 && !escalationCheck.shouldEscalate && !isExchangeRefundFlow) {
         console.log(`📏 Size guides active (${sizeGuides.length} total). Checking customer message for size intent...`);
         // Only guides that have a real public HTTP URL (never base64/data URIs)
         const validGuides = sizeGuides.filter(g => g.image_url && g.image_url.startsWith('http'));
