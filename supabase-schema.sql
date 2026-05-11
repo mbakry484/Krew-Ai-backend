@@ -29,9 +29,19 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
   tone TEXT, -- Brand voice/tone
   guidelines TEXT, -- Brand guidelines
   faqs JSONB DEFAULT '[]'::jsonb, -- Array of {question, answer} objects
+  situations_enabled BOOLEAN DEFAULT false,
+  situations JSONB DEFAULT '[]'::jsonb, -- Array of {text} objects describing brand situations
+  size_guides_enabled BOOLEAN DEFAULT false,
+  size_guides JSONB DEFAULT '[]'::jsonb, -- Array of {product_name, content, image_url} objects
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Migration: add new columns if table already exists
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS situations_enabled BOOLEAN DEFAULT false;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS situations JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS size_guides_enabled BOOLEAN DEFAULT false;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS size_guides JSONB DEFAULT '[]'::jsonb;
 
 -- 4. Products table
 CREATE TABLE IF NOT EXISTS products (

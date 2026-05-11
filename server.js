@@ -15,6 +15,9 @@ const ordersRoutes = require('./routes/orders');
 const escalationsRoutes = require('./routes/escalations');
 const refundsRoutes = require('./routes/refunds');
 const exchangesRoutes = require('./routes/exchanges');
+const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
+const metaTokenRoutes = require('./routes/meta-token');
+const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 
 const app = express();
 
@@ -40,6 +43,19 @@ const corsOptions = {
     const localhostPattern = /^http:\/\/localhost:\d+$/;
     const localhostIPPattern = /^http:\/\/127\.0\.0\.1:\d+$/;
     if (localhostPattern.test(origin) || localhostIPPattern.test(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow Railway-hosted services (Shopify app polling sync-status)
+    const railwayPattern = /^https:\/\/[\w-]+\.up\.railway\.app$/;
+    if (railwayPattern.test(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow Shopify admin (embedded app iframe)
+    const shopifyPattern = /^https:\/\/[\w-]+\.myshopify\.com$/;
+    const shopifyAdminPattern = /^https:\/\/admin\.shopify\.com$/;
+    if (shopifyPattern.test(origin) || shopifyAdminPattern.test(origin)) {
       return callback(null, true);
     }
 
@@ -74,6 +90,8 @@ app.use('/orders', ordersRoutes);
 app.use('/escalations', escalationsRoutes);
 app.use('/refunds', refundsRoutes);
 app.use('/exchanges', exchangesRoutes);
+app.use('/exchanges-refunds', exchangesRefundsRoutes);
+app.use('/api/meta', metaTokenRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -85,4 +103,7 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Krew Backend API listening on port ${PORT}`);
+
+  // Start daily token refresh cron job
+  startTokenRefreshCron();
 });
