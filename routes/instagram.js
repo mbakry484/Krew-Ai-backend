@@ -1125,17 +1125,23 @@ Customer's image looks like: ${queryDescription}
           throw new Error('Missing order_id or customer_name in VALIDATE_ORDER');
         }
 
-        // Look up order by order number or shopify_order_number for this brand
+        // Look up order by shopify_order_number for this brand
+        // Try multiple formats: "1005", "#1005" — the customer might provide either
+        const orderIdVariants = [requestedOrderId, `#${requestedOrderId}`];
         const { data: matchedOrders, error: orderLookupError } = await supabase
           .from('orders')
           .select('*')
           .eq('brand_id', brand_id)
-          .or(`shopify_order_number.eq.${requestedOrderId},order_number.eq.${requestedOrderId},shopify_order_number.eq.#${requestedOrderId}`);
+          .in('shopify_order_number', orderIdVariants);
 
         let validationResult;
 
+        if (orderLookupError) {
+          console.error(`❌ Order lookup error:`, orderLookupError);
+        }
+
         if (orderLookupError || !matchedOrders || matchedOrders.length === 0) {
-          console.log(`❌ Order not found: ${requestedOrderId}`);
+          console.log(`❌ Order not found: ${requestedOrderId} (searched shopify_order_number IN [${orderIdVariants.join(', ')}])`);
           validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — No order found with ID "${requestedOrderId}". Ask the customer to double-check their order number.`;
         } else {
           // Fuzzy name matching — check if any matched order has a similar customer name
