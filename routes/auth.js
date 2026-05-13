@@ -239,7 +239,7 @@ router.get('/me', verifyToken, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
 
-    console.log('Auth/me - userId:', userId, 'user:', user, 'error:', fetchError?.message);
+    if (fetchError) console.error('Auth/me error:', fetchError.message);
 
     if (fetchError || !user) {
       return res.status(404).json({ error: 'User not found' });

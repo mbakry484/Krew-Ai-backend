@@ -166,16 +166,33 @@ router.post('/product-update', async (req, res) => {
       data
     });
 
-    // Run embedding generation in background for this product
+    // Only regenerate embedding if the product has an image and either:
+    // 1. No embedding exists yet, or
+    // 2. The image_url changed (meaning the actual image was updated)
     if (product.image_url) {
       const { generateProductEmbedding } = require('../lib/embeddings');
-      generateProductEmbedding({
-        shopify_product_id: product.shopify_product_id,
-        name: product.name,
-        image_url: product.image_url
-      }).catch(err =>
-        console.error('❌ Background embedding error:', err.message)
-      );
+
+      // Check if this product already has an embedding and what image_url was used
+      const { data: existing } = await supabase
+        .from('products')
+        .select('image_url, embedding')
+        .eq('shopify_product_id', product.shopify_product_id)
+        .single();
+
+      const needsEmbedding = !existing?.embedding || existing?.image_url !== product.image_url;
+
+      if (needsEmbedding) {
+        console.log(`🔄 Regenerating embedding for ${product.name} (${!existing?.embedding ? 'no embedding' : 'image changed'})`);
+        generateProductEmbedding({
+          shopify_product_id: product.shopify_product_id,
+          name: product.name,
+          image_url: product.image_url
+        }).catch(err =>
+          console.error('❌ Background embedding error:', err.message)
+        );
+      } else {
+        console.log(`⏭️  Skipping embedding for ${product.name} — image unchanged, embedding exists`);
+      }
     }
   } catch (error) {
     console.error('Error upserting product:', error);
