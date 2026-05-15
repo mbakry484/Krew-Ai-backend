@@ -34,8 +34,15 @@ async function analyzeInteraction(interaction) {
     .lte('created_at', interaction.ended_at)
     .order('created_at', { ascending: true });
 
-  if (error || !messages || messages.length === 0) {
-    console.error(`  interaction-analysis: no messages for ${interaction.id}`, error?.message);
+  console.log(`  [${interaction.id}] fetched ${messages?.length ?? 0} messages (window: ${interaction.started_at} → ${interaction.ended_at})`);
+
+  if (error) {
+    console.error(`  [${interaction.id}] DB error fetching messages:`, error.message, error.details ?? '');
+    return null;
+  }
+
+  if (!messages || messages.length === 0) {
+    console.warn(`  [${interaction.id}] no messages found in time window — skipping`);
     return null;
   }
 
@@ -48,9 +55,15 @@ async function analyzeInteraction(interaction) {
     })
     .join('\n');
 
-  if (!transcript.trim()) return null;
+  console.log(`  [${interaction.id}] transcript length: ${transcript.length} chars`);
+
+  if (!transcript.trim()) {
+    console.warn(`  [${interaction.id}] transcript is empty after filtering — skipping`);
+    return null;
+  }
 
   try {
+    console.log(`  [${interaction.id}] calling ${ANALYSIS_MODEL}...`);
     const response = await openai.chat.completions.create({
       model: ANALYSIS_MODEL,
       temperature: 0.1,
@@ -63,9 +76,22 @@ async function analyzeInteraction(interaction) {
     });
 
     const content = response.choices[0]?.message?.content;
-    if (!content) return null;
+    if (!content) {
+      console.error(`  [${interaction.id}] OpenAI returned empty content`);
+      return null;
+    }
 
-    const parsed = JSON.parse(content);
+    console.log(`  [${interaction.id}] raw AI response: ${content}`);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (parseErr) {
+      console.error(`  [${interaction.id}] JSON parse failed:`, parseErr.message, '| raw:', content);
+      return null;
+    }
+
+    console.log(`  [${interaction.id}] analysis: sentiment=${parsed.sentiment}, issue="${parsed.issue_category}", resolution=${parsed.resolution_status}`);
 
     // Log usage (fire-and-forget)
     logUsage({
@@ -80,7 +106,9 @@ async function analyzeInteraction(interaction) {
 
     return parsed;
   } catch (err) {
-    console.error(`  interaction-analysis: OpenAI error for ${interaction.id}:`, err.message);
+    console.error(`  [${interaction.id}] OpenAI error:`, err.message);
+    if (err.status) console.error(`  [${interaction.id}] HTTP status: ${err.status}`);
+    if (err.error) console.error(`  [${interaction.id}] API error detail:`, JSON.stringify(err.error));
     return null;
   }
 }
@@ -141,6 +169,11 @@ async function runAnalysisBatch() {
   let failed = 0;
 
   for (const interaction of pending) {
+    console.log(`\n── interaction ${interaction.id} ──`);
+    console.log(`   conversation: ${interaction.conversation_id}`);
+    console.log(`   messages: ${interaction.message_count}, escalated: ${interaction.was_escalated}`);
+    console.log(`   window: ${interaction.started_at} → ${interaction.ended_at}`);
+
     const [analysis, avgResponseMs] = await Promise.all([
       analyzeInteraction(interaction),
       calcResponseTime(interaction),
@@ -148,36 +181,44 @@ async function runAnalysisBatch() {
 
     if (!analysis) {
       failed++;
-      // Mark as analyzed anyway to prevent infinite retries on bad data
-      await supabase
+      console.warn(`  [${interaction.id}] analysis returned null — marking analyzed_at to skip on next run`);
+      const { error: skipErr } = await supabase
         .from('interactions')
         .update({ analyzed_at: new Date().toISOString() })
         .eq('id', interaction.id);
+      if (skipErr) console.error(`  [${interaction.id}] failed to mark skip:`, skipErr.message);
       continue;
     }
 
+    console.log(`  [${interaction.id}] avg response time: ${avgResponseMs ?? 'N/A'}ms`);
+
+    const updatePayload = {
+      sentiment: analysis.sentiment,
+      sentiment_score: analysis.sentiment_score,
+      issue_category: analysis.issue_category,
+      issue_summary: analysis.issue_summary,
+      resolution_status: interaction.was_escalated ? 'escalated' : analysis.resolution_status,
+      response_time_avg_ms: avgResponseMs,
+      analyzed_at: new Date().toISOString(),
+    };
+
+    console.log(`  [${interaction.id}] writing to DB:`, JSON.stringify(updatePayload));
+
     const { error: updateErr } = await supabase
       .from('interactions')
-      .update({
-        sentiment: analysis.sentiment,
-        sentiment_score: analysis.sentiment_score,
-        issue_category: analysis.issue_category,
-        issue_summary: analysis.issue_summary,
-        resolution_status: interaction.was_escalated ? 'escalated' : analysis.resolution_status,
-        response_time_avg_ms: avgResponseMs,
-        analyzed_at: new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq('id', interaction.id);
 
     if (updateErr) {
-      console.error(`  interaction-analysis: update failed for ${interaction.id}:`, updateErr.message);
+      console.error(`  [${interaction.id}] DB update failed:`, updateErr.message, updateErr.details ?? '');
       failed++;
     } else {
+      console.log(`  [${interaction.id}] ✓ saved successfully`);
       success++;
     }
   }
 
-  console.log(`interaction-analysis: batch complete — ${success} analyzed, ${failed} failed`);
+  console.log(`\ninteraction-analysis: batch complete — ${success} analyzed, ${failed} failed`);
 }
 
 /**
