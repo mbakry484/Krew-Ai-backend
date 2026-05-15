@@ -1002,8 +1002,18 @@ Customer's image looks like: ${queryDescription}
                   shipping_address: {
                     name: orderData.name,
                     address1: orderData.address,
-                    phone: formattedPhone,
-                    country: 'EG'
+                    city: 'Egypt',      // Shopify requires city to save the address; full address is in address1
+                    country: 'EG',
+                    country_code: 'EG',
+                    phone: formattedPhone
+                  },
+                  billing_address: {
+                    name: orderData.name,
+                    address1: orderData.address,
+                    city: 'Egypt',
+                    country: 'EG',
+                    country_code: 'EG',
+                    phone: formattedPhone
                   },
                   phone: formattedPhone,
                   financial_status: 'pending',
