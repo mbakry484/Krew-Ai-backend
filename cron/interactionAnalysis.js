@@ -187,7 +187,7 @@ async function runAnalysisBatch() {
 function startInteractionAnalysisCron() {
   console.log('interaction-analysis: cron scheduled (every 5 minutes)');
 
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('*/3 * * * *', async () => {
     try {
       await runAnalysisBatch();
     } catch (err) {
