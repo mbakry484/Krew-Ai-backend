@@ -8,6 +8,7 @@ const { toFile } = require('openai');
 const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
+const { trackInteraction } = require('../lib/interaction-tracker');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -666,7 +667,7 @@ Do not invent product names. Only match against the listed products above.`
       console.log(`   Reason: ${conversation.escalation_reason}`);
 
       // Still save the incoming message for the team to see
-      await supabase
+      const { data: escalatedMsg } = await supabase
         .from('messages')
         .insert({
           conversation_id: conversation.id,
@@ -674,7 +675,19 @@ Do not invent product names. Only match against the listed products above.`
           content: finalMessage || null,
           platform_message_id: messageId,
           image_url: storedImageUrl,
-        });
+        })
+        .select('id')
+        .single();
+
+      // Track interaction (fire-and-forget)
+      trackInteraction({
+        brandId: brand_id,
+        conversationId: conversation.id,
+        customerId: senderId,
+        customerUsername: conversation.customer_username,
+        messageId: escalatedMsg?.id,
+        isEscalated: true,
+      });
 
       // Don't send any reply - let human team handle it
       return;
@@ -692,7 +705,7 @@ Do not invent product names. Only match against the listed products above.`
       .limit(20);
 
     // 8. Save incoming message
-    await supabase
+    const { data: savedMsg } = await supabase
       .from('messages')
       .insert({
         conversation_id: conversation.id,
@@ -700,7 +713,18 @@ Do not invent product names. Only match against the listed products above.`
         content: finalMessage || null,
         platform_message_id: messageId,
         image_url: storedImageUrl,
-      });
+      })
+      .select('id')
+      .single();
+
+    // Track interaction (fire-and-forget)
+    trackInteraction({
+      brandId: brand_id,
+      conversationId: conversation.id,
+      customerId: senderId,
+      customerUsername: conversation.customer_username,
+      messageId: savedMsg?.id,
+    });
 
     // 9. Map conversation history to OpenAI format
     // Filter out image-only placeholder messages — they have no useful text context

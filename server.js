@@ -17,7 +17,9 @@ const refundsRoutes = require('./routes/refunds');
 const exchangesRoutes = require('./routes/exchanges');
 const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
 const metaTokenRoutes = require('./routes/meta-token');
+const interactionsRoutes = require('./routes/interactions');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
+const { startInteractionAnalysisCron } = require('./cron/interactionAnalysis');
 
 const app = express();
 
@@ -92,6 +94,7 @@ app.use('/refunds', refundsRoutes);
 app.use('/exchanges', exchangesRoutes);
 app.use('/exchanges-refunds', exchangesRefundsRoutes);
 app.use('/api/meta', metaTokenRoutes);
+app.use('/interactions', interactionsRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -106,4 +109,7 @@ app.listen(PORT, () => {
 
   // Start daily token refresh cron job
   startTokenRefreshCron();
+
+  // Start interaction analysis cron job (every 5 minutes)
+  startInteractionAnalysisCron();
 });
