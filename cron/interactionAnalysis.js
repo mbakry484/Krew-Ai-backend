@@ -14,9 +14,9 @@ const ANALYSIS_PROMPT = `You are analyzing a customer support conversation betwe
 Analyze the conversation and return a JSON object with these fields:
 - "sentiment": one of "angry", "frustrated", "neutral", "satisfied", "happy"
 - "sentiment_score": a float from -1.0 (most negative) to 1.0 (most positive)
-- "issue_category": a short label describing the main issue (e.g. "sizing issue", "late delivery", "color mismatch", "product quality", "wrong item received", "payment issue", "product inquiry", "order status"). Use lowercase. If no issue, use "general inquiry".
-- "issue_summary": one sentence summarizing what the customer wanted or complained about.
-- "resolution_status": one of "resolved" (customer's issue was addressed), "unresolved" (customer left without resolution), "escalated" (was handed off to a human agent)
+- "issue_category": a short label ONLY if the customer had a real problem or complaint (e.g. "late delivery", "wrong item received", "damaged product", "payment issue", "color mismatch", "product quality"). Use lowercase. Set to null if the customer was just asking a general question (size charts, shipping info, product info, availability) or expressing thanks/satisfaction — those are NOT issues.
+- "issue_summary": one sentence summarizing the specific problem the customer had. Set to null if there was no real issue.
+- "resolution_status": one of "resolved" (customer's issue was addressed), "unresolved" (customer left without resolution), "escalated" (was handed off to a human agent), or "no_issue" (customer had no complaint — was asking a question or expressing satisfaction)
 
 Return ONLY valid JSON, no markdown fences, no extra text.`;
 
