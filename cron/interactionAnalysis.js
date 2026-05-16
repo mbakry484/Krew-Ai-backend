@@ -25,16 +25,22 @@ Return ONLY valid JSON, no markdown fences, no extra text.`;
  * Returns the parsed analysis or null on failure.
  */
 async function analyzeInteraction(interaction) {
-  // Fetch messages for this interaction's time window
+  // Fetch messages for this interaction's time window.
+  // Add a 2-second buffer on each side to handle single-message interactions
+  // where started_at === ended_at and minor timestamp precision differences
+  // would otherwise cause the window query to return 0 rows.
+  const windowStart = new Date(new Date(interaction.started_at).getTime() - 2000).toISOString();
+  const windowEnd = new Date(new Date(interaction.ended_at).getTime() + 2000).toISOString();
+
   const { data: messages, error } = await supabase
     .from('messages')
     .select('sender, content, created_at')
     .eq('conversation_id', interaction.conversation_id)
-    .gte('created_at', interaction.started_at)
-    .lte('created_at', interaction.ended_at)
+    .gte('created_at', windowStart)
+    .lte('created_at', windowEnd)
     .order('created_at', { ascending: true });
 
-  console.log(`  [${interaction.id}] fetched ${messages?.length ?? 0} messages (window: ${interaction.started_at} → ${interaction.ended_at})`);
+  console.log(`  [${interaction.id}] fetched ${messages?.length ?? 0} messages (window: ${windowStart} → ${windowEnd})`);
 
   if (error) {
     console.error(`  [${interaction.id}] DB error fetching messages:`, error.message, error.details ?? '');
@@ -118,12 +124,15 @@ async function analyzeInteraction(interaction) {
  * for messages within this interaction's time window.
  */
 async function calcResponseTime(interaction) {
+  const windowStart = new Date(new Date(interaction.started_at).getTime() - 2000).toISOString();
+  const windowEnd = new Date(new Date(interaction.ended_at).getTime() + 2000).toISOString();
+
   const { data: messages } = await supabase
     .from('messages')
     .select('sender, created_at')
     .eq('conversation_id', interaction.conversation_id)
-    .gte('created_at', interaction.started_at)
-    .lte('created_at', interaction.ended_at)
+    .gte('created_at', windowStart)
+    .lte('created_at', windowEnd)
     .order('created_at', { ascending: true });
 
   if (!messages || messages.length < 2) return null;
