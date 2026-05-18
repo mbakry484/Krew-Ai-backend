@@ -8,6 +8,7 @@ const { toFile } = require('openai');
 const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
+const { trackInteraction } = require('../lib/interaction-tracker');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -59,6 +60,8 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
     const contentType = response.headers.get('content-type') || 'image/jpeg';
 
     // Generate description of customer's image using GPT-4o vision
+    // Use detail: 'auto' (not 'low') so GPT-4o can pick up subtle features
+    // from customer photos which are often lower quality or different angles
     const visionResponse = await openai.chat.completions.create({
       model: 'gpt-4o',
       max_tokens: 150,
@@ -73,7 +76,7 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
             type: 'image_url',
             image_url: {
               url: `data:${contentType};base64,${base64}`,
-              detail: 'low'
+              detail: 'auto'
             }
           }
         ]
@@ -93,10 +96,8 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
       totalTokens: visionResponse.usage?.total_tokens ?? 0
     });
 
-    // Generate embedding using the same format as stored product embeddings:
-    // stored embeddings were created as "${product.name}. ${description}"
-    // so we embed just the description here and let the DB sort by raw similarity.
-    // We do NOT prepend a product name since we don't know it yet.
+    // Generate embedding from description only — matches the format used for
+    // stored product embeddings (description-only, no product name prefix).
     const embeddingResponse = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: queryDescription
@@ -119,8 +120,9 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
     }
 
     // Sort strictly by similarity score (ignore the SQL's in_stock-first ordering)
-    // Only return matches that are genuinely similar (≥ 0.50) to avoid forcing bad matches
-    const SIMILARITY_THRESHOLD = 0.50;
+    // Threshold 0.42 balances catching legitimate matches (different angles/lighting)
+    // while still filtering out clearly wrong products
+    const SIMILARITY_THRESHOLD = 0.42;
     const matches = (rawMatches || [])
       .sort((a, b) => b.similarity - a.similarity)
       .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
@@ -466,13 +468,13 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     }
 
     const { brand_id, access_token: integrationToken } = integration;
-    console.log(`🔍 Brand found: ${brand_id}`);
+    // Brand resolved from integration lookup
 
     // Try to get a managed long-lived page token, fall back to integrations table token
     let access_token = integrationToken;
     try {
       access_token = await getValidPageToken(brand_id);
-      console.log(`🔑 Using managed page token for brand ${brand_id}`);
+      // Using managed page token
     } catch (tokenErr) {
       console.log(`ℹ️  No managed token for brand ${brand_id}, using integrations token`);
     }
@@ -643,7 +645,7 @@ Do not invent product names. Only match against the listed products above.`
     if (conversation?.metadata && typeof conversation.metadata === 'object') {
       metadata = { ...defaultMetadata, ...conversation.metadata };
     }
-    console.log(`💾 Metadata: ${JSON.stringify(metadata)}`);
+    // Metadata loaded from DB — skip verbose logging
 
     // ── Langfuse Tracing ──────────────────────────────────────
     const profile = {
@@ -684,7 +686,7 @@ Do not invent product names. Only match against the listed products above.`
       console.log(`   Reason: ${conversation.escalation_reason}`);
 
       // Still save the incoming message for the team to see
-      await supabase
+      const { data: escalatedMsg } = await supabase
         .from('messages')
         .insert({
           conversation_id: conversation.id,
@@ -692,7 +694,19 @@ Do not invent product names. Only match against the listed products above.`
           content: finalMessage || null,
           platform_message_id: messageId,
           image_url: storedImageUrl,
-        });
+        })
+        .select('id')
+        .single();
+
+      // Track interaction (fire-and-forget)
+      trackInteraction({
+        brandId: brand_id,
+        conversationId: conversation.id,
+        customerId: senderId,
+        customerUsername: conversation.customer_username,
+        messageId: escalatedMsg?.id,
+        isEscalated: true,
+      });
 
       // Don't send any reply - let human team handle it
       return;
@@ -710,7 +724,7 @@ Do not invent product names. Only match against the listed products above.`
       .limit(20);
 
     // 8. Save incoming message
-    await supabase
+    const { data: savedMsg } = await supabase
       .from('messages')
       .insert({
         conversation_id: conversation.id,
@@ -718,7 +732,18 @@ Do not invent product names. Only match against the listed products above.`
         content: finalMessage || null,
         platform_message_id: messageId,
         image_url: storedImageUrl,
-      });
+      })
+      .select('id')
+      .single();
+
+    // Track interaction (fire-and-forget)
+    trackInteraction({
+      brandId: brand_id,
+      conversationId: conversation.id,
+      customerId: senderId,
+      customerUsername: conversation.customer_username,
+      messageId: savedMsg?.id,
+    });
 
     // 9. Map conversation history to OpenAI format
     // Filter out image-only placeholder messages — they have no useful text context
@@ -1020,8 +1045,18 @@ Customer's image looks like: ${queryDescription}
                   shipping_address: {
                     name: orderData.name,
                     address1: orderData.address,
-                    phone: formattedPhone,
-                    country: 'EG'
+                    city: 'Egypt',      // Shopify requires city to save the address; full address is in address1
+                    country: 'EG',
+                    country_code: 'EG',
+                    phone: formattedPhone
+                  },
+                  billing_address: {
+                    name: orderData.name,
+                    address1: orderData.address,
+                    city: 'Egypt',
+                    country: 'EG',
+                    country_code: 'EG',
+                    phone: formattedPhone
                   },
                   phone: formattedPhone,
                   financial_status: 'pending',
@@ -1491,7 +1526,6 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
       }
 
       await sendDM(senderId, aiReply, access_token);
-      console.log(`✅ Sent to ${senderId}`);
     }
 
     // 16. Save AI reply to database
