@@ -688,13 +688,13 @@ Do not invent product names. Only match against the listed products above.`
       // Still save the incoming message for the team to see
       const { data: escalatedMsg } = await supabase
         .from('messages')
-        .insert({
+        .insert([{
           conversation_id: conversation.id,
           sender: 'customer',
           content: finalMessage || null,
           platform_message_id: messageId,
           image_url: storedImageUrl,
-        })
+        }])
         .select('id')
         .single();
 
@@ -726,13 +726,13 @@ Do not invent product names. Only match against the listed products above.`
     // 8. Save incoming message
     const { data: savedMsg } = await supabase
       .from('messages')
-      .insert({
+      .insert([{
         conversation_id: conversation.id,
         sender: 'customer',
         content: finalMessage || null,
         platform_message_id: messageId,
         image_url: storedImageUrl,
-      })
+      }])
       .select('id')
       .single();
 
@@ -1533,19 +1533,8 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
       .from('messages')
       .insert([{
         conversation_id: conversation.id,
-        direction: 'inbound',
-        content: finalMessage || '[Image]',
-        sender_name: profile.name || 'Customer',
-        is_luna: false,
-        sent_at: new Date().toISOString()
-      },
-      {
-        conversation_id: conversation.id,
-        direction: 'outbound',
+        sender: 'ai',
         content: aiReply,
-        sender_name: 'Luna',
-        is_luna: true,
-        sent_at: new Date().toISOString()
       }]);
 
     await supabase
