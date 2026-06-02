@@ -59,6 +59,28 @@ async function issueTokenPair(userId, email) {
 }
 
 /**
+ * POST /auth/check-email
+ * Check if an email is already registered (used during signup step 0)
+ */
+router.post('/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .single();
+
+    return res.status(200).json({ exists: !!existingUser });
+  } catch (err) {
+    console.error('Check email error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
  * POST /auth/signup
  * Register a new user
  */
