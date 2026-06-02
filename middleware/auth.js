@@ -1,7 +1,7 @@
 const jwt = require('jsonwebtoken');
 
 /**
- * Middleware to verify JWT tokens on protected routes
+ * Middleware to verify short-lived access tokens on protected routes.
  */
 function verifyToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -13,7 +13,10 @@ function verifyToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // Attach decoded user data to request
+    if (decoded.type !== 'access') {
+      return res.status(403).json({ error: 'Invalid token type' });
+    }
+    req.user = decoded;
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {

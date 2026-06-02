@@ -6,12 +6,56 @@ const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const { syncTokenToIntegrations } = require('../src/services/metaTokenService');
 
+const crypto = require('crypto');
+
 const JWT_SECRET = process.env.JWT_SECRET;
 const SALT_ROUNDS = 10;
-const JWT_EXPIRY = '7d';
+const ACCESS_TOKEN_EXPIRY = '15m';
+const REFRESH_TOKEN_EXPIRY_DAYS = 7;
+// bcrypt cost for refresh token verifier hashing (lower than passwords — tokens are
+// already high-entropy random bytes, so we just need breach-resistance, not slow KDF)
+const VERIFIER_BCRYPT_ROUNDS = 10;
 
 if (!JWT_SECRET) {
   throw new Error('Missing JWT_SECRET environment variable');
+}
+
+/**
+ * Issue an access token + opaque refresh token for a given user.
+ *
+ * Security model — selector/verifier split:
+ *   selector      16 random bytes (hex) — stored plain, used to locate the DB row
+ *   verifier      32 random bytes (hex) — the secret; only its bcrypt hash is stored
+ *   client token  "<selector>.<verifier>" — opaque, never reconstructable from the DB
+ *
+ * Even if the DB is fully leaked, an attacker cannot reverse a verifier hash into
+ * a usable refresh token.
+ */
+async function issueTokenPair(userId, email) {
+  const accessToken = jwt.sign(
+    { user_id: userId, email, type: 'access' },
+    JWT_SECRET,
+    { expiresIn: ACCESS_TOKEN_EXPIRY }
+  );
+
+  const selector = crypto.randomBytes(16).toString('hex');   // 32 hex chars — public lookup key
+  const verifier = crypto.randomBytes(32).toString('hex');   // 64 hex chars — secret
+  const verifierHash = await bcrypt.hash(verifier, VERIFIER_BCRYPT_ROUNDS);
+
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
+  const { error } = await supabase
+    .from('refresh_tokens')
+    .insert({ user_id: userId, selector, verifier_hash: verifierHash, expires_at: expiresAt });
+
+  if (error) {
+    console.error('Failed to store refresh token:', error);
+    throw new Error('Failed to issue session');
+  }
+
+  // Return the opaque token the client will store: "<selector>.<verifier>"
+  const refreshToken = `${selector}.${verifier}`;
+  return { accessToken, refreshToken };
 }
 
 /**
@@ -87,16 +131,12 @@ router.post('/signup', async (req, res) => {
       return res.status(500).json({ error: 'Failed to create user account' });
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { user_id: newUser.id, email: newUser.email },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRY }
-    );
+    const { accessToken, refreshToken } = await issueTokenPair(newUser.id, newUser.email);
 
     res.status(201).json({
       message: 'User created successfully',
-      token,
+      token: accessToken,
+      refreshToken,
       user: {
         user_id: newUser.id,
         email: newUser.email
@@ -139,16 +179,12 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { user_id: user.id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRY }
-    );
+    const { accessToken, refreshToken } = await issueTokenPair(user.id, user.email);
 
     res.json({
       message: 'Login successful',
-      token,
+      token: accessToken,
+      refreshToken,
       user: {
         user_id: user.id,
         email: user.email
@@ -315,6 +351,87 @@ router.put('/brand-description', verifyToken, async (req, res) => {
     console.error('Brand description update error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+/**
+ * POST /auth/refresh
+ * Exchange a valid refresh token for a new access token + rotated refresh token.
+ * The old token row is deleted immediately (single-use rotation).
+ *
+ * Expects body: { refreshToken: "<selector>.<verifier>" }
+ */
+router.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken || !refreshToken.includes('.')) {
+    return res.status(400).json({ error: 'Refresh token required' });
+  }
+
+  const dotIndex = refreshToken.indexOf('.');
+  const selector = refreshToken.slice(0, dotIndex);
+  const verifier = refreshToken.slice(dotIndex + 1);
+
+  if (!selector || !verifier) {
+    return res.status(403).json({ error: 'Invalid refresh token' });
+  }
+
+  // Look up the row by selector (plain-text, indexed)
+  const { data: storedToken, error: fetchError } = await supabase
+    .from('refresh_tokens')
+    .select('id, user_id, verifier_hash, expires_at')
+    .eq('selector', selector)
+    .maybeSingle();
+
+  if (fetchError || !storedToken) {
+    return res.status(403).json({ error: 'Refresh token not recognised' });
+  }
+
+  // Check DB-level expiry (defence-in-depth on top of the expires_at column)
+  if (new Date(storedToken.expires_at) < new Date()) {
+    await supabase.from('refresh_tokens').delete().eq('id', storedToken.id);
+    return res.status(401).json({ error: 'Refresh token expired' });
+  }
+
+  // Constant-time bcrypt comparison of the secret verifier
+  const verifierValid = await bcrypt.compare(verifier, storedToken.verifier_hash);
+  if (!verifierValid) {
+    // Possible token theft — delete the row to invalidate the session entirely
+    await supabase.from('refresh_tokens').delete().eq('id', storedToken.id);
+    return res.status(403).json({ error: 'Invalid refresh token' });
+  }
+
+  // Delete the used row before issuing the new pair (rotation)
+  await supabase.from('refresh_tokens').delete().eq('id', storedToken.id);
+
+  const { data: user, error: userError } = await supabase
+    .from('users')
+    .select('id, email')
+    .eq('id', storedToken.user_id)
+    .single();
+
+  if (userError || !user) {
+    return res.status(401).json({ error: 'User not found' });
+  }
+
+  const { accessToken, refreshToken: newRefreshToken } = await issueTokenPair(user.id, user.email);
+
+  res.json({ token: accessToken, refreshToken: newRefreshToken });
+});
+
+/**
+ * POST /auth/logout
+ * Revoke the refresh token by selector so it can no longer be used.
+ * Expects body: { refreshToken: "<selector>.<verifier>" }
+ */
+router.post('/logout', async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (refreshToken && refreshToken.includes('.')) {
+    const selector = refreshToken.slice(0, refreshToken.indexOf('.'));
+    await supabase.from('refresh_tokens').delete().eq('selector', selector);
+  }
+
+  res.json({ message: 'Logged out' });
 });
 
 // ─── Instagram OAuth ────────────────────────────────────────────────
