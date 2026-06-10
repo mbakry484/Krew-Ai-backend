@@ -537,7 +537,7 @@ router.delete('/disconnect', verifyToken, async (req, res) => {
       brandUpdates.instagram_business_account_id = null;
     }
     if (platformsToRemove.includes('shopify')) {
-      brandUpdates.shopify_shop_domain = null;
+      // shopify_shop_domain lives on the integrations table, not brands — no brand column to clear
     }
 
     if (Object.keys(brandUpdates).length > 0) {
