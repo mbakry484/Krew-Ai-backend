@@ -458,13 +458,13 @@ router.post('/logout', async (req, res) => {
 
 // ─── Instagram OAuth ────────────────────────────────────────────────
 
-const FACEBOOK_APP_ID = process.env.META_APP_ID;
-const FACEBOOK_APP_SECRET = process.env.META_APP_SECRET;
+const INSTAGRAM_APP_ID = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
+const INSTAGRAM_APP_SECRET = process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
 const FACEBOOK_REDIRECT_URI = process.env.FACEBOOK_REDIRECT_URI;
 const FRONTEND_DASHBOARD_URL = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')[0].trim()
   : 'http://localhost:3000';
-const META_GRAPH_BASE = 'https://graph.facebook.com/v20.0';
+const INSTAGRAM_GRAPH_BASE = 'https://graph.instagram.com';
 
 /**
  * GET /auth/instagram
@@ -495,14 +495,12 @@ router.get('/instagram', (req, res) => {
     })).toString('base64');
 
     const scopes = [
-      'instagram_basic',
-      'instagram_manage_messages',
       'instagram_business_basic',
       'instagram_business_manage_messages'
     ].join(',');
 
     const authUrl = `https://www.instagram.com/oauth/authorize`
-      + `?client_id=${FACEBOOK_APP_ID}`
+      + `?client_id=${INSTAGRAM_APP_ID}`
       + `&redirect_uri=${encodeURIComponent(FACEBOOK_REDIRECT_URI)}`
       + `&scope=${scopes}`
       + `&state=${encodeURIComponent(state)}`
@@ -559,17 +557,23 @@ router.get('/instagram/callback', async (req, res) => {
     console.log(`🔑 [${brand_id}] Instagram OAuth callback - exchanging code for tokens...`);
 
     // Step 1: Exchange code → short-lived Instagram user token
-    const tokenUrl = `${META_GRAPH_BASE}/oauth/access_token`
-      + `?client_id=${FACEBOOK_APP_ID}`
-      + `&client_secret=${FACEBOOK_APP_SECRET}`
-      + `&redirect_uri=${encodeURIComponent(FACEBOOK_REDIRECT_URI)}`
-      + `&code=${code}`;
+    const tokenUrl = `${INSTAGRAM_GRAPH_BASE}/oauth/access_token`;
 
-    const tokenRes = await fetch(tokenUrl);
+    const tokenRes = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: INSTAGRAM_APP_ID,
+        client_secret: INSTAGRAM_APP_SECRET,
+        grant_type: 'authorization_code',
+        redirect_uri: FACEBOOK_REDIRECT_URI,
+        code
+      })
+    });
     const tokenData = await tokenRes.json();
 
-    if (!tokenRes.ok || tokenData.error) {
-      console.error(`❌ [${brand_id}] Code exchange failed:`, tokenData.error?.message);
+    if (!tokenRes.ok || tokenData.error_type) {
+      console.error(`❌ [${brand_id}] Code exchange failed:`, tokenData.error_message || JSON.stringify(tokenData));
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
@@ -577,16 +581,16 @@ router.get('/instagram/callback', async (req, res) => {
     console.log(`✅ [${brand_id}] Got short-lived Instagram user token`);
 
     // Step 2: Exchange short-lived → long-lived Instagram user token (60 days)
-    const llUrl = `${META_GRAPH_BASE}/oauth/access_token`
+    const llUrl = `${INSTAGRAM_GRAPH_BASE}/access_token`
       + `?grant_type=ig_exchange_token`
-      + `&client_secret=${FACEBOOK_APP_SECRET}`
+      + `&client_secret=${INSTAGRAM_APP_SECRET}`
       + `&access_token=${shortLivedToken}`;
 
     const llRes = await fetch(llUrl);
     const llData = await llRes.json();
 
     if (!llRes.ok || llData.error) {
-      console.error(`❌ [${brand_id}] Long-lived token exchange failed:`, llData.error?.message);
+      console.error(`❌ [${brand_id}] Long-lived token exchange failed:`, llData.error?.message || JSON.stringify(llData));
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
@@ -595,7 +599,7 @@ router.get('/instagram/callback', async (req, res) => {
     console.log(`✅ [${brand_id}] Got long-lived Instagram user token (expires in ${Math.round(expiresIn / 86400)} days)`);
 
     // Step 3: Fetch the Instagram user's ID and username
-    const meUrl = `${META_GRAPH_BASE}/me?fields=user_id,name,username&access_token=${longLivedUserToken}`;
+    const meUrl = `${INSTAGRAM_GRAPH_BASE}/v21.0/me?fields=user_id,name,username&access_token=${longLivedUserToken}`;
     const meRes = await fetch(meUrl);
     const meData = await meRes.json();
 

@@ -1,6 +1,6 @@
 const supabase = require('../../lib/supabase');
 
-const META_GRAPH_BASE = 'https://graph.facebook.com/v20.0';
+const INSTAGRAM_GRAPH_BASE = 'https://graph.instagram.com';
 
 /**
  * Refresh a long-lived Instagram user token.
@@ -10,7 +10,7 @@ const META_GRAPH_BASE = 'https://graph.facebook.com/v20.0';
  * @returns {Promise<{access_token: string, expires_in: number}>}
  */
 async function refreshLongLivedToken(currentToken) {
-  const url = `${META_GRAPH_BASE}/refresh_access_token`
+  const url = `${INSTAGRAM_GRAPH_BASE}/refresh_access_token`
     + `?grant_type=ig_refresh_token`
     + `&access_token=${currentToken}`;
 
