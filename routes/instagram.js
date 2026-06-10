@@ -196,12 +196,12 @@ async function transcribeAudio(audioUrl, whisperPrompt = '') {
 }
 
 /**
- * Fetch customer's Instagram/Facebook profile (name and username)
+ * Fetch customer's Instagram profile (name and username)
  */
 async function getCustomerProfile(senderId, accessToken) {
   try {
     const response = await fetch(
-      `https://graph.facebook.com/v21.0/${senderId}?fields=name,username&access_token=${accessToken}`
+      `https://graph.instagram.com/v21.0/${senderId}?fields=name,username&access_token=${accessToken}`
     );
     const data = await response.json();
     return {

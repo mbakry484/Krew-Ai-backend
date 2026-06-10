@@ -468,7 +468,7 @@ const META_GRAPH_BASE = 'https://graph.facebook.com/v20.0';
 
 /**
  * GET /auth/instagram
- * Redirects the user to Facebook Login with the required scopes.
+ * Redirects the user to Instagram OAuth authorization.
  * Expects ?brand_id=xxx as a query param so we know which brand to update on callback.
  */
 router.get('/instagram', (req, res) => {
@@ -497,20 +497,16 @@ router.get('/instagram', (req, res) => {
     const scopes = [
       'instagram_basic',
       'instagram_manage_messages',
-      'pages_manage_metadata',
-      'pages_read_engagement',
-      'pages_messaging',
-      'pages_show_list',
-      'business_management'
+      'instagram_business_basic',
+      'instagram_business_manage_messages'
     ].join(',');
 
-    const authUrl = `https://www.facebook.com/v20.0/dialog/oauth`
+    const authUrl = `https://www.instagram.com/oauth/authorize`
       + `?client_id=${FACEBOOK_APP_ID}`
       + `&redirect_uri=${encodeURIComponent(FACEBOOK_REDIRECT_URI)}`
       + `&scope=${scopes}`
       + `&state=${encodeURIComponent(state)}`
-      + `&response_type=code`
-      + `&auth_type=rerequest`;
+      + `&response_type=code`;
 
     res.redirect(authUrl);
   } catch (error) {
@@ -521,15 +517,18 @@ router.get('/instagram', (req, res) => {
 
 /**
  * GET /auth/instagram/callback
- * Handles the OAuth callback from Facebook Login.
+ * Handles the OAuth callback from Instagram Business Login.
  * Flow:
- *   1. Exchange code → short-lived user token
- *   2. Exchange short-lived → long-lived user token (60 days)
- *   3. Fetch the brand's Facebook Pages
- *   4. Get the Instagram Business Account ID linked to that page
- *   5. Generate a permanent Page Access Token
- *   6. Save to brands table: page_access_token, instagram_page_id, instagram_business_account_id
- *   7. Redirect to dashboard on success
+ *   1. Exchange code → short-lived Instagram user token
+ *   2. Exchange short-lived → long-lived Instagram user token (60 days)
+ *   3. Fetch the Instagram user's ID and username via /me
+ *   4. Save to brands table: long_lived_user_token, instagram_business_account_id
+ *   5. Upsert integrations row so the webhook can find this brand
+ *   6. Redirect to dashboard on success
+ *
+ * NOTE: Instagram Business Login does NOT issue Page Access Tokens.
+ *       The long-lived Instagram user token is used directly for DM replies
+ *       via the /{ig-user-id}/messages endpoint.
  */
 router.get('/instagram/callback', async (req, res) => {
   const dashboardUrl = `${FRONTEND_DASHBOARD_URL}/dashboard`;
@@ -543,7 +542,6 @@ router.get('/instagram/callback', async (req, res) => {
     }
 
     // Decode state to get brand_id
-    // Note: Express already URL-decodes req.query values, so no decodeURIComponent needed
     let stateData;
     try {
       stateData = JSON.parse(Buffer.from(state, 'base64').toString());
@@ -560,7 +558,7 @@ router.get('/instagram/callback', async (req, res) => {
 
     console.log(`🔑 [${brand_id}] Instagram OAuth callback - exchanging code for tokens...`);
 
-    // Step 1: Exchange code → short-lived user token
+    // Step 1: Exchange code → short-lived Instagram user token
     const tokenUrl = `${META_GRAPH_BASE}/oauth/access_token`
       + `?client_id=${FACEBOOK_APP_ID}`
       + `&client_secret=${FACEBOOK_APP_SECRET}`
@@ -576,14 +574,13 @@ router.get('/instagram/callback', async (req, res) => {
     }
 
     const shortLivedToken = tokenData.access_token;
-    console.log(`✅ [${brand_id}] Got short-lived user token`);
+    console.log(`✅ [${brand_id}] Got short-lived Instagram user token`);
 
-    // Step 2: Exchange short-lived → long-lived user token (60 days)
+    // Step 2: Exchange short-lived → long-lived Instagram user token (60 days)
     const llUrl = `${META_GRAPH_BASE}/oauth/access_token`
-      + `?grant_type=fb_exchange_token`
-      + `&client_id=${FACEBOOK_APP_ID}`
+      + `?grant_type=ig_exchange_token`
       + `&client_secret=${FACEBOOK_APP_SECRET}`
-      + `&fb_exchange_token=${shortLivedToken}`;
+      + `&access_token=${shortLivedToken}`;
 
     const llRes = await fetch(llUrl);
     const llData = await llRes.json();
@@ -595,42 +592,28 @@ router.get('/instagram/callback', async (req, res) => {
 
     const longLivedUserToken = llData.access_token;
     const expiresIn = llData.expires_in || 5184000;
-    console.log(`✅ [${brand_id}] Got long-lived user token (expires in ${Math.round(expiresIn / 86400)} days)`);
+    console.log(`✅ [${brand_id}] Got long-lived Instagram user token (expires in ${Math.round(expiresIn / 86400)} days)`);
 
-    // Step 3: Fetch the user's Facebook Pages
-    const pagesUrl = `${META_GRAPH_BASE}/me/accounts?access_token=${longLivedUserToken}`;
-    const pagesRes = await fetch(pagesUrl);
-    const pagesData = await pagesRes.json();
+    // Step 3: Fetch the Instagram user's ID and username
+    const meUrl = `${META_GRAPH_BASE}/me?fields=user_id,name,username&access_token=${longLivedUserToken}`;
+    const meRes = await fetch(meUrl);
+    const meData = await meRes.json();
 
-    console.log(`📋 [${brand_id}] Pages API raw response:`, JSON.stringify(pagesData));
-
-    if (!pagesRes.ok || pagesData.error || !pagesData.data?.length) {
-      console.error(`❌ [${brand_id}] Failed to fetch pages:`, pagesData.error?.message || 'No pages found');
+    if (!meRes.ok || meData.error) {
+      console.error(`❌ [${brand_id}] Failed to fetch Instagram user info:`, meData.error?.message);
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
-    const page = pagesData.data[0]; // Use the first page
-    const pageAccessToken = page.access_token; // This is a permanent page token (derived from long-lived user token)
-    const fbPageId = page.id;
-    console.log(`📄 [${brand_id}] Using page: ${page.name} (${fbPageId})`);
+    // user_id is the app-scoped IG user ID; id is the graph node ID
+    const instagramBusinessAccountId = meData.user_id || meData.id;
+    const instagramUsername = meData.username || meData.name || null;
 
-    // Step 4: Get the Instagram Business Account ID linked to this page
-    const igUrl = `${META_GRAPH_BASE}/${fbPageId}?fields=instagram_business_account&access_token=${pageAccessToken}`;
-    const igRes = await fetch(igUrl);
-    const igData = await igRes.json();
-
-    if (!igRes.ok || igData.error) {
-      console.error(`❌ [${brand_id}] Failed to fetch IG business account:`, igData.error?.message);
-      return res.redirect(`${dashboardUrl}?error=instagram_failed`);
-    }
-
-    const instagramBusinessAccountId = igData.instagram_business_account?.id || null;
     if (!instagramBusinessAccountId) {
-      console.error(`❌ [${brand_id}] No Instagram Business Account linked to page ${fbPageId}`);
+      console.error(`❌ [${brand_id}] Could not determine Instagram Business Account ID from /me response:`, JSON.stringify(meData));
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
-    console.log(`📸 [${brand_id}] Instagram Business Account: ${instagramBusinessAccountId}`);
+    console.log(`📸 [${brand_id}] Instagram Business Account: ${instagramBusinessAccountId} (@${instagramUsername})`);
 
     // Check if this Instagram account is already connected to another brand
     const { data: existingIg } = await supabase
@@ -645,14 +628,14 @@ router.get('/instagram/callback', async (req, res) => {
       return res.redirect(`${dashboardUrl}?error=instagram_already_connected`);
     }
 
-    // Step 5: Save to brands table
+    // Step 4: Save to brands table
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
 
     const { error: updateError } = await supabase
       .from('brands')
       .update({
-        fb_page_id: fbPageId,
-        page_access_token: pageAccessToken,
+        fb_page_id: null,
+        page_access_token: longLivedUserToken,
         long_lived_user_token: longLivedUserToken,
         token_expires_at: expiresAt,
         instagram_page_id: instagramBusinessAccountId,
@@ -665,12 +648,9 @@ router.get('/instagram/callback', async (req, res) => {
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
-    console.log(`✅ [${brand_id}] Saved tokens and IG account to brands table`);
+    console.log(`✅ [${brand_id}] Saved Instagram token and account to brands table`);
 
-    // Step 6: Sync page token to integrations table
-    await syncTokenToIntegrations(brand_id, pageAccessToken);
-
-    // Ensure an integrations row exists so the webhook can find this brand
+    // Step 5: Upsert integrations row so the webhook can find this brand
     const { data: existingIntegration } = await supabase
       .from('integrations')
       .select('id')
@@ -681,7 +661,7 @@ router.get('/instagram/callback', async (req, res) => {
     if (existingIntegration) {
       await supabase
         .from('integrations')
-        .update({ instagram_page_id: instagramBusinessAccountId, access_token: pageAccessToken })
+        .update({ instagram_page_id: instagramBusinessAccountId, access_token: longLivedUserToken })
         .eq('id', existingIntegration.id);
     } else {
       const { error: insertError } = await supabase
@@ -690,7 +670,7 @@ router.get('/instagram/callback', async (req, res) => {
           brand_id,
           platform: 'instagram',
           instagram_page_id: instagramBusinessAccountId,
-          access_token: pageAccessToken
+          access_token: longLivedUserToken
         });
 
       if (insertError) {

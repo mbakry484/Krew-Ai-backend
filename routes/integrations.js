@@ -457,7 +457,7 @@ router.get('/status', verifyToken, async (req, res) => {
     if (igAccountId && igAccessToken) {
       try {
         const igRes = await fetch(
-          `https://graph.facebook.com/v21.0/${igAccountId}?fields=username&access_token=${igAccessToken}`
+          `https://graph.instagram.com/v21.0/me?fields=username&access_token=${igAccessToken}`
         );
         if (igRes.ok) {
           const igData = await igRes.json();
