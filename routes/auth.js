@@ -557,7 +557,9 @@ router.get('/instagram/callback', async (req, res) => {
     console.log(`🔑 [${brand_id}] Instagram OAuth callback - exchanging code for tokens...`);
 
     // Step 1: Exchange code → short-lived Instagram user token
-    const tokenUrl = `${INSTAGRAM_GRAPH_BASE}/oauth/access_token`;
+    const tokenUrl = `https://api.instagram.com/oauth/access_token`;
+
+    console.log(`📋 [${brand_id}] Token exchange: client_id=${INSTAGRAM_APP_ID}, redirect_uri=${FACEBOOK_REDIRECT_URI}, code=${code.substring(0, 20)}...`);
 
     const tokenRes = await fetch(tokenUrl, {
       method: 'POST',
@@ -572,8 +574,10 @@ router.get('/instagram/callback', async (req, res) => {
     });
     const tokenData = await tokenRes.json();
 
-    if (!tokenRes.ok || tokenData.error_type) {
-      console.error(`❌ [${brand_id}] Code exchange failed:`, tokenData.error_message || JSON.stringify(tokenData));
+    console.log(`📋 [${brand_id}] Token exchange response:`, JSON.stringify(tokenData));
+
+    if (!tokenRes.ok || tokenData.error_type || tokenData.error) {
+      console.error(`❌ [${brand_id}] Code exchange failed:`, tokenData.error_message || tokenData.error?.message || JSON.stringify(tokenData));
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
     }
 
