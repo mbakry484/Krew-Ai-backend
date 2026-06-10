@@ -600,6 +600,8 @@ router.get('/instagram/callback', async (req, res) => {
     const pagesRes = await fetch(pagesUrl);
     const pagesData = await pagesRes.json();
 
+    console.log(`📋 [${brand_id}] Pages API raw response:`, JSON.stringify(pagesData));
+
     if (!pagesRes.ok || pagesData.error || !pagesData.data?.length) {
       console.error(`❌ [${brand_id}] Failed to fetch pages:`, pagesData.error?.message || 'No pages found');
       return res.redirect(`${dashboardUrl}?error=instagram_failed`);
