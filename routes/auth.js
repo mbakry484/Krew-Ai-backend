@@ -500,7 +500,8 @@ router.get('/instagram', (req, res) => {
       'pages_manage_metadata',
       'pages_read_engagement',
       'pages_messaging',
-      'pages_show_list'
+      'pages_show_list',
+      'business_management'
     ].join(',');
 
     const authUrl = `https://www.facebook.com/v20.0/dialog/oauth`
@@ -508,7 +509,8 @@ router.get('/instagram', (req, res) => {
       + `&redirect_uri=${encodeURIComponent(FACEBOOK_REDIRECT_URI)}`
       + `&scope=${scopes}`
       + `&state=${encodeURIComponent(state)}`
-      + `&response_type=code`;
+      + `&response_type=code`
+      + `&auth_type=rerequest`;
 
     res.redirect(authUrl);
   } catch (error) {
