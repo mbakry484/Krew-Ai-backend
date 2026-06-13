@@ -4,13 +4,14 @@ const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
+const { getShopName, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Fetch all products from Shopify and upsert them into Supabase
 async function autoSyncProducts({ shop, access_token, brand_id }) {
   console.log(`🔄 Auto-syncing products for ${shop}...`);
 
   const response = await fetch(
-    `https://${shop}/admin/api/2024-10/graphql.json`,
+    `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
     {
       method: 'POST',
       headers: {
@@ -433,18 +434,11 @@ router.get('/status', verifyToken, async (req, res) => {
       .eq('id', brandId)
       .single();
 
-    // Fetch Shopify store name from Shopify REST API
+    // Fetch Shopify store name via GraphQL
     let shopName = null;
     if (shopify?.shopify_shop_domain && shopify?.access_token) {
       try {
-        const shopRes = await fetch(
-          `https://${shopify.shopify_shop_domain}/admin/api/2024-10/shop.json`,
-          { headers: { 'X-Shopify-Access-Token': shopify.access_token } }
-        );
-        if (shopRes.ok) {
-          const shopData = await shopRes.json();
-          shopName = shopData.shop?.name || null;
-        }
+        shopName = await getShopName(shopify.shopify_shop_domain, shopify.access_token);
       } catch (err) {
         console.error('Failed to fetch Shopify shop name:', err.message);
       }

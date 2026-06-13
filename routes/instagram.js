@@ -9,6 +9,7 @@ const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
+const { shopifyGraphQL, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -1008,87 +1009,84 @@ Customer's image looks like: ${queryDescription}
         } else {
           const formattedPhone = formatEgyptianPhone(orderData.phone);
 
-          // Build line_items using real variant IDs when available
-          const line_items = orderData.items.map(item => {
+          // Build lineItems for GraphQL — ensure GID format for variant IDs
+          const lineItems = orderData.items.map(item => {
             if (item.variant_id) {
-              // Extract numeric ID from GID format (gid://shopify/ProductVariant/12345 → 12345)
-              const numericId = item.variant_id.includes('gid://')
-                ? item.variant_id.split('/').pop()
-                : item.variant_id;
+              const variantGid = item.variant_id.toString().includes('gid://')
+                ? item.variant_id
+                : `gid://shopify/ProductVariant/${item.variant_id}`;
               return {
-                variant_id: parseInt(numericId, 10),
+                variantId: variantGid,
                 quantity: item.quantity || 1
               };
             }
-            // Fallback for items without variant_id (shouldn't happen with updated prompts)
+            // Fallback for items without variant_id
             return {
               title: item.product_name,
               quantity: item.quantity || 1,
-              price: item.price
+              priceSet: { shopMoney: { amount: String(item.price), currencyCode: 'EGP' } }
             };
           });
 
-          const shopifyResponse = await fetch(
-            `https://${shopifyIntegration.shopify_shop_domain}/admin/api/2024-01/orders.json`,
-            {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Shopify-Access-Token': shopifyIntegration.access_token
-              },
-              body: JSON.stringify({
-                order: {
-                  line_items,
-                  customer: {
-                    first_name: orderData.name
-                  },
-                  shipping_address: {
-                    name: orderData.name,
-                    address1: orderData.address,
-                    city: 'Egypt',      // Shopify requires city to save the address; full address is in address1
-                    country: 'EG',
-                    country_code: 'EG',
-                    phone: formattedPhone
-                  },
-                  billing_address: {
-                    name: orderData.name,
-                    address1: orderData.address,
-                    city: 'Egypt',
-                    country: 'EG',
-                    country_code: 'EG',
-                    phone: formattedPhone
-                  },
-                  phone: formattedPhone,
-                  financial_status: 'pending',
-                  inventory_behaviour: 'decrement_obeying_policy',
-                  send_receipt: false,
-                  note: 'Order placed via Luna AI agent on Instagram/Messenger'
+          const orderCreateMutation = `
+            mutation orderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
+              orderCreate(order: $order, options: $options) {
+                userErrors {
+                  field
+                  message
                 }
-              })
-            }
-          );
-
-          const shopifyData = await shopifyResponse.json();
-
-          if (!shopifyResponse.ok) {
-            console.error(`❌ Shopify API error: ${shopifyResponse.status}`, shopifyData);
-
-            // Parse Shopify error details into a human-readable message
-            let errorDetail = '';
-            if (shopifyData?.errors) {
-              const errors = shopifyData.errors;
-              if (typeof errors === 'string') {
-                errorDetail = errors;
-              } else {
-                const parts = [];
-                for (const [field, messages] of Object.entries(errors)) {
-                  const msgs = Array.isArray(messages) ? messages.join(', ') : String(messages);
-                  parts.push(`${field}: ${msgs}`);
+                order {
+                  id
+                  name
                 }
-                errorDetail = parts.join(' | ');
               }
             }
-            console.error(`❌ Shopify error details: ${errorDetail}`);
+          `;
+
+          const orderVariables = {
+            order: {
+              lineItems,
+              customer: {
+                toUpsert: {
+                  firstName: orderData.name,
+                  phone: formattedPhone,
+                },
+              },
+              shippingAddress: {
+                firstName: orderData.name,
+                address1: orderData.address,
+                city: 'Egypt',
+                countryCode: 'EG',
+                phone: formattedPhone,
+              },
+              billingAddress: {
+                firstName: orderData.name,
+                address1: orderData.address,
+                city: 'Egypt',
+                countryCode: 'EG',
+                phone: formattedPhone,
+              },
+              phone: formattedPhone,
+              financialStatus: 'PENDING',
+              note: 'Order placed via Luna AI agent on Instagram/Messenger',
+            },
+            options: {
+              inventoryBehaviour: 'DECREMENT_OBEYING_POLICY',
+              sendReceipt: false,
+            },
+          };
+
+          const shopifyData = await shopifyGraphQL(
+            shopifyIntegration.shopify_shop_domain,
+            shopifyIntegration.access_token,
+            orderCreateMutation,
+            orderVariables
+          );
+
+          const userErrors = shopifyData?.data?.orderCreate?.userErrors;
+          if (userErrors && userErrors.length > 0) {
+            const errorDetail = userErrors.map(e => `${(e.field || []).join('.')}: ${e.message}`).join(' | ');
+            console.error(`❌ Shopify GraphQL orderCreate errors:`, errorDetail);
 
             // Build user-facing message based on which field failed
             const errLower = errorDetail.toLowerCase();
@@ -1114,11 +1112,11 @@ Customer's image looks like: ${queryDescription}
             return;
           }
 
-          const shopifyOrder = shopifyData.order;
+          const shopifyOrder = shopifyData?.data?.orderCreate?.order;
           const shopifyOrderId = shopifyOrder?.id;
-          shopifyOrderNumber = shopifyOrder?.order_number;
+          shopifyOrderNumber = shopifyOrder?.name;
 
-          console.log(`✅ Shopify order created: #${shopifyOrderNumber} for ${productSummary}`);
+          console.log(`✅ Shopify order created: ${shopifyOrderNumber} for ${productSummary}`);
 
           // Save to Supabase orders table
           await supabase.from('orders').insert({
@@ -1136,7 +1134,7 @@ Customer's image looks like: ${queryDescription}
             created_at: new Date().toISOString()
           });
 
-          confirmationMsg = `✅ Your order has been placed!\n\n• Order #${shopifyOrderNumber}\n• Product: ${productSummary}\n• Price: ${totalPrice} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
+          confirmationMsg = `✅ Your order has been placed!\n\n• Order ${shopifyOrderNumber}\n• Product: ${productSummary}\n• Price: ${totalPrice} EGP\n• Name: ${orderData.name}\n• Phone: ${orderData.phone}\n• Address: ${orderData.address}\n\nWe'll contact you soon to confirm delivery. Thank you! 🎉`;
         }
 
         // Send confirmation to customer (not the raw JSON)
