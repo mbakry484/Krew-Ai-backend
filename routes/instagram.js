@@ -681,7 +681,31 @@ Do not invent product names. Only match against the listed products above.`
       }
     });
 
-    // 4. ESCALATION CHECK - Skip AI response if conversation is escalated
+    // 4a. GLOBAL LUNA CHECK - Skip AI response if Luna is globally disabled for this brand
+    const { data: brandSettings } = await supabase
+      .from('brands')
+      .select('luna_global_enabled')
+      .eq('id', brand_id)
+      .single();
+
+    if (brandSettings && brandSettings.luna_global_enabled === false) {
+      console.log(`⏸️ Luna is globally disabled for brand ${brand_id} - AI will not respond`);
+
+      // Still save the incoming message for the team to see
+      await supabase
+        .from('messages')
+        .insert([{
+          conversation_id: conversation.id,
+          sender: 'customer',
+          content: finalMessage || null,
+          platform_message_id: messageId,
+          image_url: storedImageUrl,
+        }]);
+
+      return;
+    }
+
+    // 4b. ESCALATION CHECK - Skip AI response if conversation is escalated
     if (conversation.is_escalated) {
       console.log(`🚨 Conversation is escalated (type: ${conversation.escalation_type}) - AI will not respond`);
       console.log(`   Reason: ${conversation.escalation_reason}`);

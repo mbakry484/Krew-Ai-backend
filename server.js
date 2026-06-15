@@ -18,6 +18,7 @@ const exchangesRoutes = require('./routes/exchanges');
 const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
 const metaTokenRoutes = require('./routes/meta-token');
 const interactionsRoutes = require('./routes/interactions');
+const lunaRoutes = require('./routes/luna');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 const { startInteractionAnalysisCron } = require('./cron/interactionAnalysis');
 
@@ -95,6 +96,7 @@ app.use('/exchanges', exchangesRoutes);
 app.use('/exchanges-refunds', exchangesRefundsRoutes);
 app.use('/api/meta', metaTokenRoutes);
 app.use('/interactions', interactionsRoutes);
+app.use('/luna', lunaRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
