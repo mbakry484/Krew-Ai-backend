@@ -1109,6 +1109,14 @@ Customer's image looks like: ${queryDescription}
             orderVariables
           );
 
+          // Debug: log the full Shopify response to diagnose missing order fields
+          console.log('🔍 Shopify orderCreate full response:', JSON.stringify(shopifyData, null, 2));
+
+          // Check for top-level GraphQL errors (access/scope issues)
+          if (shopifyData?.errors && shopifyData.errors.length > 0) {
+            console.error('❌ Shopify GraphQL top-level errors:', JSON.stringify(shopifyData.errors));
+          }
+
           const userErrors = shopifyData?.data?.orderCreate?.userErrors;
           if (userErrors && userErrors.length > 0) {
             const errorDetail = userErrors.map(e => `${(e.field || []).join('.')}: ${e.message}`).join(' | ');
@@ -1139,8 +1147,15 @@ Customer's image looks like: ${queryDescription}
           }
 
           const shopifyOrder = shopifyData?.data?.orderCreate?.order;
-          const shopifyOrderId = shopifyOrder?.id;
-          shopifyOrderNumber = shopifyOrder?.name;
+          if (!shopifyOrder) {
+            console.error('❌ Shopify orderCreate returned null order. Full response:', JSON.stringify(shopifyData, null, 2));
+            confirmationMsg = `Sorry, we couldn't place your order right now. Please try again or contact us directly.`;
+            await sendDM(senderId, confirmationMsg, access_token);
+            await supabase.from('messages').insert({ conversation_id: conversation.id, sender: 'ai', content: confirmationMsg });
+            return;
+          }
+          const shopifyOrderId = shopifyOrder.id;
+          shopifyOrderNumber = shopifyOrder.name;
 
           console.log(`✅ Shopify order created: ${shopifyOrderNumber} for ${productSummary}`);
 
