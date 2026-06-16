@@ -34,7 +34,13 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
     }
   );
 
-  if (!response.ok) throw new Error(`Shopify GraphQL error: ${response.status}`);
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`❌ Shopify GraphQL ${response.status} response body:`, errorBody);
+    console.error(`❌ Token used (first 10 chars): ${access_token?.substring(0, 10)}...`);
+    console.error(`❌ URL called: https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
+    throw new Error(`Shopify GraphQL error: ${response.status}`);
+  }
 
   const json = await response.json();
   const products = json.data?.products?.edges || [];
@@ -140,7 +146,7 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
     );
 
     // Build Shopify OAuth URL
-    const scopes = 'read_products,write_products,read_orders,write_orders,read_inventory,read_shop';
+    const scopes = 'read_products,write_products,read_orders,write_orders,read_inventory';
     const redirectUri = `${backendUrl}/integrations/shopify/callback`;
     const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
 
@@ -209,6 +215,7 @@ router.get('/shopify/callback', async (req, res) => {
     }
 
     const tokenData = await tokenResponse.json();
+    console.log('🔑 Shopify token response:', JSON.stringify(tokenData));
     const { access_token } = tokenData;
 
     if (!access_token) {
