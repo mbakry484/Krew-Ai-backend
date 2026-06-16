@@ -4,7 +4,7 @@ const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
-const { getShopName, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { getShopName, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Fetch all products from Shopify and upsert them into Supabase
 async function autoSyncProducts({ shop, access_token, brand_id }) {
@@ -205,7 +205,8 @@ router.get('/shopify/callback', async (req, res) => {
       body: JSON.stringify({
         client_id: process.env.SHOPIFY_API_KEY,
         client_secret: process.env.SHOPIFY_API_SECRET,
-        code
+        code,
+        grant_type: 'authorization_code',
       })
     });
 
@@ -215,13 +216,18 @@ router.get('/shopify/callback', async (req, res) => {
     }
 
     const tokenData = await tokenResponse.json();
-    console.log('🔑 Shopify token response:', JSON.stringify(tokenData));
-    const { access_token } = tokenData;
+    console.log('🔑 Shopify token response keys:', Object.keys(tokenData));
+    const { access_token, refresh_token, expires_in } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
+
+    // Calculate token expiry (Shopify expiring tokens last ~1 hour)
+    const token_expires_at = expires_in
+      ? new Date(Date.now() + expires_in * 1000).toISOString()
+      : null;
 
     // Upsert into integrations table using the authenticated brand_id
     const { error: upsertError } = await supabase
@@ -230,6 +236,8 @@ router.get('/shopify/callback', async (req, res) => {
         brand_id,
         shopify_shop_domain: shop,
         access_token,
+        refresh_token: refresh_token || null,
+        token_expires_at,
         platform: 'shopify'
       }, {
         onConflict: 'shopify_shop_domain'
@@ -423,7 +431,7 @@ router.get('/status', verifyToken, async (req, res) => {
     // Query all integrations for this brand
     const { data: integrations, error: fetchError } = await supabase
       .from('integrations')
-      .select('platform, shopify_shop_domain, instagram_page_id, access_token')
+      .select('platform, shopify_shop_domain, instagram_page_id, access_token, refresh_token, token_expires_at')
       .eq('brand_id', brandId);
 
     if (fetchError) {
@@ -441,11 +449,12 @@ router.get('/status', verifyToken, async (req, res) => {
       .eq('id', brandId)
       .single();
 
-    // Fetch Shopify store name via GraphQL
+    // Fetch Shopify store name via GraphQL (auto-refreshes expired token)
     let shopName = null;
     if (shopify?.shopify_shop_domain && shopify?.access_token) {
       try {
-        shopName = await getShopName(shopify.shopify_shop_domain, shopify.access_token);
+        const validToken = await getValidAccessToken(shopify);
+        shopName = await getShopName(shopify.shopify_shop_domain, validToken);
       } catch (err) {
         console.error('Failed to fetch Shopify shop name:', err.message);
       }

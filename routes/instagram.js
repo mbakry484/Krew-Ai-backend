@@ -9,7 +9,7 @@ const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
-const { shopifyGraphQL, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { shopifyGraphQL, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -999,10 +999,10 @@ Customer's image looks like: ${queryDescription}
           `${item.quantity || 1}x ${item.product_name}`
         ).join(', ');
 
-        // Fetch Shopify integration
+        // Fetch Shopify integration (include refresh fields for token rotation)
         const { data: shopifyIntegration } = await supabase
           .from('integrations')
-          .select('shopify_shop_domain, access_token')
+          .select('shopify_shop_domain, access_token, refresh_token, token_expires_at')
           .eq('brand_id', brand_id)
           .eq('platform', 'shopify')
           .maybeSingle();
@@ -1100,9 +1100,11 @@ Customer's image looks like: ${queryDescription}
             },
           };
 
+          // Get a valid (non-expired) access token
+          const validToken = await getValidAccessToken(shopifyIntegration);
           const shopifyData = await shopifyGraphQL(
             shopifyIntegration.shopify_shop_domain,
-            shopifyIntegration.access_token,
+            validToken,
             orderCreateMutation,
             orderVariables
           );
