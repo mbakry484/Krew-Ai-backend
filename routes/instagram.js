@@ -1074,6 +1074,7 @@ Customer's image looks like: ${queryDescription}
                 toUpsert: {
                   firstName: orderData.name,
                   phone: formattedPhone,
+                  email: `${formattedPhone.replace(/\+/g, '')}@instagram.placeholder`,
                 },
               },
               shippingAddress: {
