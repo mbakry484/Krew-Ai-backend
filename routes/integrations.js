@@ -140,7 +140,7 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
     );
 
     // Build Shopify OAuth URL
-    const scopes = 'read_products,write_products';
+    const scopes = 'read_products,write_products,read_orders,write_orders,read_inventory,read_shop';
     const redirectUri = `${backendUrl}/integrations/shopify/callback`;
     const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
 
