@@ -207,6 +207,7 @@ router.get('/shopify/callback', async (req, res) => {
         client_secret: process.env.SHOPIFY_API_SECRET,
         code,
         grant_type: 'authorization_code',
+        expiring: 1,
       })
     });
 
