@@ -19,6 +19,8 @@ const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
 const metaTokenRoutes = require('./routes/meta-token');
 const interactionsRoutes = require('./routes/interactions');
 const lunaRoutes = require('./routes/luna');
+const supabase = require('./lib/supabase');
+const { client: aiClient, provider: aiProvider } = require('./lib/ai-provider');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 const { startInteractionAnalysisCron } = require('./cron/interactionAnalysis');
 
@@ -77,6 +79,33 @@ app.use(express.json());
 // Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Krew Backend API' });
+});
+
+app.get('/health', async (req, res) => {
+  const checks = { supabase: false, openai: false };
+
+  // Verify Supabase connection
+  try {
+    const { error } = await supabase.from('users').select('id', { count: 'exact', head: true });
+    checks.supabase = !error;
+  } catch {
+    checks.supabase = false;
+  }
+
+  // Verify OpenAI / AI provider connection
+  try {
+    await aiClient.models.list();
+    checks.openai = true;
+  } catch {
+    checks.openai = false;
+  }
+
+  const healthy = checks.supabase && checks.openai;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ok' : 'degraded',
+    uptime: process.uptime(),
+    checks,
+  });
 });
 
 // Routes
