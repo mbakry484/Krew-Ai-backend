@@ -209,4 +209,45 @@ router.post('/profile/:brand_id/activate', verifyToken, async (req, res) => {
   }
 });
 
+// ─── POST /api/voice/profile/:brand_id/deactivate ───────────────────
+// Marks the profile as inactive
+router.post('/profile/:brand_id/deactivate', verifyToken, async (req, res) => {
+  try {
+    const userBrandId = await getBrandId(req.user.user_id);
+    if (userBrandId !== req.params.brand_id) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('voice_profiles')
+      .select('id')
+      .eq('brand_id', req.params.brand_id)
+      .single();
+
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'No voice profile found for this brand.' });
+    }
+
+    const { data, error } = await supabase
+      .from('voice_profiles')
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('brand_id', req.params.brand_id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Deactivate voice profile error:', error);
+      return res.status(500).json({ error: 'Failed to deactivate voice profile.' });
+    }
+
+    return res.json({ message: 'Voice profile deactivated.', data });
+  } catch (err) {
+    console.error('Deactivate voice profile error:', err);
+    return res.status(500).json({ error: 'Failed to deactivate voice profile.' });
+  }
+});
+
 module.exports = router;
