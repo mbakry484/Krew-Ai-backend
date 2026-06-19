@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
+const { generateReply } = require('../lib/claude');
 
 /**
  * GET /luna/global-status
@@ -76,6 +77,104 @@ router.put('/global-status', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('Error updating Luna global status:', err);
     return res.status(500).json({ error: 'Failed to update Luna global status' });
+  }
+});
+
+/**
+ * POST /luna/test-chat
+ * Let the user test Luna directly. The user's message is treated as a customer
+ * message and Luna responds using the brand's full configuration (knowledge base,
+ * products, settings). No escalation, no handover — Luna always replies.
+ * Body: { message: string, history?: Array<{ role: 'user'|'assistant', content: string }> }
+ */
+router.post('/test-chat', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { message, history = [] } = req.body;
+
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+
+    // Get brand_id for this user
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const brandId = user.brand_id;
+
+    // Gather all brand data in parallel
+    const [brandResult, kbResult, productsResult] = await Promise.all([
+      supabase
+        .from('brands')
+        .select('business_name, business_type, brand_description')
+        .eq('id', brandId)
+        .single(),
+      supabase
+        .from('knowledge_base')
+        .select('faqs, situations_enabled, situations, size_guides_enabled, size_guides')
+        .eq('brand_id', brandId),
+      supabase
+        .from('products')
+        .select('name, price, status, variants')
+        .eq('brand_id', brandId),
+    ]);
+
+    const brand = brandResult.data || {};
+    const businessName = brand.business_name || 'our business';
+    const businessType = brand.business_type || null;
+    const brandDescription = brand.brand_description || null;
+
+    const knowledgeBaseRows = kbResult.data || [];
+    const kb = knowledgeBaseRows[0] || {};
+
+    const allProducts = productsResult.data || [];
+    const inStockProducts = allProducts.filter(p => p.status === 'active');
+    const outOfStockProducts = allProducts.filter(p => p.status !== 'active');
+
+    // Convert frontend history format to OpenAI format
+    const conversationHistory = history.map(h => ({
+      role: h.role === 'user' ? 'user' : 'assistant',
+      content: h.content,
+    }));
+
+    // Generate Luna's reply using the same pipeline as real conversations
+    const reply = await generateReply(
+      message.trim(),
+      knowledgeBaseRows,
+      inStockProducts,
+      outOfStockProducts,
+      brandId,
+      conversationHistory,
+      null, // no metadata (no order state tracking in test mode)
+      businessName,
+      null, // no image
+      '',   // no story context
+      businessType,
+      brandDescription,
+      kb.situations_enabled || false,
+      kb.situations || [],
+      kb.size_guides_enabled || false,
+      kb.size_guides || []
+    );
+
+    // Strip any escalation keywords from the response for test mode
+    let cleanReply = reply;
+    const escalationKeywords = ['ESCALATE_REFUND', 'ESCALATE_EXCHANGE', 'ESCALATE_DELIVERY', 'ESCALATE_GENERAL'];
+    escalationKeywords.forEach(keyword => {
+      cleanReply = cleanReply.replace(new RegExp(keyword, 'gi'), '').trim();
+    });
+
+    res.json({ reply: cleanReply });
+  } catch (err) {
+    console.error('❌ Luna test-chat error:', err.message);
+    res.status(500).json({ error: 'Failed to generate Luna response' });
   }
 });
 
