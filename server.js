@@ -19,6 +19,7 @@ const exchangesRefundsRoutes = require('./routes/exchanges-refunds');
 const metaTokenRoutes = require('./routes/meta-token');
 const interactionsRoutes = require('./routes/interactions');
 const lunaRoutes = require('./routes/luna');
+const voiceRoutes = require('./routes/voice');
 const supabase = require('./lib/supabase');
 const { client: aiClient, provider: aiProvider } = require('./lib/ai-provider');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
@@ -126,6 +127,7 @@ app.use('/exchanges-refunds', exchangesRefundsRoutes);
 app.use('/api/meta', metaTokenRoutes);
 app.use('/interactions', interactionsRoutes);
 app.use('/luna', lunaRoutes);
+app.use('/api/voice', voiceRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
