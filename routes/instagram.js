@@ -1465,11 +1465,13 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
       const collectedProduct = parseField(aiReply, '📦', 'Product');
       const collectedReason  = parseField(aiReply, '📝', 'Reason');
 
-      // Fallbacks: use conversation metadata or the customer's last message
-      const resolvedName    = collectedName    || conversation.customer_name || null;
-      const resolvedOrderId = collectedOrderId || null;
-      const resolvedProduct = collectedProduct || metadata.current_order?.product_name || null;
-      const resolvedReason  = collectedReason  || finalMessage || null;
+      // Fallbacks: use slots (Phase 4), then conversation metadata, then customer's last message
+      const resolvedName    = collectedName    || metadata.slots?.customer_name || conversation.customer_name || null;
+      const resolvedOrderId = collectedOrderId || metadata.slots?.order_id || null;
+      const slotsItem = metadata.slots?.item && metadata.slots.item !== '__pending_ai_parse__' ? metadata.slots.item : null;
+      const slotsReason = metadata.slots?.reason && metadata.slots.reason !== '__pending_ai_parse__' ? metadata.slots.reason : null;
+      const resolvedProduct = collectedProduct || slotsItem || metadata.current_order?.product_name || 'Unknown product';
+      const resolvedReason  = collectedReason  || slotsReason || finalMessage || null;
 
       console.log(`📋 Escalation data — name: "${resolvedName}", orderId: "${resolvedOrderId}", product: "${resolvedProduct}", reason: "${resolvedReason}"`);
 
