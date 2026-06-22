@@ -10,6 +10,7 @@ const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
 const { shopifyGraphQL, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { runStepDetector, postAiReplyTransition, postValidationTransition } = require('../lib/flow-detector');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -586,7 +587,14 @@ Do not invent product names. Only match against the listed products above.`
 
     const defaultMetadata = {
       discussed_products: [],
-      current_order: null
+      current_order: null,
+      // --- flow-state fields (Phase 1) ---
+      flow: null,                  // 'exchange' | 'refund' | 'order' | null
+      step: null,                  // step name within the flow
+      slots: {},                   // { order_id, customer_name, item, reason, replacement }
+      exchange_suggested: false,   // latch: once true, never suggest exchange again
+      no_progress_count: 0,        // increments when no slot filled / step unchanged
+      last_replies: []             // last 3 outgoing AI replies (for repetition detection)
     };
 
     if (!conversation) {
@@ -795,6 +803,13 @@ Do not invent product names. Only match against the listed products above.`
       .maybeSingle();
     const businessType = brand?.business_type || null;
     const brandDescription = brand?.brand_description || null;
+
+    // 10b. Run flow/step detector (Phase 4) — sets metadata.flow, metadata.step, metadata.slots
+    await runStepDetector(finalMessage, metadata);
+
+    // Snapshot flow state before AI call (used by no-progress counter in post-processing)
+    const stepBefore = metadata.step;
+    const slotsSnapshotBefore = JSON.stringify(metadata.slots || {});
 
     // 11. Generate AI reply
     let aiReply;
@@ -1192,8 +1207,17 @@ Customer's image looks like: ${queryDescription}
           level: 'DEFAULT'
         });
 
-        // Reset metadata after successful order
-        metadata = { discussed_products: [], current_order: null };
+        // Reset metadata after successful order (full shape including flow-state fields)
+        metadata = {
+          discussed_products: [],
+          current_order: null,
+          flow: null,
+          step: null,
+          slots: {},
+          exchange_suggested: false,
+          no_progress_count: 0,
+          last_replies: []
+        };
         await supabase.from('conversations').update({ metadata }).eq('id', conversation.id);
         return;
 
@@ -1324,6 +1348,9 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
           }
         }
 
+        // Advance step based on validation result (Phase 4)
+        postValidationTransition(validationResult, metadata);
+
         // Re-invoke AI with the validation result so Luna can continue the conversation
         console.log(`🔁 Re-invoking AI with validation result...`);
 
@@ -1371,6 +1398,9 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
 
         aiReply = validationCompletion.choices[0].message.content;
         console.log(`🤖 Luna reply (post-validation): "${aiReply}"`);
+
+        // Post-AI transition for validation re-invocation (Phase 4)
+        postAiReplyTransition(aiReply, metadata);
 
         logUsage({
           brandId: brand_id,
@@ -1515,6 +1545,97 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
 
     // 14. Update discussed products from AI reply
     metadata = updateProductTracking(aiReply, metadata, inStockProducts);
+
+    // ── Phase 2 circuit breakers (run BEFORE sendDM, BEFORE metadata persist) ──
+
+    // Trilingual handoff — detect customer language from their latest message
+    const hasArabicChars = /[\u0600-\u06FF]/.test(finalMessage || '');
+    const hasFrancoMarkers = /\b(3ayez|3ayza|la2|7aga|felosy|2order|ba3at)\b/i.test(finalMessage || '');
+    const handoffMsg = hasArabicChars
+      ? 'هسيب حد من الفريق يساعدك — لحظة واحدة!'
+      : hasFrancoMarkers
+        ? 'Haseeb 7ad men el team ysa3dak — lahza wahda!'
+        : 'Let me get a teammate to help you with this — one moment!';
+
+    // A. Repetition guard — compare about-to-send reply against last 3 replies
+    //    Skip for very short replies (< 8 words) to avoid false positives on pleasantries.
+    //    At validation step, require 3 repeats (customer may legitimately retry after a typo).
+    const recentReplies = metadata.last_replies || [];
+    const normalize = (s) => (s || '').toLowerCase().replace(/[^\w\u0600-\u06FF\s]/g, '').split(/\s+/).filter(Boolean);
+    const currentWords = normalize(aiReply || '');
+    const repeatThreshold = metadata.step === 'validate' ? 3 : 1;
+
+    if (aiReply && currentWords.length >= 8 && recentReplies.length > 0) {
+      const currentSet = new Set(currentWords);
+      let repeatCount = 0;
+      for (const prev of recentReplies) {
+        const prevSet = new Set(normalize(prev));
+        if (currentSet.size === 0 && prevSet.size === 0) { repeatCount++; continue; }
+        const intersection = [...currentSet].filter(w => prevSet.has(w)).length;
+        const union = new Set([...currentSet, ...prevSet]).size;
+        if (union > 0 && (intersection / union) > 0.8) repeatCount++;
+      }
+
+      if (repeatCount >= repeatThreshold) {
+        console.log(`🔁 Repetition guard triggered (${repeatCount} matches, threshold ${repeatThreshold}) — forcing escalation`);
+        aiReply = handoffMsg;
+        // Force escalation (match existing escalation write shape)
+        await supabase
+          .from('conversations')
+          .update({
+            is_escalated: true,
+            escalation_type: metadata.flow || 'general',
+            escalation_reason: 'AI response loop detected — repeated reply',
+            escalated_at: new Date().toISOString(),
+            escalated_by: 'ai'
+          })
+          .eq('id', conversation.id);
+      }
+    }
+
+    // B. No-progress counter — did this turn advance the flow?
+    //    Compares full serialized slots (detects value changes, not just new keys).
+    if (metadata.flow) {
+      const stepAfter = metadata.step;
+      const slotsSnapshotAfter = JSON.stringify(metadata.slots || {});
+      const progressed = (stepAfter !== stepBefore) || (slotsSnapshotAfter !== slotsSnapshotBefore);
+
+      if (progressed) {
+        metadata.no_progress_count = 0;
+      } else {
+        metadata.no_progress_count = (metadata.no_progress_count || 0) + 1;
+        console.log(`⏳ No-progress count: ${metadata.no_progress_count}`);
+      }
+
+      if (metadata.no_progress_count >= 2) {
+        console.log(`🚨 No-progress guard triggered (${metadata.no_progress_count} turns) — forcing escalation`);
+        aiReply = handoffMsg;
+        await supabase
+          .from('conversations')
+          .update({
+            is_escalated: true,
+            escalation_type: metadata.flow || 'general',
+            escalation_reason: `AI stuck — no progress for ${metadata.no_progress_count} turns`,
+            escalated_at: new Date().toISOString(),
+            escalated_by: 'ai'
+          })
+          .eq('id', conversation.id);
+        metadata.no_progress_count = 0;
+      }
+    }
+
+    // Track reply for repetition guard (keep last 3)
+    if (aiReply) {
+      metadata.last_replies = [...(metadata.last_replies || []), aiReply].slice(-3);
+    }
+
+    // ── End circuit breakers ──
+
+    // 11b. Post-AI step transition (Phase 4) — runs on FINAL aiReply after guards.
+    //      Skip if circuit breakers replaced the reply with a handoff message (force-escalated).
+    if (aiReply && aiReply !== handoffMsg) {
+      postAiReplyTransition(aiReply, metadata);
+    }
 
     // 15. Send reply via Meta API
     if (aiReply) {
