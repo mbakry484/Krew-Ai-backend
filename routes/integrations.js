@@ -195,7 +195,9 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=shop_mismatch`);
     }
 
-    // Exchange code for access_token
+    // Exchange authorization code for access token
+    // Per Shopify docs: do NOT send grant_type for code exchange — only client_id, client_secret, code
+    // Send expiring=1 to get an expiring offline token with refresh_token
     const tokenExchangeUrl = `https://${shop}/admin/oauth/access_token`;
     const tokenResponse = await fetch(tokenExchangeUrl, {
       method: 'POST',
@@ -206,23 +208,27 @@ router.get('/shopify/callback', async (req, res) => {
         client_id: process.env.SHOPIFY_API_KEY,
         client_secret: process.env.SHOPIFY_API_SECRET,
         code,
-        grant_type: 'authorization_code',
         expiring: 1,
       })
     });
 
     if (!tokenResponse.ok) {
-      console.error('Failed to exchange code for token:', tokenResponse.status);
+      const errBody = await tokenResponse.text();
+      console.error(`Failed to exchange code for token (${tokenResponse.status}):`, errBody);
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=token_exchange_failed`);
     }
 
     const tokenData = await tokenResponse.json();
-    console.log('🔑 Shopify token response keys:', Object.keys(tokenData));
+    console.log('🔑 Shopify token response:', JSON.stringify(tokenData, null, 2));
     const { access_token, refresh_token, expires_in } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
+    }
+
+    if (!refresh_token) {
+      console.warn('⚠️ No refresh_token received — Shopify returned a non-expiring token. Token will work but cannot be rotated.');
     }
 
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
