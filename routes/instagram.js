@@ -804,12 +804,13 @@ Do not invent product names. Only match against the listed products above.`
     const businessType = brand?.business_type || null;
     const brandDescription = brand?.brand_description || null;
 
-    // 10b. Run flow/step detector (Phase 4) — sets metadata.flow, metadata.step, metadata.slots
-    await runStepDetector(finalMessage, metadata);
-
-    // Snapshot flow state before AI call (used by no-progress counter in post-processing)
+    // Snapshot flow state BEFORE step detector (used by no-progress counter in post-processing).
+    // Must be taken before runStepDetector so that step advances count as progress.
     const stepBefore = metadata.step;
     const slotsSnapshotBefore = JSON.stringify(metadata.slots || {});
+
+    // 10b. Run flow/step detector (Phase 4) — sets metadata.flow, metadata.step, metadata.slots
+    await runStepDetector(finalMessage, metadata);
 
     // 11. Generate AI reply
     let aiReply;
@@ -1597,7 +1598,9 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
 
     // B. No-progress counter — did this turn advance the flow?
     //    Compares full serialized slots (detects value changes, not just new keys).
-    if (metadata.flow) {
+    //    Skip terminal steps (escalate, confirm_refund) — no progress is possible by design.
+    const terminalSteps = ['escalate', 'confirm_refund'];
+    if (metadata.flow && !terminalSteps.includes(metadata.step)) {
       const stepAfter = metadata.step;
       const slotsSnapshotAfter = JSON.stringify(metadata.slots || {});
       const progressed = (stepAfter !== stepBefore) || (slotsSnapshotAfter !== slotsSnapshotBefore);

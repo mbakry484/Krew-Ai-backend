@@ -456,6 +456,25 @@ router.post('/:id/restore-luna', verifyToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // First, read current metadata so we can reset flow state while preserving other fields
+    const { data: current } = await supabase
+      .from('conversations')
+      .select('metadata')
+      .eq('id', id)
+      .eq('brand_id', user.brand_id)
+      .single();
+
+    const existingMeta = current?.metadata || {};
+    const resetMetadata = {
+      ...existingMeta,
+      flow: null,
+      step: null,
+      slots: {},
+      exchange_suggested: false,
+      no_progress_count: 0,
+      last_replies: [],
+    };
+
     const { data, error } = await supabase
       .from('conversations')
       .update({
@@ -466,6 +485,7 @@ router.post('/:id/restore-luna', verifyToken, async (req, res) => {
         escalated_by: 'ai',
         status: 'active',
         updated_at: new Date().toISOString(),
+        metadata: resetMetadata,
       })
       .eq('id', id)
       .eq('brand_id', user.brand_id)
