@@ -9,7 +9,7 @@ const langfuse = require('../lib/tracer');
 const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
-const { shopifyGraphQL, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { shopifyGraphQL, getValidAccessToken, getShopifyOrderByNumber, SHOPIFY_API_VERSION } = require('../lib/shopify');
 const { runStepDetector, postAiReplyTransition, postValidationTransition } = require('../lib/flow-detector');
 
 // Initialize OpenAI client for image similarity search
@@ -1259,9 +1259,98 @@ Customer's image looks like: ${queryDescription}
           console.error(`❌ Order lookup error:`, orderLookupError);
         }
 
+        // If not found locally, try Shopify API as fallback
+        let shopifyOrder = null;
         if (orderLookupError || !matchedOrders || matchedOrders.length === 0) {
-          console.log(`❌ Order not found: ${requestedOrderId} (searched shopify_order_number IN [${orderIdVariants.join(', ')}])`);
+          console.log(`ℹ️ Order not found locally: ${requestedOrderId} — trying Shopify API...`);
+          try {
+            const { data: shopifyIntegration } = await supabase
+              .from('integrations')
+              .select('shopify_shop_domain, access_token, refresh_token, token_expires_at')
+              .eq('brand_id', brand_id)
+              .eq('platform', 'shopify')
+              .maybeSingle();
+
+            if (shopifyIntegration) {
+              const validToken = await getValidAccessToken(shopifyIntegration);
+              shopifyOrder = await getShopifyOrderByNumber(
+                shopifyIntegration.shopify_shop_domain,
+                validToken,
+                requestedOrderId
+              );
+            }
+          } catch (shopifyErr) {
+            console.error(`❌ Shopify order lookup failed:`, shopifyErr.message);
+          }
+        }
+
+        if ((orderLookupError || !matchedOrders || matchedOrders.length === 0) && !shopifyOrder) {
+          console.log(`❌ Order not found: ${requestedOrderId} (searched local DB and Shopify API)`);
           validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — No order found with ID "${requestedOrderId}". Ask the customer to double-check their order number.`;
+        } else if (shopifyOrder) {
+          // Validate name against Shopify order
+          const normalizeStr = (s) => s.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]/g, '');
+          const requestedNameNorm = normalizeStr(requestedName);
+          const shopifyNameNorm = normalizeStr(shopifyOrder.customer_name || '');
+
+          const fuzzyNameMatch = (a, b) => {
+            if (a === b) return true;
+            if (a.includes(b) || b.includes(a)) return true;
+            if (a.length > 4 && b.length > 4) {
+              let differences = 0;
+              const longer = a.length >= b.length ? a : b;
+              const shorter = a.length < b.length ? a : b;
+              for (let i = 0; i < longer.length; i++) {
+                if (longer[i] !== shorter[i]) differences++;
+              }
+              if (Math.abs(a.length - b.length) + differences <= 2) return true;
+            }
+            return false;
+          };
+
+          if (!shopifyOrder.customer_name || !fuzzyNameMatch(requestedNameNorm, shopifyNameNorm)) {
+            console.log(`❌ Name mismatch (Shopify): "${requestedName}" vs "${shopifyOrder.customer_name}"`);
+            validationResult = `SYSTEM_VALIDATION_RESULT: INVALID — Order ${shopifyOrder.order_number} exists but the name "${requestedName}" does not match the name on the order. Ask the customer to check the exact name they used when ordering (there might be a typo).`;
+          } else {
+            console.log(`✅ Order validated via Shopify API: ${shopifyOrder.order_number} for "${shopifyOrder.customer_name}"`);
+
+            // Check for existing active exchanges/refunds by order number
+            const orderIdClean = requestedOrderId.replace(/^#/, '').trim();
+            const { data: existingExchangesByNumber } = await supabase
+              .from('exchanges')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('original_order_number', orderIdClean)
+              .in('status', ['pending', 'approved', 'shipped']);
+
+            const { data: existingRefundsByNumber } = await supabase
+              .from('refunds')
+              .select('id, status')
+              .eq('brand_id', brand_id)
+              .eq('original_order_number', orderIdClean)
+              .in('status', ['pending', 'approved', 'processed']);
+
+            const hasActiveExchange = existingExchangesByNumber && existingExchangesByNumber.length > 0;
+            const hasActiveRefund = existingRefundsByNumber && existingRefundsByNumber.length > 0;
+
+            if (hasActiveExchange || hasActiveRefund) {
+              const activeType = hasActiveExchange ? 'exchange' : 'refund';
+              console.log(`⚠️ Order ${shopifyOrder.order_number} already has an active ${activeType} request`);
+              validationResult = `SYSTEM_VALIDATION_RESULT: ALREADY_EXISTS — Order ${shopifyOrder.order_number} already has an active ${activeType} request being processed by the team. Tell the customer that their ${activeType} request for this order is already being handled and the team will be in touch. Do NOT create another request. Do NOT escalate.`;
+            } else {
+              const productInfo = shopifyOrder.line_items.map(li => `${li.quantity}x ${li.title}`).join(', ');
+              validationResult = `SYSTEM_VALIDATION_RESULT: VALID — Order ${shopifyOrder.order_number} confirmed for "${shopifyOrder.customer_name}".
+ORDER DETAILS:
+- Order Number: ${shopifyOrder.order_number}
+- Customer Name: ${shopifyOrder.customer_name}
+- Products Ordered: ${productInfo}
+- Order Date: ${new Date(shopifyOrder.created_at).toLocaleDateString()}
+- Financial Status: ${shopifyOrder.financial_status || 'N/A'}
+- Fulfillment Status: ${shopifyOrder.fulfillment_status || 'N/A'}
+
+Now show these products to the customer and proceed with Step 2 of the exchange/refund flow.`;
+            }
+          }
         } else {
           // Fuzzy name matching — check if any matched order has a similar customer name
           const normalizeStr = (s) => s.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]/g, '');
