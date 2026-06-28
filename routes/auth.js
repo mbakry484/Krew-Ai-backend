@@ -738,11 +738,26 @@ router.post('/supabase/ensure-user', async (req, res) => {
     .maybeSingle();
 
   if (existing) {
-    return res.json({ user: existing, isNew: false });
+    // If the caller is supplying fields that are still empty (e.g. brand name collected
+    // after the initial callback call), update them so onboarding data is never lost.
+    const { first_name: bodyFn, last_name: bodyLn, business_name: bodyBn } = req.body || {};
+    const patch = {};
+    if (bodyFn && (!existing.first_name || existing.first_name === 'User')) patch.first_name = bodyFn;
+    if (bodyLn && !existing.last_name) patch.last_name = bodyLn;
+    if (bodyBn && !existing.business_name) patch.business_name = bodyBn;
+
+    if (Object.keys(patch).length > 0) {
+      await supabase.from('users').update(patch).eq('id', existing.id);
+      if (patch.business_name && existing.brand_id) {
+        await supabase.from('brands').update({ name: patch.business_name }).eq('id', existing.brand_id);
+      }
+    }
+
+    return res.json({ user: { ...existing, ...patch }, isNew: false });
   }
 
   // ── New user — create users + brands rows ────────────────────────────────
-  const { first_name, last_name, business_name } = req.body;
+  const { first_name, last_name, business_name } = req.body || {};
 
   // Fall back to Google/OAuth metadata when the onboarding fields aren't provided yet
   const meta = supabaseUser.user_metadata || {};
