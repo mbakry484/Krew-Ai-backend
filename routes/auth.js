@@ -776,18 +776,32 @@ router.post('/supabase/ensure-user', async (req, res) => {
     return res.status(500).json({ error: 'Failed to create brand' });
   }
 
-  const { data: newUser, error: insertError } = await supabase
+  const userRow = {
+    email: supabaseUser.email,
+    password: null, // OAuth/OTP users have no password in our table
+    first_name: fn,
+    last_name: ln,
+    business_name: bn,
+    brand_id: newBrand.id,
+  };
+
+  let { data: newUser, error: insertError } = await supabase
     .from('users')
-    .insert([{
-      email: supabaseUser.email,
-      password: null, // OAuth/OTP users have no password in our table
-      first_name: fn,
-      last_name: ln,
-      business_name: bn,
-      brand_id: newBrand.id,
-    }])
+    .insert([userRow])
     .select('id, email, first_name, last_name, business_name, brand_id')
     .single();
+
+  // If password column has NOT NULL constraint (pre-migration), retry with a UUID sentinel.
+  // Run `ALTER TABLE users ALTER COLUMN password DROP NOT NULL;` to clean this up.
+  if (insertError && insertError.code === '23502') {
+    const { data: retryUser, error: retryError } = await supabase
+      .from('users')
+      .insert([{ ...userRow, password: require('crypto').randomUUID() }])
+      .select('id, email, first_name, last_name, business_name, brand_id')
+      .single();
+    insertError = retryError;
+    newUser = retryUser;
+  }
 
   if (insertError) {
     console.error('[ensure-user] Failed to create user:', insertError.message);
