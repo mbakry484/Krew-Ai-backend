@@ -695,4 +695,93 @@ router.get('/instagram/callback', async (req, res) => {
   }
 });
 
+// ─── Supabase Auth — user provisioning ──────────────────────────────────────
+
+/**
+ * POST /auth/supabase/ensure-user
+ *
+ * Called by the frontend after:
+ *   - Google OAuth callback (new or returning user)
+ *   - Email OTP verification (new user completing onboarding)
+ *
+ * Validates the Supabase access_token from the Authorization header, then
+ * ensures a row exists in our `users` and `brands` tables for that Auth user.
+ * Safe to call multiple times — returns the existing row if already present.
+ *
+ * Body (only required when creating a new user):
+ *   { first_name?, last_name?, business_name? }
+ *
+ * NOTE: If the `users.password` column has a NOT NULL constraint in your DB,
+ * you will need to run:
+ *   ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
+ * before Supabase OAuth/OTP users can be inserted (they have no password).
+ */
+router.post('/supabase/ensure-user', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  // Validate the Supabase access token
+  const { data: { user: supabaseUser }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !supabaseUser) {
+    return res.status(401).json({ error: 'Invalid or expired Supabase session' });
+  }
+
+  // Check if this email is already in our users table
+  const { data: existing } = await supabase
+    .from('users')
+    .select('id, email, first_name, last_name, business_name, brand_id')
+    .eq('email', supabaseUser.email)
+    .maybeSingle();
+
+  if (existing) {
+    return res.json({ user: existing, isNew: false });
+  }
+
+  // ── New user — create users + brands rows ────────────────────────────────
+  const { first_name, last_name, business_name } = req.body;
+
+  // Fall back to Google/OAuth metadata when the onboarding fields aren't provided yet
+  const meta = supabaseUser.user_metadata || {};
+  const fn = first_name || meta.full_name?.split(' ')[0] || meta.name?.split(' ')[0] || 'User';
+  const ln = last_name || meta.full_name?.split(' ').slice(1).join(' ') || meta.name?.split(' ').slice(1).join(' ') || '';
+  const bn = business_name || '';
+
+  const { data: newBrand, error: brandError } = await supabase
+    .from('brands')
+    .insert([{ name: bn || fn }])
+    .select('id')
+    .single();
+
+  if (brandError) {
+    console.error('[ensure-user] Failed to create brand:', brandError.message);
+    return res.status(500).json({ error: 'Failed to create brand' });
+  }
+
+  const { data: newUser, error: insertError } = await supabase
+    .from('users')
+    .insert([{
+      email: supabaseUser.email,
+      password: null, // OAuth/OTP users have no password in our table
+      first_name: fn,
+      last_name: ln,
+      business_name: bn,
+      brand_id: newBrand.id,
+    }])
+    .select('id, email, first_name, last_name, business_name, brand_id')
+    .single();
+
+  if (insertError) {
+    console.error('[ensure-user] Failed to create user:', insertError.message);
+    // Roll back the brand row so we don't leave orphans
+    await supabase.from('brands').delete().eq('id', newBrand.id);
+    return res.status(500).json({ error: 'Failed to create user account' });
+  }
+
+  return res.status(201).json({ user: newUser, isNew: true });
+});
+
 module.exports = router;
