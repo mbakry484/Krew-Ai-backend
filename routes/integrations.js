@@ -208,7 +208,6 @@ router.get('/shopify/callback', async (req, res) => {
         client_id: process.env.SHOPIFY_API_KEY,
         client_secret: process.env.SHOPIFY_API_SECRET,
         code,
-        expiring: 1,
       })
     });
 
@@ -227,8 +226,8 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
 
-    if (!refresh_token) {
-      console.warn('⚠️ No refresh_token received — Shopify returned a non-expiring token. Token will work but cannot be rotated.');
+    if (refresh_token) {
+      console.warn('⚠️ Shopify returned a refresh_token — expiring token rotation is active. Consider removing expiring:1 for permanent offline tokens.');
     }
 
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
