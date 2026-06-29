@@ -458,12 +458,18 @@ router.get('/status', verifyToken, async (req, res) => {
 
     // Fetch Shopify store name via GraphQL (auto-refreshes expired token)
     let shopName = null;
+    let shopifyNeedsReconnect = false;
     if (shopify?.shopify_shop_domain && shopify?.access_token) {
       try {
         const validToken = await getValidAccessToken(shopify);
         shopName = await getShopName(shopify.shopify_shop_domain, validToken);
       } catch (err) {
-        console.error('Failed to fetch Shopify shop name:', err.message);
+        if (err.code === 'SHOPIFY_NEEDS_RECONNECT') {
+          console.warn(`⚠️ Shopify reconnect required for brand ${brandId}:`, err.message);
+          shopifyNeedsReconnect = true;
+        } else {
+          console.error('Failed to fetch Shopify shop name:', err.message);
+        }
       }
     }
 
@@ -490,6 +496,7 @@ router.get('/status', verifyToken, async (req, res) => {
         linked: !!shopify,
         shop_domain: shopify?.shopify_shop_domain || null,
         shop_name: shopName,
+        needs_reconnect: shopifyNeedsReconnect,
       },
       meta: {
         linked: !!(meta || brand?.instagram_business_account_id),
