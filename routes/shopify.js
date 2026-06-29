@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
+const { getValidAccessToken, getStorefrontUrl } = require('../lib/shopify');
 
 // POST /products/sync - Bulk sync products from Shopify
 router.post('/sync', async (req, res) => {
@@ -46,6 +47,8 @@ router.post('/sync', async (req, res) => {
         shopify_product_id: product.shopify_product_id,
         brand_id: brandId,
         name: product.name,
+        handle: product.handle || null,
+        online_store_url: product.online_store_url || null,
         description: product.description || null,
         price: product.price || null,
         currency: product.currency || 'EGP',
@@ -140,6 +143,8 @@ router.post('/product-update', async (req, res) => {
         user_id: brandId,
         brand_id: brandId,
         name: product.name,
+        handle: product.handle || null,
+        online_store_url: product.online_store_url || null,
         description: product.description,
         price: product.price,
         currency: product.currency || 'EGP',
@@ -246,6 +251,53 @@ router.post('/product-delete', async (req, res) => {
   } catch (error) {
     console.error('Error deleting product:', error);
     res.status(500).json({ error: 'Failed to delete product', details: error.message });
+  }
+});
+
+// POST /webhook/shopify/shop-update
+// Shopify fires shop/update when shop settings change (including the primary
+// domain). Re-fetch the storefront URL so product links stay on the brand's
+// published custom domain instead of the .myshopify.com fallback.
+router.post('/shop-update', async (req, res) => {
+  try {
+    const { shop_domain } = req.body;
+
+    if (!shop_domain) {
+      return res.status(400).json({ error: 'Invalid request body. Expected { shop_domain }' });
+    }
+
+    // Look up the integration so we can refresh its access token if needed
+    const { data: integration, error: integrationError } = await supabase
+      .from('integrations')
+      .select('brand_id, shopify_shop_domain, access_token, refresh_token, token_expires_at')
+      .eq('shopify_shop_domain', shop_domain)
+      .eq('platform', 'shopify')
+      .single();
+
+    if (integrationError || !integration || !integration.brand_id) {
+      return res.status(404).json({
+        error: 'Store not linked. Please link the Shopify store to a brand first.'
+      });
+    }
+
+    const accessToken = await getValidAccessToken(integration);
+    const storefrontUrl = await getStorefrontUrl(shop_domain, accessToken);
+
+    if (storefrontUrl) {
+      const { error } = await supabase
+        .from('integrations')
+        .update({ storefront_url: storefrontUrl })
+        .eq('shopify_shop_domain', shop_domain)
+        .eq('platform', 'shopify');
+
+      if (error) throw error;
+      console.log(`✅ Refreshed storefront URL for ${shop_domain}: ${storefrontUrl}`);
+    }
+
+    res.json({ success: true, storefront_url: storefrontUrl || null });
+  } catch (error) {
+    console.error('Error handling shop-update:', error);
+    res.status(500).json({ error: 'Failed to handle shop update', details: error.message });
   }
 });
 

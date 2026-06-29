@@ -4,7 +4,7 @@ const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
-const { getShopName, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Fetch all products from Shopify and upsert them into Supabase
 async function autoSyncProducts({ shop, access_token, brand_id }) {
@@ -23,7 +23,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
           products(first: 50, query: "status:active") {
             edges {
               node {
-                id title description
+                id title handle description onlineStoreUrl
                 images(first: 20) { edges { node { url altText width height } } }
                 variants(first: 10) { edges { node { id title price inventoryQuantity } } }
               }
@@ -63,6 +63,8 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
       brand_id,
       shopify_product_id: node.id,
       name: node.title,
+      handle: node.handle || null,
+      online_store_url: node.onlineStoreUrl || null,
       description: node.description || null,
       price: parseFloat(variants[0]?.price || '0'),
       currency: 'EGP',
@@ -236,6 +238,15 @@ router.get('/shopify/callback', async (req, res) => {
       ? new Date(Date.now() + expires_in * 1000).toISOString()
       : null;
 
+    // Fetch the brand's published storefront domain (custom domain if configured,
+    // else the .myshopify.com). Used to build clickable product links in DMs.
+    let storefront_url = null;
+    try {
+      storefront_url = await getStorefrontUrl(shop, access_token);
+    } catch (err) {
+      console.error('⚠️ Failed to fetch storefront URL:', err.message);
+    }
+
     // Upsert into integrations table using the authenticated brand_id
     const { error: upsertError } = await supabase
       .from('integrations')
@@ -245,6 +256,7 @@ router.get('/shopify/callback', async (req, res) => {
         access_token,
         refresh_token: refresh_token || null,
         token_expires_at,
+        storefront_url,
         platform: 'shopify'
       }, {
         onConflict: 'shopify_shop_domain'
