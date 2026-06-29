@@ -497,7 +497,7 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // Fetch ALL products - both in stock and out of stock
     const { data: products } = await supabase
       .from('products')
-      .select('name, price, variants, image_url, shopify_product_id, in_stock')
+      .select('name, price, variants, image_url, shopify_product_id, in_stock, handle, online_store_url')
       .eq('brand_id', brand_id)
       .not('price', 'is', null)
       .gt('price', 0)
@@ -506,6 +506,16 @@ async function handleIncomingMessage(messagingEvent, recipientId) {
     // Separate into available and unavailable
     const inStockProducts = products?.filter(p => p.in_stock) || [];
     const outOfStockProducts = products?.filter(p => !p.in_stock) || [];
+
+    // Fetch the brand's published storefront URL (Shopify integration) so Luna can
+    // share clickable product links instead of listing 100+ products in the DM.
+    const { data: shopifyIntegration } = await supabase
+      .from('integrations')
+      .select('storefront_url')
+      .eq('brand_id', brand_id)
+      .eq('platform', 'shopify')
+      .maybeSingle();
+    const storefrontUrl = shopifyIntegration?.storefront_url || null;
 
     // Brand-aware story analysis — now that we have the product catalog
     if (storyImageBase64 && storyImageContentType) {
@@ -837,7 +847,8 @@ Do not invent product names. Only match against the listed products above.`
         situationsEnabled,
         situations,
         sizeGuidesEnabled,
-        sizeGuides
+        sizeGuides,
+        storefrontUrl
       });
 
       // Build the image system prompt with vector search results appended
@@ -974,7 +985,8 @@ Customer's image looks like: ${queryDescription}
         situations,
         sizeGuidesEnabled,
         sizeGuides,
-        conversation.id
+        conversation.id,
+        storefrontUrl
       );
       const textLatency = Date.now() - textStartTime;
 
@@ -1472,7 +1484,8 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
           situationsEnabled,
           situations,
           sizeGuidesEnabled,
-          sizeGuides
+          sizeGuides,
+          storefrontUrl
         });
 
         const validationMessages = [
