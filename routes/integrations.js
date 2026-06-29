@@ -204,10 +204,6 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
 
-<<<<<<< HEAD
-    if (refresh_token) {
-      console.warn('⚠️ Shopify returned a refresh_token — expiring token rotation is active. Consider removing expiring:1 for permanent offline tokens.');
-=======
     if (!refresh_token) {
       // Shopify returned a non-expiring token — this means the app was previously installed
       // with non-expiring tokens and re-authorization reused the old one. These tokens are
@@ -215,7 +211,6 @@ router.get('/shopify/callback', async (req, res) => {
       // their Shopify admin (Apps page) before reconnecting.
       console.error(`❌ Shopify returned a non-expiring token for ${shop} — merchant must uninstall the app from Shopify admin then reconnect.`);
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=legacy_token`);
->>>>>>> 10a0a65 (Refactor Shopify product sync to use shopifyGraphQL and improve error handling for non-expiring tokens)
     }
 
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
