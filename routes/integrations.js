@@ -4,45 +4,23 @@ const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
-const { getShopName, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { getShopName, getValidAccessToken, shopifyGraphQL, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
 // Fetch all products from Shopify and upsert them into Supabase
 async function autoSyncProducts({ shop, access_token, brand_id }) {
   console.log(`🔄 Auto-syncing products for ${shop}...`);
 
-  const response = await fetch(
-    `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': access_token,
-      },
-      body: JSON.stringify({
-        query: `{
-          products(first: 50, query: "status:active") {
-            edges {
-              node {
-                id title description
-                images(first: 20) { edges { node { url altText width height } } }
-                variants(first: 10) { edges { node { id title price inventoryQuantity } } }
-              }
-            }
-          }
-        }`
-      }),
+  const json = await shopifyGraphQL(shop, access_token, `{
+    products(first: 50, query: "status:active") {
+      edges {
+        node {
+          id title description
+          images(first: 20) { edges { node { url altText width height } } }
+          variants(first: 10) { edges { node { id title price inventoryQuantity } } }
+        }
+      }
     }
-  );
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`❌ Shopify GraphQL ${response.status} response body:`, errorBody);
-    console.error(`❌ Token used (first 10 chars): ${access_token?.substring(0, 10)}...`);
-    console.error(`❌ URL called: https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
-    throw new Error(`Shopify GraphQL error: ${response.status}`);
-  }
-
-  const json = await response.json();
+  }`);
   const products = json.data?.products?.edges || [];
   if (products.length === 0) return;
 
@@ -226,8 +204,18 @@ router.get('/shopify/callback', async (req, res) => {
       return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
     }
 
+<<<<<<< HEAD
     if (refresh_token) {
       console.warn('⚠️ Shopify returned a refresh_token — expiring token rotation is active. Consider removing expiring:1 for permanent offline tokens.');
+=======
+    if (!refresh_token) {
+      // Shopify returned a non-expiring token — this means the app was previously installed
+      // with non-expiring tokens and re-authorization reused the old one. These tokens are
+      // now rejected by Shopify's Admin API. The merchant must fully uninstall the app from
+      // their Shopify admin (Apps page) before reconnecting.
+      console.error(`❌ Shopify returned a non-expiring token for ${shop} — merchant must uninstall the app from Shopify admin then reconnect.`);
+      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=legacy_token`);
+>>>>>>> 10a0a65 (Refactor Shopify product sync to use shopifyGraphQL and improve error handling for non-expiring tokens)
     }
 
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
