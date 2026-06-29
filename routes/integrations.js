@@ -148,7 +148,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     // Validate required parameters
     if (!code || !shop || !state) {
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=missing_params`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=missing_params`);
     }
 
     // Verify and decode state to extract user_id
@@ -157,20 +157,20 @@ router.get('/shopify/callback', async (req, res) => {
       decoded = jwt.verify(state, process.env.JWT_SECRET);
     } catch (error) {
       console.error('Invalid or expired state:', error);
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=invalid_state`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=invalid_state`);
     }
 
     const { brand_id, shop_domain } = decoded;
 
     if (!brand_id) {
       console.error('No brand_id in state');
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=invalid_state`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=invalid_state`);
     }
 
     // Verify that the shop matches the one in the state
     if (shop !== shop_domain) {
       console.error('Shop mismatch:', shop, shop_domain);
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=shop_mismatch`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=shop_mismatch`);
     }
 
     // Exchange authorization code for access token
@@ -192,7 +192,7 @@ router.get('/shopify/callback', async (req, res) => {
     if (!tokenResponse.ok) {
       const errBody = await tokenResponse.text();
       console.error(`Failed to exchange code for token (${tokenResponse.status}):`, errBody);
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=token_exchange_failed`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=token_exchange_failed`);
     }
 
     const tokenData = await tokenResponse.json();
@@ -201,7 +201,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     if (!access_token) {
       console.error('No access token received from Shopify');
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=no_token`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=no_token`);
     }
 
     if (!refresh_token) {
@@ -210,7 +210,7 @@ router.get('/shopify/callback', async (req, res) => {
       // now rejected by Shopify's Admin API. The merchant must fully uninstall the app from
       // their Shopify admin (Apps page) before reconnecting.
       console.error(`❌ Shopify returned a non-expiring token for ${shop} — merchant must uninstall the app from Shopify admin then reconnect.`);
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=legacy_token`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=legacy_token`);
     }
 
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
@@ -234,7 +234,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     if (upsertError) {
       console.error('Error upserting integration:', upsertError);
-      return res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=db_error`);
+      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=db_error`);
     }
 
     // Redirect to the Shopify embedded app so user sees the progress bar
@@ -248,7 +248,7 @@ router.get('/shopify/callback', async (req, res) => {
   } catch (error) {
     console.error('Shopify OAuth callback error:', error);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/dashboard?shopify=error&reason=server_error`);
+    res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=server_error`);
   }
 });
 
