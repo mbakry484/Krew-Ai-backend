@@ -197,53 +197,21 @@ router.get('/shopify/callback', async (req, res) => {
 
     const tokenData = await tokenResponse.json();
     console.log('🔑 Shopify token response:', JSON.stringify(tokenData, null, 2));
-    let { access_token, refresh_token, expires_in } = tokenData;
+    const { access_token, refresh_token, expires_in } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
       return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=no_token`);
     }
 
-    // If Shopify returned a non-expiring token (no refresh_token), attempt to rotate it
-    // to an expiring token via Shopify's rotation endpoint before storing.
-    if (!refresh_token) {
-      console.warn(`⚠️ Got non-expiring token for ${shop}. Attempting token rotation...`);
-      try {
-        const rotateRes = await fetch(`https://${shop}/admin/oauth/rotate_access_token`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            client_id: process.env.SHOPIFY_API_KEY,
-            client_secret: process.env.SHOPIFY_API_SECRET,
-            access_token,
-          }),
-        });
-        if (rotateRes.ok) {
-          const rotated = await rotateRes.json();
-          if (rotated.refresh_token) {
-            console.log(`✅ Token rotation successful for ${shop}`);
-            access_token = rotated.access_token;
-            refresh_token = rotated.refresh_token;
-            expires_in = rotated.expires_in;
-          } else {
-            console.warn(`⚠️ Rotation response had no refresh_token for ${shop}:`, JSON.stringify(rotated));
-          }
-        } else {
-          const errBody = await rotateRes.text();
-          console.warn(`⚠️ Token rotation failed (${rotateRes.status}) for ${shop}:`, errBody);
-        }
-      } catch (rotateErr) {
-        console.warn(`⚠️ Token rotation error for ${shop}:`, rotateErr.message);
-      }
+    // NOTE: This legacy OAuth flow returns a non-expiring offline token when the app uses
+    // Shopify Managed Installation, and Shopify's Admin API now rejects those with a 403.
+    // The source of truth for a usable token is the embedded app (it obtains expiring offline
+    // tokens via token exchange and auto-refreshes them). At API call time, getValidAccessToken
+    // pulls a fresh token from the embedded app when SHOPIFY_EMBEDDED_APP_URL is configured.
+    // We still store whatever we get here so the brand_id ↔ shop_domain link exists.
 
-      // If rotation also failed, store the token anyway — getValidAccessToken will
-      // surface needs_reconnect:true in the status endpoint so the frontend can warn the user.
-      if (!refresh_token) {
-        console.error(`❌ Could not obtain expiring token for ${shop} — storing as-is, API calls will surface reconnect error.`);
-      }
-    }
-
-    // Calculate token expiry (Shopify expiring tokens last ~86400 seconds)
+    // Calculate token expiry (Shopify expiring tokens last ~24h)
     const token_expires_at = expires_in
       ? new Date(Date.now() + expires_in * 1000).toISOString()
       : null;
