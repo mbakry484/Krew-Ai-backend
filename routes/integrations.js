@@ -197,23 +197,53 @@ router.get('/shopify/callback', async (req, res) => {
 
     const tokenData = await tokenResponse.json();
     console.log('🔑 Shopify token response:', JSON.stringify(tokenData, null, 2));
-    const { access_token, refresh_token, expires_in } = tokenData;
+    let { access_token, refresh_token, expires_in } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
       return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=no_token`);
     }
 
+    // If Shopify returned a non-expiring token (no refresh_token), attempt to rotate it
+    // to an expiring token via Shopify's rotation endpoint before storing.
     if (!refresh_token) {
-      // Shopify returned a non-expiring token — this means the app was previously installed
-      // with non-expiring tokens and re-authorization reused the old one. These tokens are
-      // now rejected by Shopify's Admin API. The merchant must fully uninstall the app from
-      // their Shopify admin (Apps page) before reconnecting.
-      console.error(`❌ Shopify returned a non-expiring token for ${shop} — merchant must uninstall the app from Shopify admin then reconnect.`);
-      return res.redirect(`${frontendUrl}/dashboard/luna/settings?shopify=error&reason=legacy_token`);
+      console.warn(`⚠️ Got non-expiring token for ${shop}. Attempting token rotation...`);
+      try {
+        const rotateRes = await fetch(`https://${shop}/admin/oauth/rotate_access_token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            client_id: process.env.SHOPIFY_API_KEY,
+            client_secret: process.env.SHOPIFY_API_SECRET,
+            access_token,
+          }),
+        });
+        if (rotateRes.ok) {
+          const rotated = await rotateRes.json();
+          if (rotated.refresh_token) {
+            console.log(`✅ Token rotation successful for ${shop}`);
+            access_token = rotated.access_token;
+            refresh_token = rotated.refresh_token;
+            expires_in = rotated.expires_in;
+          } else {
+            console.warn(`⚠️ Rotation response had no refresh_token for ${shop}:`, JSON.stringify(rotated));
+          }
+        } else {
+          const errBody = await rotateRes.text();
+          console.warn(`⚠️ Token rotation failed (${rotateRes.status}) for ${shop}:`, errBody);
+        }
+      } catch (rotateErr) {
+        console.warn(`⚠️ Token rotation error for ${shop}:`, rotateErr.message);
+      }
+
+      // If rotation also failed, store the token anyway — getValidAccessToken will
+      // surface needs_reconnect:true in the status endpoint so the frontend can warn the user.
+      if (!refresh_token) {
+        console.error(`❌ Could not obtain expiring token for ${shop} — storing as-is, API calls will surface reconnect error.`);
+      }
     }
 
-    // Calculate token expiry (Shopify expiring tokens last ~1 hour)
+    // Calculate token expiry (Shopify expiring tokens last ~86400 seconds)
     const token_expires_at = expires_in
       ? new Date(Date.now() + expires_in * 1000).toISOString()
       : null;
