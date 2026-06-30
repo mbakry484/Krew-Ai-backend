@@ -93,4 +93,44 @@ async function verifyToken(req, res, next) {
   }
 }
 
-module.exports = { verifyToken };
+/**
+ * Resolve a raw access token (from a header OR a query param) to our internal
+ * user identity, supporting BOTH Supabase Auth JWTs and legacy custom JWTs.
+ *
+ * Use this for browser-redirect flows (e.g. /auth/instagram) where the token
+ * arrives as a query param and the verifyToken middleware can't run off the
+ * Authorization header.
+ *
+ * @returns {Promise<{ user_id: string, email: string|null } | null>} null if invalid.
+ */
+async function resolveUserFromToken(token) {
+  if (!token) return null;
+
+  // ── Supabase JWT ──
+  if (looksLikeSupabaseToken(token)) {
+    try {
+      const { data: { user }, error } = await _supabaseForAuth.auth.getUser(token);
+      if (error || !user) return null;
+
+      const { data: dbUser } = await _supabaseForAuth
+        .from('users')
+        .select('id')
+        .eq('email', user.email)
+        .maybeSingle();
+
+      return { user_id: dbUser?.id ?? user.id, email: user.email };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Legacy custom JWT ──
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    return { user_id: decoded.user_id, email: decoded.email ?? null };
+  } catch {
+    return null;
+  }
+}
+
+module.exports = { verifyToken, resolveUserFromToken };
