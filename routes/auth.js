@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const supabase = require('../lib/supabase');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, resolveUserFromToken } = require('../middleware/auth');
 const { syncTokenToIntegrations } = require('../src/services/metaTokenService');
 
 const crypto = require('crypto');
@@ -471,7 +471,7 @@ const INSTAGRAM_GRAPH_BASE = 'https://graph.instagram.com';
  * Redirects the user to Instagram OAuth authorization.
  * Expects ?brand_id=xxx as a query param so we know which brand to update on callback.
  */
-router.get('/instagram', (req, res) => {
+router.get('/instagram', async (req, res) => {
   try {
     const brandId = req.query.brand_id;
     const token = req.query.token;
@@ -480,18 +480,17 @@ router.get('/instagram', (req, res) => {
       return res.redirect(`${FRONTEND_DASHBOARD_URL}/dashboard?error=instagram_failed`);
     }
 
-    // Verify the JWT manually (browser redirects can't send Authorization headers)
-    let decoded;
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch {
+    // Verify the token manually (browser redirects can't send Authorization headers).
+    // Supports both Supabase Auth JWTs (new accounts) and legacy custom JWTs.
+    const authedUser = await resolveUserFromToken(token);
+    if (!authedUser) {
       return res.redirect(`${FRONTEND_DASHBOARD_URL}/dashboard?error=instagram_failed`);
     }
 
     // Encode brand_id + user_id in the state param so the callback knows which brand to update
     const state = Buffer.from(JSON.stringify({
       brand_id: brandId,
-      user_id: decoded.user_id
+      user_id: authedUser.user_id
     })).toString('base64');
 
     const scopes = [
