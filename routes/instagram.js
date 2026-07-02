@@ -1760,32 +1760,55 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
 
         if (validGuides.length > 0) {
           const msgLower = (finalMessage || '').toLowerCase();
+          // Single-word keywords match on word boundaries so "size" doesn't fire inside
+          // unrelated words ("outfit"); multi-word phrases still use substring matching.
+          // Split on non-letter/number chars so trailing punctuation ("size?") still tokenizes.
+          const msgWords = msgLower.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
           const sizeKeywords = ['size', 'sizing', 'fit', 'fits', 'chart', 'measurement', 'measure',
-            'length', 'chest', 'waist', 'hips', 'shoulder', 'مقاس', 'مقاسات', 'قياس', 'قياسات', 'طول'];
-          const isSizeQuestion = sizeKeywords.some(kw => msgLower.includes(kw));
+            'length', 'chest', 'waist', 'hips', 'shoulder', 'مقاس', 'مقاسات', 'قياس', 'قياسات', 'طول',
+            'size chart', 'size guide'];
+          const isSizeQuestion = sizeKeywords.some(kw =>
+            kw.includes(' ') ? msgLower.includes(kw) : msgWords.includes(kw)
+          );
           console.log(`📏 isSizeQuestion: ${isSizeQuestion} (message: "${finalMessage}")`);
 
           if (isSizeQuestion) {
-            // Match by any product name in the customer message, fall back to all guides
-            let guidesToSend = validGuides;
-            if (validGuides.length > 1) {
-              const matched = validGuides.filter(g => {
-                const names = Array.isArray(g.product_names) && g.product_names.length > 0
-                  ? g.product_names
-                  : (g.product_name ? [g.product_name] : []);
-                return names.some(n => msgLower.includes(n.toLowerCase()));
-              });
-              if (matched.length > 0) guidesToSend = matched;
+            // A size chart only makes sense for a SPECIFIC product. Identify which product the
+            // customer means — named in their current message, or already under discussion. If we
+            // can't tie the size question to a product, DON'T send a chart; Luna asks which one.
+            const guidesMatching = (haystack) => validGuides.filter(g => {
+              const names = Array.isArray(g.product_names) && g.product_names.length > 0
+                ? g.product_names
+                : (g.product_name ? [g.product_name] : []);
+              return names.some(n => n && haystack.includes(n.toLowerCase()));
+            });
+
+            // 1) Product named in the customer's current message
+            let guidesToSend = guidesMatching(msgLower);
+
+            // 2) Otherwise, a product already discussed in this conversation
+            if (guidesToSend.length === 0) {
+              const discussedNames = (metadata.discussed_products || [])
+                .map(p => (p.name || '').toLowerCase())
+                .filter(Boolean)
+                .join(' | ');
+              if (discussedNames) {
+                guidesToSend = guidesMatching(discussedNames);
+              }
             }
 
-            for (const guide of guidesToSend) {
-              try {
-                console.log(`📏 Sending size chart image: ${guide.image_url}`);
-                await sendImageDM(senderId, guide.image_url, access_token);
-                console.log(`📏 Sent size chart for "${guide.product_name}" to ${senderId}`);
-              } catch (imgErr) {
-                console.error(`❌ Failed to send size chart image: ${imgErr.message}`);
+            if (guidesToSend.length > 0) {
+              for (const guide of guidesToSend) {
+                try {
+                  console.log(`📏 Sending size chart image: ${guide.image_url}`);
+                  await sendImageDM(senderId, guide.image_url, access_token);
+                  console.log(`📏 Sent size chart for "${guide.product_name}" to ${senderId}`);
+                } catch (imgErr) {
+                  console.error(`❌ Failed to send size chart image: ${imgErr.message}`);
+                }
               }
+            } else {
+              console.log(`📏 Size intent but no specific product identified — skipping auto-send (Luna will ask which product)`);
             }
           }
         } else {
