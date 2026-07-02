@@ -11,6 +11,8 @@ const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
 const { shopifyGraphQL, getValidAccessToken, getShopifyOrderByNumber, SHOPIFY_API_VERSION } = require('../lib/shopify');
 const { runStepDetector, postAiReplyTransition, postValidationTransition } = require('../lib/flow-detector');
+const { downloadImageAsBase64, describeImageForSearch, embedText } = require('../lib/embeddings');
+const { garmentTypePenalty } = require('../lib/garment-vocab');
 
 // Initialize OpenAI client for image similarity search
 const openai = new OpenAI({
@@ -58,67 +60,37 @@ const BATCH_WAIT_MS = parseInt(process.env.MESSAGE_BATCH_WAIT_MS || '10000', 10)
  */
 async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
   try {
-    // Download and encode customer's image as base64
-    const response = await fetch(imageUrl);
-    if (!response.ok) throw new Error(`Failed to download image: ${response.status}`);
-
-    const buffer = await response.arrayBuffer();
-    const base64 = Buffer.from(buffer).toString('base64');
-    const contentType = response.headers.get('content-type') || 'image/jpeg';
-
-    // Generate description of customer's image using GPT-4o vision
-    // Use detail: 'auto' (not 'low') so GPT-4o can pick up subtle features
-    // from customer photos which are often lower quality or different angles
-    const visionResponse = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 150,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: 'Describe this clothing/product image in 2-3 sentences focusing on: type of item, colors, style, distinctive visual features.'
-          },
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:${contentType};base64,${base64}`,
-              detail: 'auto'
-            }
-          }
-        ]
-      }]
-    });
-
-    const queryDescription = visionResponse.choices[0].message.content;
-    console.log(`🔍 Customer image described as: ${queryDescription}`);
+    // Describe the customer's image with the SAME structured vision prompt and
+    // schema used when indexing product images (lib/embeddings.js), so both
+    // sides produce embeddings in the same vector space.
+    const image = await downloadImageAsBase64(imageUrl);
+    const described = await describeImageForSearch(image);
+    const queryDescription = described.summary;
+    const queryType = described.garmentType;
+    console.log(`🔍 Customer image described as: ${described.embeddingText}`);
+    console.log(`👕 Query garment type: ${queryType || 'unknown'}`);
 
     logUsage({
       brandId,
       conversationId,
       messageType: 'image',
       model: 'gpt-4o',
-      promptTokens: visionResponse.usage?.prompt_tokens ?? 0,
-      completionTokens: visionResponse.usage?.completion_tokens ?? 0,
-      totalTokens: visionResponse.usage?.total_tokens ?? 0
+      promptTokens: described.usage?.prompt_tokens ?? 0,
+      completionTokens: described.usage?.completion_tokens ?? 0,
+      totalTokens: described.usage?.total_tokens ?? 0
     });
 
-    // Generate embedding from description only — matches the format used for
-    // stored product embeddings (description-only, no product name prefix).
-    const embeddingResponse = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: queryDescription
-    });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
+    // Embed the canonical attribute string — same format as stored product embeddings
+    const queryEmbedding = await embedText(described.embeddingText);
 
-    // Search for similar products using pgvector
-    // Use a higher threshold (0.5) to avoid weak matches being presented as real results
-    // Fetch more candidates (5) so we can filter client-side
+    // Search for similar products using pgvector.
+    // Fetch a wide candidate pool with a low raw threshold — the real ranking
+    // happens client-side after applying the garment-type penalty.
     const { data: rawMatches, error } = await supabase.rpc('match_products_by_embedding', {
       query_embedding: queryEmbedding,
       match_brand_id: brandId,
-      match_threshold: 0.35,
-      match_count: 5
+      match_threshold: 0.3,
+      match_count: 10
     });
 
     if (error) {
@@ -126,11 +98,19 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
       return { matches: [], queryDescription };
     }
 
-    // Sort strictly by similarity score (ignore the SQL's in_stock-first ordering)
-    // Threshold 0.42 balances catching legitimate matches (different angles/lighting)
-    // while still filtering out clearly wrong products
-    const SIMILARITY_THRESHOLD = 0.42;
+    // Two-stage ranking:
+    // 1) cosine similarity from pgvector (visual/attribute closeness)
+    // 2) soft garment-type penalty — a polo must not beat a tank top for a
+    //    tank-top query just because the colors/texture align. Soft (not a
+    //    hard filter) so one mislabeled type can't hide a genuinely good match.
+    // Threshold applies to the ADJUSTED score. Env-tunable for re-calibration
+    // after the catalog is re-indexed under the structured description scheme.
+    const SIMILARITY_THRESHOLD = parseFloat(process.env.IMAGE_MATCH_THRESHOLD || '0.45');
     const matches = (rawMatches || [])
+      .map(m => {
+        const penalty = garmentTypePenalty(queryType, m.garment_type || null);
+        return { ...m, raw_similarity: m.similarity, similarity: m.similarity - penalty };
+      })
       .sort((a, b) => b.similarity - a.similarity)
       .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
       .slice(0, 3);
@@ -139,7 +119,10 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
     console.log(`🎯 Found ${matches.length} confident matches above ${SIMILARITY_THRESHOLD} (best: ${best})`);
     if (matches.length > 0) {
       matches.forEach(m => {
-        console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
+        const penaltyNote = m.raw_similarity !== m.similarity
+          ? ` (raw: ${(m.raw_similarity * 100).toFixed(1)}%, type mismatch: ${m.garment_type || '?'} vs ${queryType})`
+          : '';
+        console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}%${penaltyNote} | type: ${m.garment_type || 'unknown'} | in_stock: ${m.in_stock}`);
       });
     }
     return { matches, queryDescription };
