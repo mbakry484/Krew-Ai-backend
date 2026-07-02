@@ -40,10 +40,15 @@ async function uploadImageToStorage(imageUrl, brandId) {
   }
 }
 
-// Pending image buffer: holds images waiting for a follow-up text message
-// Key: senderId, Value: { messaging, recipientId, timer }
-const pendingImages = new Map();
-const IMAGE_WAIT_MS = 15000;
+// Message batching (debounce): customers often send several messages in a burst
+// (follow-up texts, voice notes, images — e.g. a question whose image loads a
+// moment after the text). Instead of replying to each message individually,
+// buffer them per sender and reset a cooldown timer on every new message. When
+// the customer goes quiet for BATCH_WAIT_MS, the whole batch is processed as
+// ONE combined message so Luna answers with full context.
+// Key: senderId, Value: { events: [messaging...], recipientId, timer }
+const messageBuffers = new Map();
+const BATCH_WAIT_MS = parseInt(process.env.MESSAGE_BATCH_WAIT_MS || '10000', 10);
 
 /**
  * Find products similar to a customer's image using vector similarity search
@@ -315,47 +320,25 @@ router.post('/', async (req, res) => {
         const logMessage = customerMessage || (effectiveImageUrl ? '[Image]' : (storyReply ? '[Story Reply]' : '[Voice Note]'));
         console.log(`📨 ${senderId}: "${logMessage}"`);
 
-        // IMAGE WAIT LOGIC:
-        // If this is a pure image (no text), buffer it and wait IMAGE_WAIT_MS for a follow-up text.
-        // If a text message arrives while an image is pending, combine them and process together.
-        const isImageOnly = effectiveImageUrl && !customerMessage && !audioUrl && !storyReply;
-        const hasPendingImage = pendingImages.has(senderId);
-
-        if (isImageOnly) {
-          // Cancel any existing pending image for this sender (replace with latest)
-          if (hasPendingImage) {
-            clearTimeout(pendingImages.get(senderId).timer);
-          }
-          console.log(`⏳ Image received from ${senderId} — waiting ${IMAGE_WAIT_MS / 1000}s for follow-up text`);
-          const timer = setTimeout(async () => {
-            pendingImages.delete(senderId);
-            console.log(`⏰ No follow-up received — processing image alone for ${senderId}`);
-            await handleIncomingMessage(messaging, recipientId);
-          }, IMAGE_WAIT_MS);
-          pendingImages.set(senderId, { messaging, recipientId, timer });
-          continue; // Don't process yet
-        }
-
-        if (customerMessage && hasPendingImage) {
-          // Text arrived while an image was pending — combine them
-          const pending = pendingImages.get(senderId);
-          clearTimeout(pending.timer);
-          pendingImages.delete(senderId);
-          console.log(`✅ Follow-up text received — combining with pending image for ${senderId}`);
-          // Merge the text into the pending image messaging event
-          const combinedMessaging = {
-            ...pending.messaging,
-            message: {
-              ...pending.messaging.message,
-              text: customerMessage
-            }
-          };
-          await handleIncomingMessage(combinedMessaging, pending.recipientId);
-          continue;
-        }
-
-        // Normal message (text, audio, story — no pending image involved)
-        await handleIncomingMessage(messaging, recipientId);
+        // MESSAGE BATCHING (debounce):
+        // Buffer this event and (re)start the sender's cooldown timer. Any
+        // follow-up message within BATCH_WAIT_MS joins the same batch and
+        // resets the timer, so a burst of texts/voice notes/images gets ONE
+        // combined reply — and an image that loads after its accompanying
+        // text still lands in the same batch.
+        const buffer = messageBuffers.get(senderId) || { events: [], recipientId };
+        if (buffer.timer) clearTimeout(buffer.timer);
+        buffer.events.push(messaging);
+        buffer.recipientId = recipientId;
+        buffer.timer = setTimeout(() => {
+          messageBuffers.delete(senderId);
+          console.log(`⏰ Batch window closed for ${senderId} — processing ${buffer.events.length} message(s)`);
+          handleIncomingMessage(buffer.events, buffer.recipientId).catch(err =>
+            console.error(`❌ Batch processing error: ${err.message}`)
+          );
+        }, BATCH_WAIT_MS);
+        messageBuffers.set(senderId, buffer);
+        console.log(`⏳ Batched message ${buffer.events.length} from ${senderId} — waiting ${BATCH_WAIT_MS / 1000}s for follow-ups`);
       }
     }
   } catch (error) {
@@ -366,59 +349,85 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * Handle an incoming Instagram DM
- * NOTE: This function only receives validated messages with actual content
+ * Handle a batch of incoming Instagram DMs from one sender.
+ * Receives every message collected during the batching window (text, voice
+ * notes, images, story replies, shared posts) and produces ONE combined reply,
+ * preserving the order the customer sent things in.
  */
-async function handleIncomingMessage(messagingEvent, recipientId) {
-  const senderId = messagingEvent.sender.id;
-  let customerMessage = messagingEvent.message?.text;
-  const messageId = messagingEvent.message.mid;
+async function handleIncomingMessage(messagingEvents, recipientId) {
+  const events = Array.isArray(messagingEvents) ? messagingEvents : [messagingEvents];
+  const senderId = events[0].sender.id;
+  const messageId = events[events.length - 1].message?.mid;
 
-  // Detect attachments (image, audio, and shared posts)
-  const attachments = messagingEvent.message?.attachments || [];
-  const imageAttachment = attachments.find(a => a.type === 'image');
-  const imageUrl = imageAttachment?.payload?.url || null;
-  const audioAttachment = attachments.find(a => a.type === 'audio');
-  const audioUrl = audioAttachment?.payload?.url || null;
+  // Decompose the batch into ordered content parts so the combined message
+  // keeps its sequence (e.g. "do you have this?" followed by the image).
+  // Each part: { kind: 'text'|'audio'|'image', text, url }
+  // Voice-note parts get their text filled in after transcription (which runs
+  // later, once products are fetched, so Whisper can be primed with product names).
+  const parts = [];
+  const imageUrls = []; // direct image attachments only (for vector search)
+  let storyReply = null;
+  let sharedPost = null;
 
-  // Detect shared Instagram posts (template type)
-  // Shared posts are the brand's own content — treat them like story replies (context analysis),
-  // NOT like a customer's product search image (vector search). Keep effectiveImageUrl for
-  // direct image attachments only.
-  const templateAttachment = attachments.find(a => a.type === 'template');
-  const sharedPostImageUrl = templateAttachment?.payload?.elements?.[0]?.image_url
-    || templateAttachment?.payload?.elements?.[0]?.url
-    || null;
-  const sharedPostTitle = templateAttachment?.payload?.elements?.[0]?.title || null;
-  const sharedPostSubtitle = templateAttachment?.payload?.elements?.[0]?.subtitle || null;
+  for (const ev of events) {
+    const msg = ev.message || {};
+    const atts = msg.attachments || [];
 
-  // effectiveImageUrl = only direct image attachments (for vector search)
-  const effectiveImageUrl = imageUrl || null;
+    // Detect story replies
+    if (msg.reply_to?.story) storyReply = msg.reply_to.story;
 
-  if (sharedPostImageUrl) {
-    console.log(`📤 Customer shared a brand post: "${sharedPostTitle || 'no title'}"`);
+    // Detect shared Instagram posts (template type)
+    // Shared posts are the brand's own content — treat them like story replies
+    // (context analysis), NOT like a customer's product search image (vector search).
+    const template = atts.find(a => a.type === 'template');
+    if (template) {
+      const el = template.payload?.elements?.[0] || {};
+      sharedPost = {
+        imageUrl: el.image_url || el.url || null,
+        title: el.title || null,
+        subtitle: el.subtitle || null
+      };
+    }
+
+    if (msg.text) parts.push({ kind: 'text', text: msg.text, url: null });
+
+    for (const att of atts) {
+      if (att.type === 'image' && att.payload?.url) {
+        parts.push({ kind: 'image', text: null, url: att.payload.url });
+        imageUrls.push(att.payload.url);
+      } else if (att.type === 'audio' && att.payload?.url) {
+        parts.push({ kind: 'audio', text: null, url: att.payload.url });
+      }
+    }
   }
 
-  // Detect story replies
-  const storyReply = messagingEvent.message?.reply_to?.story || null;
+  const hasAudio = parts.some(p => p.kind === 'audio');
+  const sharedPostImageUrl = sharedPost?.imageUrl || null;
+  const sharedPostTitle = sharedPost?.title || null;
+  const sharedPostSubtitle = sharedPost?.subtitle || null;
   const storyImageUrl = storyReply?.url || null;
   const storyId = storyReply?.id || null;
 
+  if (events.length > 1) {
+    console.log(`📦 Processing batch of ${events.length} messages from ${senderId}`);
+  }
+  if (sharedPostImageUrl) {
+    console.log(`📤 Customer shared a brand post: "${sharedPostTitle || 'no title'}"`);
+  }
   if (storyReply) {
     console.log(`📖 Customer replied to story: ${storyId}`);
   }
 
-  // Guard: ignore events with no content
-  if (!customerMessage && !effectiveImageUrl && !audioUrl && !storyReply && !sharedPostImageUrl) {
+  // Guard: ignore batches with no content
+  if (parts.length === 0 && !storyReply && !sharedPostImageUrl) {
     console.log(`ℹ️  Ignoring event with no content from ${senderId}`);
     return;
   }
 
-  // Handle voice notes - transcription happens later after products are fetched
-  // so we can prime Whisper with product name vocabulary for better accuracy
-  let finalMessage = customerMessage;
-
-  // If story reply with no text, set a default message
+  // Combined customer message: all text + transcribed voice parts, in order.
+  // Built for real after transcription; story-reply default applied there too.
+  const buildFinalMessage = () => parts.map(p => p.text).filter(Boolean).join('\n');
+  let finalMessage = buildFinalMessage();
   if (!finalMessage && storyReply && !sharedPostImageUrl) {
     finalMessage = 'The customer replied to your story without adding text.';
   }
@@ -564,25 +573,38 @@ Do not invent product names. Only match against the listed products above.`
       }
     }
 
-    // Transcribe voice note now that we have product names to prime Whisper
+    // Transcribe voice notes now that we have product names to prime Whisper
     let whisperDurationSeconds = 0;
-    if (audioUrl) {
-      console.log('🎤 Voice note received, transcribing...');
+    const audioParts = parts.filter(p => p.kind === 'audio');
+    if (audioParts.length > 0) {
+      console.log(`🎤 ${audioParts.length} voice note(s) received, transcribing...`);
       const productNames = (products || []).map(p => p.name).join(', ');
       const whisperPrompt = productNames
         ? `Customer service conversation. Brand products: ${productNames}.`
         : 'Customer service conversation.';
-      const { text: transcribed, durationSeconds } = await transcribeAudio(audioUrl, whisperPrompt);
-      whisperDurationSeconds = durationSeconds;
-      if (transcribed) {
-        finalMessage = transcribed;
-        console.log(`✅ Transcription: "${transcribed}"`);
-      } else {
-        // Transcription failed — reply directly and skip AI
+      for (const part of audioParts) {
+        const { text: transcribed, durationSeconds } = await transcribeAudio(part.url, whisperPrompt);
+        whisperDurationSeconds += durationSeconds;
+        if (transcribed) {
+          part.text = transcribed;
+          console.log(`✅ Transcription: "${transcribed}"`);
+        }
+      }
+
+      // If the batch had NO other usable content and every transcription failed,
+      // reply directly and skip AI
+      const hasUsableContent = parts.some(p => p.text) || imageUrls.length > 0 || storyReply || sharedPostImageUrl;
+      if (!hasUsableContent) {
         console.log('⚠️  Transcription failed, sending fallback reply');
         const fallback = "Sorry, I couldn't catch that voice note! Could you type it out for me? 😊";
         await sendDM(senderId, fallback, access_token);
         return;
+      }
+
+      // Rebuild the combined message now that transcripts are in place
+      finalMessage = buildFinalMessage();
+      if (!finalMessage && storyReply && !sharedPostImageUrl) {
+        finalMessage = 'The customer replied to your story without adding text.';
       }
     }
 
@@ -642,14 +664,48 @@ Do not invent product names. Only match against the listed products above.`
       }
     }
 
-    // Upload customer image to Supabase Storage for a permanent URL
-    let storedImageUrl = null;
-    if (effectiveImageUrl) {
-      storedImageUrl = await uploadImageToStorage(effectiveImageUrl, brand_id);
+    // Upload customer images to Supabase Storage for permanent URLs
+    const storedImageUrls = [];
+    for (const url of imageUrls) {
+      storedImageUrls.push(await uploadImageToStorage(url, brand_id));
     }
 
+    // Build one message row per content part so the dashboard shows the
+    // conversation exactly as the customer sent it (texts, transcripts, images)
+    const buildCustomerMessageRows = () => {
+      const rows = [];
+      let imgIdx = 0;
+      for (const part of parts) {
+        if (part.kind === 'image') {
+          rows.push({
+            conversation_id: conversation.id,
+            sender: 'customer',
+            content: null,
+            image_url: storedImageUrls[imgIdx++] || part.url
+          });
+        } else if (part.text) {
+          rows.push({
+            conversation_id: conversation.id,
+            sender: 'customer',
+            content: part.text,
+            image_url: null
+          });
+        }
+      }
+      if (rows.length === 0) {
+        rows.push({
+          conversation_id: conversation.id,
+          sender: 'customer',
+          content: finalMessage || null,
+          image_url: null
+        });
+      }
+      rows[0].platform_message_id = messageId;
+      return rows;
+    };
+
     // Log Whisper usage now that we have a conversation ID
-    if (audioUrl && whisperDurationSeconds >= 0) {
+    if (audioParts.length > 0) {
       logUsage({
         brandId: brand_id,
         conversationId: conversation.id,
@@ -681,8 +737,9 @@ Do not invent product names. Only match against the listed products above.`
         customer_name: profile.name,
         customer_username: profile.username,
         channel: 'instagram',
-        has_image: !!effectiveImageUrl,
-        has_audio: !!audioUrl,
+        has_image: imageUrls.length > 0,
+        has_audio: hasAudio,
+        batch_size: events.length,
         metadata_state: JSON.stringify(metadata)
       },
       tags: ['luna', 'instagram', brand_id]
@@ -694,8 +751,9 @@ Do not invent product names. Only match against the listed products above.`
       input: finalMessage || '[Image/Audio]',
       metadata: {
         sender_id: senderId,
-        has_image: !!effectiveImageUrl,
-        has_audio: !!audioUrl
+        has_image: imageUrls.length > 0,
+        has_audio: hasAudio,
+        batch_size: events.length
       }
     });
 
@@ -709,16 +767,10 @@ Do not invent product names. Only match against the listed products above.`
     if (brandSettings && brandSettings.luna_global_enabled === false) {
       console.log(`⏸️ Luna is globally disabled for brand ${brand_id} - AI will not respond`);
 
-      // Still save the incoming message for the team to see
+      // Still save the incoming messages for the team to see
       await supabase
         .from('messages')
-        .insert([{
-          conversation_id: conversation.id,
-          sender: 'customer',
-          content: finalMessage || null,
-          platform_message_id: messageId,
-          image_url: storedImageUrl,
-        }]);
+        .insert(buildCustomerMessageRows());
 
       return;
     }
@@ -728,18 +780,11 @@ Do not invent product names. Only match against the listed products above.`
       console.log(`🚨 Conversation is escalated (type: ${conversation.escalation_type}) - AI will not respond`);
       console.log(`   Reason: ${conversation.escalation_reason}`);
 
-      // Still save the incoming message for the team to see
-      const { data: escalatedMsg } = await supabase
+      // Still save the incoming messages for the team to see
+      const { data: escalatedMsgs } = await supabase
         .from('messages')
-        .insert([{
-          conversation_id: conversation.id,
-          sender: 'customer',
-          content: finalMessage || null,
-          platform_message_id: messageId,
-          image_url: storedImageUrl,
-        }])
-        .select('id')
-        .single();
+        .insert(buildCustomerMessageRows())
+        .select('id');
 
       // Track interaction (fire-and-forget)
       trackInteraction({
@@ -747,7 +792,7 @@ Do not invent product names. Only match against the listed products above.`
         conversationId: conversation.id,
         customerId: senderId,
         customerUsername: conversation.customer_username,
-        messageId: escalatedMsg?.id,
+        messageId: escalatedMsgs?.[escalatedMsgs.length - 1]?.id,
         isEscalated: true,
       });
 
@@ -766,18 +811,11 @@ Do not invent product names. Only match against the listed products above.`
       .order('created_at', { ascending: true })
       .limit(20);
 
-    // 8. Save incoming message
-    const { data: savedMsg } = await supabase
+    // 8. Save incoming messages (one row per content part, in order)
+    const { data: savedMsgs } = await supabase
       .from('messages')
-      .insert([{
-        conversation_id: conversation.id,
-        sender: 'customer',
-        content: finalMessage || null,
-        platform_message_id: messageId,
-        image_url: storedImageUrl,
-      }])
-      .select('id')
-      .single();
+      .insert(buildCustomerMessageRows())
+      .select('id');
 
     // Track interaction (fire-and-forget)
     trackInteraction({
@@ -785,7 +823,7 @@ Do not invent product names. Only match against the listed products above.`
       conversationId: conversation.id,
       customerId: senderId,
       customerUsername: conversation.customer_username,
-      messageId: savedMsg?.id,
+      messageId: savedMsgs?.[savedMsgs.length - 1]?.id,
     });
 
     // 9. Map conversation history to OpenAI format
@@ -825,10 +863,26 @@ Do not invent product names. Only match against the listed products above.`
     // 11. Generate AI reply
     let aiReply;
 
-    if (effectiveImageUrl) {
+    if (imageUrls.length > 0) {
       // IMAGE FLOW: Use vector similarity search to find matching products
-      console.log('📸 Processing customer image with vector search...');
-      const { matches, queryDescription } = await findSimilarProducts(effectiveImageUrl, brand_id, conversation.id);
+      // Cap the number of images per batch to keep vision costs bounded
+      const searchImageUrls = imageUrls.slice(0, 3);
+      console.log(`📸 Processing ${searchImageUrls.length} customer image(s) with vector search...`);
+      let matches = [];
+      const queryDescriptions = [];
+      for (const url of searchImageUrls) {
+        const result = await findSimilarProducts(url, brand_id, conversation.id);
+        matches.push(...(result.matches || []));
+        if (result.queryDescription) queryDescriptions.push(result.queryDescription);
+      }
+      // Dedupe matches across images by product name, keeping the strongest
+      const matchByName = new Map();
+      for (const m of matches) {
+        const prev = matchByName.get(m.name);
+        if (!prev || m.similarity > prev.similarity) matchByName.set(m.name, m);
+      }
+      matches = [...matchByName.values()].sort((a, b) => b.similarity - a.similarity).slice(0, 4);
+      const queryDescription = queryDescriptions.join(' | ') || null;
 
       // Build the base system prompt using the optimized prompt builder
       const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
@@ -867,11 +921,11 @@ Do not invent product names. Only match against the listed products above.`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 IMAGE SEARCH RESULTS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The customer sent an image. Based on visual similarity search, these are the most likely matching products:
+The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Based on visual similarity search, these are the most likely matching products:
 
 ${matchList}
 
-Customer's image looks like: ${queryDescription}
+Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${queryDescription}
 
 ⛔ STRICT RULES FOR IMAGE MATCHES:
 - IN STOCK ✅: confirm the product name, state price and availability, ask if they want to order
@@ -883,22 +937,30 @@ Customer's image looks like: ${queryDescription}
         ? `${baseSystemPrompt}${imageSearchSection}`
         : baseSystemPrompt;
 
-      // Download image and send to vision model
+      // Download images and send to vision model (all images in the batch)
       let imageUserContent;
-      try {
-        const imgResponse = await fetch(effectiveImageUrl);
-        if (!imgResponse.ok) throw new Error(`Failed to download: ${imgResponse.status}`);
-        const imgBuffer = await imgResponse.arrayBuffer();
-        const imgBase64 = Buffer.from(imgBuffer).toString('base64');
-        const imgContentType = imgResponse.headers.get('content-type') || 'image/jpeg';
-        imageUserContent = [
-          { type: 'text', text: finalMessage || 'Do you have this product?' },
-          { type: 'image_url', image_url: { url: `data:${imgContentType};base64,${imgBase64}`, detail: 'low' } }
-        ];
-      } catch (imgErr) {
-        console.error('❌ Failed to attach image to vision request:', imgErr.message);
-        imageUserContent = finalMessage || 'The customer sent an image about a product.';
+      const imageContents = [];
+      for (const url of searchImageUrls) {
+        try {
+          const imgResponse = await fetch(url);
+          if (!imgResponse.ok) throw new Error(`Failed to download: ${imgResponse.status}`);
+          const imgBuffer = await imgResponse.arrayBuffer();
+          const imgBase64 = Buffer.from(imgBuffer).toString('base64');
+          const imgContentType = imgResponse.headers.get('content-type') || 'image/jpeg';
+          imageContents.push({
+            type: 'image_url',
+            image_url: { url: `data:${imgContentType};base64,${imgBase64}`, detail: 'low' }
+          });
+        } catch (imgErr) {
+          console.error('❌ Failed to attach image to vision request:', imgErr.message);
+        }
       }
+      imageUserContent = imageContents.length > 0
+        ? [
+            { type: 'text', text: finalMessage || 'Do you have this product?' },
+            ...imageContents
+          ]
+        : (finalMessage || 'The customer sent an image about a product.');
 
       const imageMessages = [
         { role: 'system', content: imageSystemPrompt },
