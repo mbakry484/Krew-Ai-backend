@@ -114,11 +114,13 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
       totalTokens: visionResponse.usage?.total_tokens ?? 0
     });
 
-    // Split into one description per garment; fall back to the whole text
+    // Split into one description per garment; fall back to the whole text.
+    // Each block runs from an "ITEM:" marker to the next one, so details the
+    // model puts on following lines (colors, texture) are kept, not dropped.
     let itemDescriptions = queryDescription
-      .split('\n')
-      .filter(line => /^\s*(?:[-*\d.]+\s*)?ITEM:/i.test(line))
-      .map(line => line.replace(/^\s*(?:[-*\d.]+\s*)?ITEM:\s*/i, '').trim())
+      .split(/(?:^|\n)\s*(?:[-*\d.]+\s*)?ITEM:\s*/i)
+      .slice(1)
+      .map(block => block.replace(/\s+/g, ' ').trim())
       .filter(Boolean)
       .slice(0, 3);
     if (itemDescriptions.length === 0) itemDescriptions = [queryDescription];
@@ -231,19 +233,26 @@ async function verifyImageMatches(customerImages, candidates, brandId, conversat
   if (customerImages.length === 0 || verifiable.length === 0) return fallback();
 
   try {
+    // Interleave a text label directly before every image — with 10+ images
+    // in one request, GPT-4o loses track of which numbered image is which
+    // and misattributes verdicts unless each image is explicitly labeled.
     const content = [
       {
         type: 'text',
-        text: `The first ${customerImages.length} image(s) are photos a customer sent to a clothing store asking about availability. The following ${verifiable.length} numbered image(s) are catalog photos of candidate products, in this order:\n${verifiable.map((c, i) => `${i + 1}. ${c.name}`).join('\n')}\n\nFor EACH candidate, compare it against the garment(s) in the customer's photo(s) and give a verdict:\n- "exact": the SAME product as a garment in the customer's photo — same garment type, same pattern AND same colorway (differences in lighting, angle or model are fine)\n- "similar": same garment type and clearly similar style, but a different colorway or pattern — close enough to offer as an alternative\n- "different": a different type of garment, or not a close alternative\n\nBe strict about "exact":\n- a polo shirt is never an exact match for a tank top; a striped item is never an exact match for a solid one\n- swapped or inverted colors are NOT exact: a black top with white trim is only "similar" to a white top with black trim\n- the main body color must be the same, not just a related shade\n\nFirst list every garment visible in the customer's photo(s) with its colors. Then judge each candidate against those garments — "exact" only if it matches one of them in type, pattern AND colors.\n\nRespond ONLY with JSON: {"customer_garments":["maroon ribbed tank top with white trim","..."],"results":[{"index":1,"verdict":"exact","reason":"matches garment 1: same maroon ribbed tank, white trim"}, ...]} with exactly one results entry per candidate.`
+        text: `You are verifying product matches for a clothing store. Below you will see ${customerImages.length} photo(s) a customer sent asking about availability, then ${verifiable.length} candidate product photos from the store's catalog. Every image is preceded by a label naming it.`
       },
-      ...customerImages.map(img => ({
-        type: 'image_url',
-        image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' }
-      })),
-      ...candidateImages.map(img => ({
-        type: 'image_url',
-        image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' }
-      }))
+      ...customerImages.flatMap((img, i) => [
+        { type: 'text', text: `CUSTOMER PHOTO ${i + 1}:` },
+        { type: 'image_url', image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' } }
+      ]),
+      ...verifiable.flatMap((c, i) => [
+        { type: 'text', text: `CANDIDATE ${i + 1}: ${c.name}` },
+        { type: 'image_url', image_url: { url: `data:${candidateImages[i].contentType};base64,${candidateImages[i].base64}`, detail: 'low' } }
+      ]),
+      {
+        type: 'text',
+        text: `First list every garment visible in the customer's photo(s) with its colors. Then give a verdict for EACH candidate by comparing its labeled photo against those garments:\n- "exact": the SAME product as a garment in the customer's photo — same garment type, same pattern AND same colorway (differences in lighting, angle or model are fine)\n- "similar": same garment type and clearly similar style, but a different colorway or pattern — close enough to offer as an alternative\n- "different": a different type of garment, or not a close alternative\n\nBe strict about "exact":\n- a polo shirt is never an exact match for a tank top; a striped item is never an exact match for a solid one\n- swapped or inverted colors are NOT exact: a black top with white trim is only "similar" to a white top with black trim\n- the main body color must be the same, not just a related shade\n\nRespond ONLY with JSON: {"customer_garments":["maroon ribbed tank top with white trim","..."],"results":[{"index":1,"verdict":"exact","reason":"matches garment 1: same maroon ribbed tank, white trim"}, ...]} with exactly one results entry per candidate, in candidate order.`
+      }
     ];
 
     const verifyResponse = await openai.chat.completions.create({
@@ -263,16 +272,29 @@ async function verifyImageMatches(customerImages, candidates, brandId, conversat
       totalTokens: verifyResponse.usage?.total_tokens ?? 0
     });
 
-    const parsed = JSON.parse(verifyResponse.choices[0].message.content);
+    // content can be null (refusal/filter) — JSON.parse('null') gives null
+    const rawContent = verifyResponse.choices[0].message.content;
+    const parsed = JSON.parse(rawContent || '{}') || {};
     const verdicts = Array.isArray(parsed.results) ? parsed.results : [];
+    if (verdicts.length === 0) {
+      console.error(`⚠️ Verifier returned no results array. Raw response: ${rawContent}`);
+      return fallback();
+    }
+    if (parsed.customer_garments) {
+      console.log(`👀 Verifier sees: ${JSON.stringify(parsed.customer_garments)}`);
+    }
 
     const matches = [];
     for (const v of verdicts) {
       const c = verifiable[v.index - 1];
       if (!c) continue;
-      if (v.verdict === 'exact' || v.verdict === 'similar') {
-        matches.push({ ...c, match_type: v.verdict });
-      }
+      // Normalize so "Exact" / "exact match" etc. still count
+      const verdict = String(v.verdict || '').toLowerCase();
+      const matchType = verdict.startsWith('exact') ? 'exact'
+        : verdict.startsWith('similar') ? 'similar'
+        : null;
+      console.log(`   • ${c.name} | verdict: ${verdict || '?'}${v.reason ? ` | ${v.reason}` : ''}`);
+      if (matchType) matches.push({ ...c, match_type: matchType });
     }
 
     matches.sort((a, b) => a.match_type === b.match_type
@@ -280,9 +302,6 @@ async function verifyImageMatches(customerImages, candidates, brandId, conversat
       : (a.match_type === 'exact' ? -1 : 1));
 
     console.log(`✅ Visual verification: ${matches.filter(m => m.match_type === 'exact').length} exact, ${matches.filter(m => m.match_type === 'similar').length} similar (of ${verifiable.length} candidates)`);
-    matches.forEach(m => {
-      console.log(`   • ${m.name} | verdict: ${m.match_type} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
-    });
     return matches.slice(0, 4);
 
   } catch (err) {
@@ -1038,6 +1057,24 @@ Do not invent product names. Only match against the listed products above.`
       // Precision stage: GPT-4o compares the customer's photo(s) against each
       // candidate's catalog photo — only visually confirmed products survive
       const matches = await verifyImageMatches(customerImages, candidates, brand_id, conversation.id);
+
+      // The search RPC doesn't return handle/online_store_url — fetch them so
+      // every presented match (in stock or not) can include its product link
+      if (matches.length > 0) {
+        const matchIds = matches.map(m => m.id).filter(Boolean);
+        const { data: linkRows } = await supabase
+          .from('products')
+          .select('id, handle, online_store_url')
+          .in('id', matchIds);
+        const linkById = new Map((linkRows || []).map(r => [r.id, r]));
+        for (const m of matches) {
+          const row = linkById.get(m.id);
+          if (row) {
+            m.handle = row.handle;
+            m.online_store_url = row.online_store_url;
+          }
+        }
+      }
 
       // Build the base system prompt using the optimized prompt builder
       const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
