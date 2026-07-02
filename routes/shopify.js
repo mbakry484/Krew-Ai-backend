@@ -49,6 +49,7 @@ router.post('/sync', async (req, res) => {
         name: product.name,
         handle: product.handle || null,
         online_store_url: product.online_store_url || null,
+        product_type: product.product_type || null,
         description: product.description || null,
         price: product.price || null,
         currency: product.currency || 'EGP',
@@ -145,6 +146,7 @@ router.post('/product-update', async (req, res) => {
         name: product.name,
         handle: product.handle || null,
         online_store_url: product.online_store_url || null,
+        product_type: product.product_type || null,
         description: product.description,
         price: product.price,
         currency: product.currency || 'EGP',
@@ -173,25 +175,32 @@ router.post('/product-update', async (req, res) => {
 
     // Only regenerate embedding if the product has an image and either:
     // 1. No embedding exists yet, or
-    // 2. The image_url changed (meaning the actual image was updated)
+    // 2. The image_url changed (meaning the actual image was updated), or
+    // 3. It was indexed under the old free-text scheme (no garment_type yet)
     if (product.image_url) {
       const { generateProductEmbedding } = require('../lib/embeddings');
 
       // Check if this product already has an embedding and what image_url was used
       const { data: existing } = await supabase
         .from('products')
-        .select('image_url, embedding')
+        .select('image_url, embedding, garment_type')
         .eq('shopify_product_id', product.shopify_product_id)
         .single();
 
-      const needsEmbedding = !existing?.embedding || existing?.image_url !== product.image_url;
+      const needsEmbedding = !existing?.embedding
+        || existing?.image_url !== product.image_url
+        || !existing?.garment_type;
 
       if (needsEmbedding) {
-        console.log(`🔄 Regenerating embedding for ${product.name} (${!existing?.embedding ? 'no embedding' : 'image changed'})`);
+        const reason = !existing?.embedding ? 'no embedding'
+          : existing?.image_url !== product.image_url ? 'image changed'
+          : 'old-format embedding';
+        console.log(`🔄 Regenerating embedding for ${product.name} (${reason})`);
         generateProductEmbedding({
           shopify_product_id: product.shopify_product_id,
           name: product.name,
-          image_url: product.image_url
+          image_url: product.image_url,
+          product_type: product.product_type || null
         }).catch(err =>
           console.error('❌ Background embedding error:', err.message)
         );

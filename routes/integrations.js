@@ -23,7 +23,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
-            id title handle description onlineStoreUrl
+            id title handle description onlineStoreUrl productType
             images(first: 20) { edges { node { url altText width height } } }
             variants(first: 10) { edges { node { id title price inventoryQuantity } } }
           }
@@ -108,6 +108,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
           name: node.title,
           handle: node.handle || null,
           online_store_url: node.onlineStoreUrl || null,
+          product_type: node.productType || null,
           description: node.description || null,
           price: parseFloat(variants[0]?.price || '0'),
           currency: 'EGP',
