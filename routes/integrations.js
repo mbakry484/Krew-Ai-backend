@@ -6,85 +6,151 @@ const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
 
-// Fetch all products from Shopify and upsert them into Supabase
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Page size per Shopify request. 50 keeps each request's query cost well under
+// Shopify's cost limit given the nested images/variants connections.
+const PRODUCT_PAGE_SIZE = 50;
+
+// Fetch ALL active products from Shopify (following pagination cursors) and
+// upsert them into Supabase page by page.
 async function autoSyncProducts({ shop, access_token, brand_id }) {
   console.log(`🔄 Auto-syncing products for ${shop}...`);
 
-  const response = await fetch(
-    `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': access_token,
-      },
-      body: JSON.stringify({
-        query: `{
-          products(first: 50, query: "status:active") {
-            edges {
-              node {
-                id title handle description onlineStoreUrl
-                images(first: 20) { edges { node { url altText width height } } }
-                variants(first: 10) { edges { node { id title price inventoryQuantity } } }
-              }
-            }
+  const query = `
+    query SyncProducts($first: Int!, $cursor: String) {
+      products(first: $first, after: $cursor, query: "status:active") {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id title handle description onlineStoreUrl
+            images(first: 20) { edges { node { url altText width height } } }
+            variants(first: 10) { edges { node { id title price inventoryQuantity } } }
           }
-        }`
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`❌ Shopify GraphQL ${response.status} response body:`, errorBody);
-    console.error(`❌ Token used (first 10 chars): ${access_token?.substring(0, 10)}...`);
-    console.error(`❌ URL called: https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
-    throw new Error(`Shopify GraphQL error: ${response.status}`);
-  }
-
-  const json = await response.json();
-  const products = json.data?.products?.edges || [];
-  if (products.length === 0) return;
+        }
+      }
+    }`;
 
   const syncedAt = new Date().toISOString();
+  let cursor = null;
+  let hasNextPage = true;
+  let page = 0;
+  let totalSynced = 0;
 
-  const productsToUpsert = products.map(({ node }) => {
-    const variants = node.variants.edges.map(e => e.node);
-    const inStock = variants.some(v => (v.inventoryQuantity ?? 0) > 0);
-    const images = node.images.edges.map(e => ({
-      url: e.node.url,
-      altText: e.node.altText || '',
-      width: e.node.width,
-      height: e.node.height,
-    })).filter(img => img.url);
+  while (hasNextPage) {
+    // Fetch one page, retrying when Shopify's cost-based rate limiter throttles us.
+    let json;
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetch(
+        `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': access_token,
+          },
+          body: JSON.stringify({
+            query,
+            variables: { first: PRODUCT_PAGE_SIZE, cursor },
+          }),
+        }
+      );
 
-    return {
-      user_id: brand_id,
-      brand_id,
-      shopify_product_id: node.id,
-      name: node.title,
-      handle: node.handle || null,
-      online_store_url: node.onlineStoreUrl || null,
-      description: node.description || null,
-      price: parseFloat(variants[0]?.price || '0'),
-      currency: 'EGP',
-      variants,
-      in_stock: inStock,
-      availability: inStock ? 'in_stock' : 'out_of_stock',
-      image_url: images[0]?.url || null,
-      images,
-      synced_at: syncedAt,
-      updated_at: syncedAt,
-    };
-  });
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error(`❌ Shopify GraphQL ${response.status} response body:`, errorBody);
+        console.error(`❌ Token used (first 10 chars): ${access_token?.substring(0, 10)}...`);
+        console.error(`❌ URL called: https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
+        throw new Error(`Shopify GraphQL error: ${response.status}`);
+      }
 
-  const { error } = await supabase
-    .from('products')
-    .upsert(productsToUpsert, { onConflict: 'shopify_product_id', ignoreDuplicates: false });
+      json = await response.json();
 
-  if (error) throw error;
+      // Throttling returns HTTP 200 with a THROTTLED error — back off and retry.
+      const throttled = json.errors?.some((e) => e.extensions?.code === 'THROTTLED');
+      if (throttled) {
+        const status = json.extensions?.cost?.throttleStatus;
+        const needed = json.extensions?.cost?.requestedQueryCost || 0;
+        const waitMs = status && status.restoreRate
+          ? Math.max(1000, ((needed - status.currentlyAvailable) / status.restoreRate) * 1000)
+          : 1000 * attempt;
+        console.warn(`⏳ Throttled by Shopify (attempt ${attempt}), waiting ${Math.round(waitMs)}ms…`);
+        await sleep(waitMs);
+        continue;
+      }
 
-  console.log(`✅ Auto-synced ${productsToUpsert.length} active products for brand ${brand_id}`);
+      if (json.errors?.length) {
+        console.error('❌ Shopify GraphQL errors:', JSON.stringify(json.errors));
+        throw new Error(`Shopify GraphQL error: ${json.errors[0]?.message || 'unknown'}`);
+      }
+
+      break;
+    }
+
+    const connection = json.data?.products;
+    const edges = connection?.edges || [];
+
+    if (edges.length > 0) {
+      const productsToUpsert = edges.map(({ node }) => {
+        const variants = node.variants.edges.map(e => e.node);
+        const inStock = variants.some(v => (v.inventoryQuantity ?? 0) > 0);
+        const images = node.images.edges.map(e => ({
+          url: e.node.url,
+          altText: e.node.altText || '',
+          width: e.node.width,
+          height: e.node.height,
+        })).filter(img => img.url);
+
+        return {
+          user_id: brand_id,
+          brand_id,
+          shopify_product_id: node.id,
+          name: node.title,
+          handle: node.handle || null,
+          online_store_url: node.onlineStoreUrl || null,
+          description: node.description || null,
+          price: parseFloat(variants[0]?.price || '0'),
+          currency: 'EGP',
+          variants,
+          in_stock: inStock,
+          availability: inStock ? 'in_stock' : 'out_of_stock',
+          image_url: images[0]?.url || null,
+          images,
+          synced_at: syncedAt,
+          updated_at: syncedAt,
+        };
+      });
+
+      const { error } = await supabase
+        .from('products')
+        .upsert(productsToUpsert, { onConflict: 'shopify_product_id', ignoreDuplicates: false });
+
+      if (error) throw error;
+
+      totalSynced += productsToUpsert.length;
+    }
+
+    page++;
+    hasNextPage = connection?.pageInfo?.hasNextPage || false;
+    cursor = connection?.pageInfo?.endCursor || null;
+    console.log(`  📦 Page ${page}: ${edges.length} products (total ${totalSynced}) for ${shop}`);
+
+    // Proactively wait if the cost budget is too low to afford the next page.
+    const cost = json.extensions?.cost;
+    if (hasNextPage && cost?.throttleStatus?.restoreRate) {
+      const { currentlyAvailable, restoreRate } = cost.throttleStatus;
+      const needed = cost.requestedQueryCost || 0;
+      if (currentlyAvailable < needed) {
+        const waitMs = ((needed - currentlyAvailable) / restoreRate) * 1000;
+        console.log(`  ⏸ Cost budget low (${currentlyAvailable}/${needed}), waiting ${Math.round(waitMs)}ms…`);
+        await sleep(waitMs);
+      }
+    }
+  }
+
+  if (totalSynced === 0) return;
+
+  console.log(`✅ Auto-synced ${totalSynced} active products for brand ${brand_id}`);
 
   // Generate embeddings in background
   generateEmbeddingsForBrand(brand_id).catch(err =>
@@ -339,6 +405,74 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Shopify link error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /integrations/shopify/resync
+ * Re-sync ALL products for the authenticated user's connected Shopify store.
+ * Follows Shopify's pagination cursors to pull the entire catalog — use this to
+ * backfill stores connected before full-catalog sync existed, or to force a refresh.
+ * Protected - requires JWT authentication. Runs the sync in the background and
+ * returns immediately; poll /webhook/shopify/sync-status for progress.
+ * Used by: Krew frontend dashboard
+ */
+router.post('/shopify/resync', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    // Look up the user's brand_id
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
+    const brandId = user.brand_id;
+
+    // Find the connected Shopify integration for this brand
+    const { data: integration, error: fetchError } = await supabase
+      .from('integrations')
+      .select('*')
+      .eq('brand_id', brandId)
+      .eq('platform', 'shopify')
+      .maybeSingle();
+
+    if (fetchError || !integration) {
+      return res.status(404).json({ error: 'No connected Shopify store found for this brand' });
+    }
+
+    // Get a valid access token, refreshing it first if it has expired
+    let accessToken;
+    try {
+      accessToken = await getValidAccessToken(integration);
+    } catch (err) {
+      console.error('Failed to get valid Shopify token for resync:', err.message);
+      return res.status(502).json({
+        error: 'Failed to authenticate with Shopify. Try reconnecting the store.',
+      });
+    }
+
+    const shop = integration.shopify_shop_domain;
+
+    // Kick off the full paginated sync in the background — don't block the response,
+    // a large catalog can take a while to walk through every page.
+    autoSyncProducts({ shop, access_token: accessToken, brand_id: brandId }).catch(err =>
+      console.error(`❌ Manual resync failed for ${shop}:`, err.message)
+    );
+
+    res.status(202).json({
+      success: true,
+      message: 'Product re-sync started. This runs in the background and may take a minute for large catalogs.',
+      shop_domain: shop,
+    });
+  } catch (error) {
+    console.error('Shopify resync error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
