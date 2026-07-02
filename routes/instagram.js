@@ -1098,11 +1098,16 @@ Do not invent product names. Only match against the listed products above.`
       });
 
       // Build the image system prompt with verified match results appended
+      const { buildProductUrl } = require('../lib/prompts/product-catalog');
       const exactMatches = matches.filter(m => m.match_type === 'exact');
       const similarMatches = matches.filter(m => m.match_type !== 'exact');
-      const formatMatch = (p) => p.in_stock
-        ? `- ${p.name}: ${p.price} EGP ✅ In Stock\n  Description: ${p.image_description || 'N/A'}`
-        : `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering\n  Description: ${p.image_description || 'N/A'}`;
+      const formatMatch = (p) => {
+        const productUrl = buildProductUrl(p, storefrontUrl);
+        const linkLine = productUrl ? `\n  link: ${productUrl}` : '';
+        return p.in_stock
+          ? `- ${p.name}: ${p.price} EGP ✅ In Stock${linkLine}\n  Description: ${p.image_description || 'N/A'}`
+          : `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering${linkLine}\n  Description: ${p.image_description || 'N/A'}`;
+      };
 
       let imageSearchSection = '';
       if (matches && matches.length > 0) {
@@ -1124,8 +1129,9 @@ Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${quer
 ⛔ STRICT RULES FOR IMAGE MATCHES:
 - Only CONFIRMED matches may be presented as the product in the customer's photo
 - If there are NO confirmed matches: say honestly that we don't carry that exact item, then offer the similar alternatives (if any) as alternatives — NEVER present an alternative as if it were the item in the photo
-- IN STOCK ✅: confirm the product name, state price and availability, ask if they want to order
-- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock`;
+- IN STOCK ✅: confirm the product name, state price and availability, share its link, ask if they want to order
+- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, share its link so they can check it on the website later, then suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock
+- ALWAYS include a product's "link:" (shown above) when you present it — in stock or not. NEVER invent or modify a link; if none is listed, just omit it`;
       } else if (searchImageUrls.length > 0) {
         imageSearchSection = `
 
