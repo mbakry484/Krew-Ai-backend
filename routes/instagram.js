@@ -51,10 +51,20 @@ const messageBuffers = new Map();
 const BATCH_WAIT_MS = parseInt(process.env.MESSAGE_BATCH_WAIT_MS || '10000', 10);
 
 /**
- * Find products similar to a customer's image using vector similarity search
+ * Retrieve candidate products for a customer's image (recall stage).
+ *
+ * Describes each garment in the photo SEPARATELY and runs one vector search
+ * per garment. A single blended description of a multi-item photo (two tops +
+ * shorts + models) produces an embedding that matches none of the individual
+ * products well — per-garment queries keep each embedding on-topic.
+ *
+ * The threshold here is deliberately low: this stage only needs the true
+ * product somewhere in the candidate list. Precision comes from
+ * verifyImageMatches(), which visually compares candidates to the photo.
+ *
  * @param {string} imageUrl - URL of the customer's image
  * @param {string} brandId - Brand ID to search within
- * @returns {Promise<{matches: Array, queryDescription: string|null}>}
+ * @returns {Promise<{candidates: Array, queryDescription: string|null, image: {base64: string, contentType: string}|null}>}
  */
 async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
   try {
@@ -65,19 +75,20 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
     const buffer = await response.arrayBuffer();
     const base64 = Buffer.from(buffer).toString('base64');
     const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const image = { base64, contentType };
 
-    // Generate description of customer's image using GPT-4o vision
+    // Generate per-garment descriptions using GPT-4o vision
     // Use detail: 'auto' (not 'low') so GPT-4o can pick up subtle features
     // from customer photos which are often lower quality or different angles
     const visionResponse = await openai.chat.completions.create({
       model: 'gpt-4o',
-      max_tokens: 150,
+      max_tokens: 350,
       messages: [{
         role: 'user',
         content: [
           {
             type: 'text',
-            text: 'Describe this clothing/product image in 2-3 sentences focusing on: type of item, colors, style, distinctive visual features.'
+            text: 'This photo was sent by a customer asking whether a clothing store sells the item(s) shown. Identify each distinct garment that is the focus of the photo (maximum 3). Ignore people, poses, background, shoes and accessories. For EACH garment, write one line starting with "ITEM: " followed by 2-3 sentences focusing on: type of item, colors, style, distinctive visual features (pattern, neckline/collar, sleeves, fabric texture, fit). Describe each garment on its own — never the outfit or the scene as a whole.'
           },
           {
             type: 'image_url',
@@ -103,50 +114,180 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
       totalTokens: visionResponse.usage?.total_tokens ?? 0
     });
 
-    // Generate embedding from description only — matches the format used for
-    // stored product embeddings (description-only, no product name prefix).
+    // Split into one description per garment; fall back to the whole text
+    let itemDescriptions = queryDescription
+      .split('\n')
+      .filter(line => /^\s*(?:[-*\d.]+\s*)?ITEM:/i.test(line))
+      .map(line => line.replace(/^\s*(?:[-*\d.]+\s*)?ITEM:\s*/i, '').trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    if (itemDescriptions.length === 0) itemDescriptions = [queryDescription];
+
+    // Embed each garment description separately — same description-only format
+    // as the stored product embeddings, so they live in the same vector space.
     const embeddingResponse = await openai.embeddings.create({
       model: 'text-embedding-3-small',
-      input: queryDescription
-    });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
-
-    // Search for similar products using pgvector
-    // Use a higher threshold (0.5) to avoid weak matches being presented as real results
-    // Fetch more candidates (5) so we can filter client-side
-    const { data: rawMatches, error } = await supabase.rpc('match_products_by_embedding', {
-      query_embedding: queryEmbedding,
-      match_brand_id: brandId,
-      match_threshold: 0.35,
-      match_count: 5
+      input: itemDescriptions
     });
 
-    if (error) {
-      console.error('❌ Vector search error:', error.message);
-      return { matches: [], queryDescription };
+    // One pgvector search per garment, run in parallel
+    const searchResults = await Promise.all(embeddingResponse.data.map(item =>
+      supabase.rpc('match_products_by_embedding', {
+        query_embedding: item.embedding,
+        match_brand_id: brandId,
+        match_threshold: 0.30,
+        match_count: 6
+      })
+    ));
+    const perGarment = [];
+    for (const { data: rawMatches, error } of searchResults) {
+      if (error) {
+        console.error('❌ Vector search error:', error.message);
+        continue;
+      }
+      perGarment.push(rawMatches || []);
     }
 
-    // Sort strictly by similarity score (ignore the SQL's in_stock-first ordering)
-    // Threshold 0.42 balances catching legitimate matches (different angles/lighting)
-    // while still filtering out clearly wrong products
-    const SIMILARITY_THRESHOLD = 0.42;
-    const matches = (rawMatches || [])
-      .sort((a, b) => b.similarity - a.similarity)
-      .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
-      .slice(0, 3);
-
-    const best = matches[0]?.similarity?.toFixed(2) || 'none';
-    console.log(`🎯 Found ${matches.length} confident matches above ${SIMILARITY_THRESHOLD} (best: ${best})`);
-    if (matches.length > 0) {
-      matches.forEach(m => {
-        console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
-      });
+    // Merge round-robin across garments (each garment's #1, then each #2, …)
+    // so one garment's strong scores can't crowd another garment's true match
+    // out of the capped candidate list. Dedupe keeps best similarity.
+    const candidateByKey = new Map();
+    const maxLen = Math.max(0, ...perGarment.map(l => l.length));
+    for (let rank = 0; rank < maxLen; rank++) {
+      for (const list of perGarment) {
+        const m = list[rank];
+        if (!m) continue;
+        const key = m.id || m.name;
+        const prev = candidateByKey.get(key);
+        if (!prev) candidateByKey.set(key, m);
+        else if (m.similarity > prev.similarity) prev.similarity = m.similarity;
+      }
     }
-    return { matches, queryDescription };
+
+    const candidates = [...candidateByKey.values()];
+    console.log(`🎯 Retrieved ${candidates.length} candidate(s) across ${itemDescriptions.length} garment(s)`);
+    candidates.forEach(m => {
+      console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
+    });
+    return { candidates, queryDescription, image };
 
   } catch (err) {
     console.error('❌ Image similarity search failed:', err.message);
-    return { matches: [], queryDescription: null };
+    return { candidates: [], queryDescription: null, image: null };
+  }
+}
+
+/**
+ * Visually verify candidate products against the customer's photo(s)
+ * (precision stage).
+ *
+ * Cosine similarity between two independently written text descriptions is
+ * too noisy to decide "same product or not" — wrong products routinely score
+ * 0.5+ while true matches can sit at 0.6. This pass shows GPT-4o the actual
+ * customer photo next to each candidate's catalog photo and keeps only what
+ * it confirms, so a lookalike is never presented as "the" product.
+ *
+ * @param {Array<{base64: string, contentType: string}>} customerImages
+ * @param {Array} candidates - merged candidates from findSimilarProducts
+ * @returns {Promise<Array>} candidates annotated with match_type: 'exact'|'similar'
+ */
+async function verifyImageMatches(customerImages, candidates, brandId, conversationId = null) {
+  if (!candidates || candidates.length === 0) return [];
+
+  // Fallback when visual verification is impossible: keep only strong text
+  // matches and label them 'similar' (never confirmed as the exact product).
+  const fallback = () => candidates
+    .filter(m => m.similarity >= 0.5)
+    .slice(0, 3)
+    .map(m => ({ ...m, match_type: 'similar' }));
+
+  // Download candidate catalog images in parallel (cap to bound vision cost)
+  const downloads = await Promise.all(candidates.slice(0, 10).map(async (c) => {
+    try {
+      if (!c.image_url) throw new Error('no image_url');
+      const res = await fetch(c.image_url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+      return {
+        candidate: c,
+        image: {
+          base64: Buffer.from(buf).toString('base64'),
+          contentType: res.headers.get('content-type') || 'image/jpeg'
+        }
+      };
+    } catch (err) {
+      console.error(`⚠️ Could not download catalog image for "${c.name}": ${err.message}`);
+      return null;
+    }
+  }));
+  const verifiable = [];
+  const candidateImages = [];
+  for (const d of downloads) {
+    if (!d) continue;
+    verifiable.push(d.candidate);
+    candidateImages.push(d.image);
+  }
+
+  if (customerImages.length === 0 || verifiable.length === 0) return fallback();
+
+  try {
+    const content = [
+      {
+        type: 'text',
+        text: `The first ${customerImages.length} image(s) are photos a customer sent to a clothing store asking about availability. The following ${verifiable.length} numbered image(s) are catalog photos of candidate products, in this order:\n${verifiable.map((c, i) => `${i + 1}. ${c.name}`).join('\n')}\n\nFor EACH candidate, compare it against the garment(s) in the customer's photo(s) and give a verdict:\n- "exact": the SAME product as a garment in the customer's photo — same garment type, same pattern AND same colorway (differences in lighting, angle or model are fine)\n- "similar": same garment type and clearly similar style, but a different colorway or pattern — close enough to offer as an alternative\n- "different": a different type of garment, or not a close alternative\n\nBe strict about "exact":\n- a polo shirt is never an exact match for a tank top; a striped item is never an exact match for a solid one\n- swapped or inverted colors are NOT exact: a black top with white trim is only "similar" to a white top with black trim\n- the main body color must be the same, not just a related shade\n\nFirst list every garment visible in the customer's photo(s) with its colors. Then judge each candidate against those garments — "exact" only if it matches one of them in type, pattern AND colors.\n\nRespond ONLY with JSON: {"customer_garments":["maroon ribbed tank top with white trim","..."],"results":[{"index":1,"verdict":"exact","reason":"matches garment 1: same maroon ribbed tank, white trim"}, ...]} with exactly one results entry per candidate.`
+      },
+      ...customerImages.map(img => ({
+        type: 'image_url',
+        image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' }
+      })),
+      ...candidateImages.map(img => ({
+        type: 'image_url',
+        image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' }
+      }))
+    ];
+
+    const verifyResponse = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 600,
+      response_format: { type: 'json_object' },
+      messages: [{ role: 'user', content }]
+    });
+
+    logUsage({
+      brandId,
+      conversationId,
+      messageType: 'image',
+      model: 'gpt-4o',
+      promptTokens: verifyResponse.usage?.prompt_tokens ?? 0,
+      completionTokens: verifyResponse.usage?.completion_tokens ?? 0,
+      totalTokens: verifyResponse.usage?.total_tokens ?? 0
+    });
+
+    const parsed = JSON.parse(verifyResponse.choices[0].message.content);
+    const verdicts = Array.isArray(parsed.results) ? parsed.results : [];
+
+    const matches = [];
+    for (const v of verdicts) {
+      const c = verifiable[v.index - 1];
+      if (!c) continue;
+      if (v.verdict === 'exact' || v.verdict === 'similar') {
+        matches.push({ ...c, match_type: v.verdict });
+      }
+    }
+
+    matches.sort((a, b) => a.match_type === b.match_type
+      ? b.similarity - a.similarity
+      : (a.match_type === 'exact' ? -1 : 1));
+
+    console.log(`✅ Visual verification: ${matches.filter(m => m.match_type === 'exact').length} exact, ${matches.filter(m => m.match_type === 'similar').length} similar (of ${verifiable.length} candidates)`);
+    matches.forEach(m => {
+      console.log(`   • ${m.name} | verdict: ${m.match_type} | similarity: ${(m.similarity * 100).toFixed(1)}% | in_stock: ${m.in_stock}`);
+    });
+    return matches.slice(0, 4);
+
+  } catch (err) {
+    console.error('❌ Visual verification failed, falling back to similarity threshold:', err.message);
+    return fallback();
   }
 }
 
@@ -864,25 +1005,39 @@ Do not invent product names. Only match against the listed products above.`
     let aiReply;
 
     if (imageUrls.length > 0) {
-      // IMAGE FLOW: Use vector similarity search to find matching products
+      // IMAGE FLOW: retrieve candidates via vector search, then visually
+      // verify them against the customer's photo(s) before presenting any
       // Cap the number of images per batch to keep vision costs bounded
       const searchImageUrls = imageUrls.slice(0, 3);
       console.log(`📸 Processing ${searchImageUrls.length} customer image(s) with vector search...`);
-      let matches = [];
+      let candidates = [];
       const queryDescriptions = [];
-      for (const url of searchImageUrls) {
-        const result = await findSimilarProducts(url, brand_id, conversation.id);
-        matches.push(...(result.matches || []));
+      const customerImages = [];
+      const perImageResults = await Promise.all(
+        searchImageUrls.map(url => findSimilarProducts(url, brand_id, conversation.id))
+      );
+      for (const result of perImageResults) {
+        candidates.push(...(result.candidates || []));
         if (result.queryDescription) queryDescriptions.push(result.queryDescription);
+        if (result.image) customerImages.push(result.image);
       }
-      // Dedupe matches across images by product name, keeping the strongest
-      const matchByName = new Map();
-      for (const m of matches) {
-        const prev = matchByName.get(m.name);
-        if (!prev || m.similarity > prev.similarity) matchByName.set(m.name, m);
+      // Dedupe candidates across images by product, keeping the strongest.
+      // Preserve the per-garment round-robin order from findSimilarProducts —
+      // re-sorting globally by similarity would let one garment's strong
+      // scores crowd another garment's true match out of the cap.
+      const candidateByKey = new Map();
+      for (const c of candidates) {
+        const key = c.id || c.name;
+        const prev = candidateByKey.get(key);
+        if (!prev) candidateByKey.set(key, c);
+        else if (c.similarity > prev.similarity) prev.similarity = c.similarity;
       }
-      matches = [...matchByName.values()].sort((a, b) => b.similarity - a.similarity).slice(0, 4);
+      candidates = [...candidateByKey.values()].slice(0, 10);
       const queryDescription = queryDescriptions.join(' | ') || null;
+
+      // Precision stage: GPT-4o compares the customer's photo(s) against each
+      // candidate's catalog photo — only visually confirmed products survive
+      const matches = await verifyImageMatches(customerImages, candidates, brand_id, conversation.id);
 
       // Build the base system prompt using the optimized prompt builder
       const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
@@ -905,56 +1060,58 @@ Do not invent product names. Only match against the listed products above.`
         storefrontUrl
       });
 
-      // Build the image system prompt with vector search results appended
+      // Build the image system prompt with verified match results appended
+      const exactMatches = matches.filter(m => m.match_type === 'exact');
+      const similarMatches = matches.filter(m => m.match_type !== 'exact');
+      const formatMatch = (p) => p.in_stock
+        ? `- ${p.name}: ${p.price} EGP ✅ In Stock\n  Description: ${p.image_description || 'N/A'}`
+        : `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering\n  Description: ${p.image_description || 'N/A'}`;
+
       let imageSearchSection = '';
       if (matches && matches.length > 0) {
-        const matchList = matches.map(p => {
-          if (p.in_stock) {
-            return `- ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
-          } else {
-            return `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
-          }
-        }).join('\n\n');
-
         imageSearchSection = `
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 IMAGE SEARCH RESULTS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Based on visual similarity search, these are the most likely matching products:
+The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Each product below was visually compared against the customer's photo${searchImageUrls.length > 1 ? 's' : ''}.
 
-${matchList}
+✅ CONFIRMED MATCHES (visually verified as the SAME product in the photo):
+${exactMatches.length > 0 ? exactMatches.map(formatMatch).join('\n\n') : 'None — we do NOT carry the exact item(s) in the photo.'}
+
+≈ SIMILAR ALTERNATIVES (same style, but NOT the product in the photo):
+${similarMatches.length > 0 ? similarMatches.map(formatMatch).join('\n\n') : 'None'}
 
 Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${queryDescription}
 
 ⛔ STRICT RULES FOR IMAGE MATCHES:
+- Only CONFIRMED matches may be presented as the product in the customer's photo
+- If there are NO confirmed matches: say honestly that we don't carry that exact item, then offer the similar alternatives (if any) as alternatives — NEVER present an alternative as if it were the item in the photo
 - IN STOCK ✅: confirm the product name, state price and availability, ask if they want to order
-- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock
-- If no match feels right visually, say so honestly — do not force a bad match`;
+- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock`;
+      } else if (searchImageUrls.length > 0) {
+        imageSearchSection = `
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 IMAGE SEARCH RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}, but NO products in our catalog matched it visually.
+${queryDescription ? `Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${queryDescription}` : ''}
+
+⛔ Tell the customer honestly that we don't carry this item. Do NOT guess or suggest a product as being the one in the photo. You may point them to the catalog for browsing.`;
       }
 
       const imageSystemPrompt = imageSearchSection
         ? `${baseSystemPrompt}${imageSearchSection}`
         : baseSystemPrompt;
 
-      // Download images and send to vision model (all images in the batch)
+      // Attach customer images to the vision request — reuse the base64
+      // already downloaded by findSimilarProducts instead of re-fetching
       let imageUserContent;
-      const imageContents = [];
-      for (const url of searchImageUrls) {
-        try {
-          const imgResponse = await fetch(url);
-          if (!imgResponse.ok) throw new Error(`Failed to download: ${imgResponse.status}`);
-          const imgBuffer = await imgResponse.arrayBuffer();
-          const imgBase64 = Buffer.from(imgBuffer).toString('base64');
-          const imgContentType = imgResponse.headers.get('content-type') || 'image/jpeg';
-          imageContents.push({
-            type: 'image_url',
-            image_url: { url: `data:${imgContentType};base64,${imgBase64}`, detail: 'low' }
-          });
-        } catch (imgErr) {
-          console.error('❌ Failed to attach image to vision request:', imgErr.message);
-        }
-      }
+      const imageContents = customerImages.map(img => ({
+        type: 'image_url',
+        image_url: { url: `data:${img.contentType};base64,${img.base64}`, detail: 'low' }
+      }));
       imageUserContent = imageContents.length > 0
         ? [
             { type: 'text', text: finalMessage || 'Do you have this product?' },

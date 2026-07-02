@@ -9,12 +9,13 @@ ALTER TABLE products
 ADD COLUMN IF NOT EXISTS image_description TEXT,
 ADD COLUMN IF NOT EXISTS embedding vector(1536);
 
--- Step 3: Create index for vector similarity search
--- This enables fast nearest-neighbor search using HNSW algorithm
-CREATE INDEX IF NOT EXISTS idx_products_embedding
-ON products
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+-- Step 3: NO vector index — exact search on purpose.
+-- An HNSW index was tried here and had terrible recall (true nearest
+-- neighbors missing from results entirely; see
+-- MIGRATION-FIX-IMAGE-SEARCH-RECALL.sql). With a few hundred products an
+-- exact scan is sub-millisecond and always correct. Revisit only if the
+-- products table grows past ~100k rows.
+DROP INDEX IF EXISTS idx_products_embedding;
 
 -- Step 4: Create function for vector similarity search
 CREATE OR REPLACE FUNCTION match_products(
@@ -98,9 +99,10 @@ BEGIN
     products.embedding IS NOT NULL
     AND products.brand_id = match_brand_id
     AND 1 - (products.embedding <=> query_embedding) > match_threshold
-  ORDER BY
-    products.in_stock DESC,  -- Prioritize in-stock products
-    products.embedding <=> query_embedding  -- Then by similarity
+  -- Order purely by similarity: ordering by in_stock first can evict the
+  -- true match from the LIMITed result set (e.g. an out-of-stock exact match
+  -- pushed out by weaker in-stock candidates). Callers handle stock status.
+  ORDER BY products.embedding <=> query_embedding
   LIMIT match_count;
 END;
 $$;
@@ -109,4 +111,4 @@ $$;
 COMMENT ON COLUMN products.image_description IS 'AI-generated description of product image using GPT-4o vision';
 COMMENT ON COLUMN products.embedding IS 'Text embedding vector (1536 dimensions) for semantic search using text-embedding-3-small';
 COMMENT ON FUNCTION match_products IS 'Find similar products using vector similarity search. Returns products ranked by cosine similarity to query embedding.';
-COMMENT ON FUNCTION match_products_by_embedding IS 'Instagram image search - returns ALL products (in-stock and OOS) for a brand, prioritizing in-stock products first, with similarity above threshold.';
+COMMENT ON FUNCTION match_products_by_embedding IS 'Instagram image search - returns ALL products (in-stock and OOS) for a brand ordered by similarity above threshold.';
