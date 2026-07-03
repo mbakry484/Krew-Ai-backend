@@ -870,7 +870,24 @@ Do not invent product names. Only match against the listed products above.`
       matches = [...matchByName.values()].sort((a, b) => b.similarity - a.similarity).slice(0, 4);
       const queryDescription = queryDescriptions.join(' | ') || null;
 
-      // Build the base system prompt using the optimized prompt builder
+      // Attach each match's OWN product link so Luna never has to hunt for a
+      // URL in the big catalog list (which is how a wrong product's link ends
+      // up glued to a match's name).
+      if (matches.length > 0) {
+        const { buildProductUrl } = require('../lib/prompts/product-catalog');
+        const { data: linkRows } = await supabase
+          .from('products')
+          .select('id, online_store_url, handle')
+          .in('id', matches.map(m => m.id));
+        const urlById = new Map((linkRows || []).map(r => [r.id, buildProductUrl(r, storefrontUrl)]));
+        matches.forEach(m => { m.product_url = urlById.get(m.id) || null; });
+      }
+
+      // Build the base system prompt using the optimized prompt builder.
+      // hasVectorMatches suppresses the generic catalog-scanning image rules —
+      // they conflict with the authoritative IMAGE SEARCH RESULTS below
+      // (the catalog list is capped at 30 in/30 OOS products, so a matched
+      // product often isn't in it and Luna would deny knowing it).
       const { buildOptimizedPrompt } = require('../lib/prompts/prompt-manager');
       const baseSystemPrompt = buildOptimizedPrompt({
         businessName,
@@ -883,6 +900,7 @@ Do not invent product names. Only match against the listed products above.`
         outOfStockProducts,
         knowledgeBaseRows: knowledgeBaseRows || [],
         hasImage: true,
+        hasVectorMatches: matches.length > 0,
         storyContext,
         situationsEnabled,
         situations,
@@ -896,27 +914,38 @@ Do not invent product names. Only match against the listed products above.`
       if (matches && matches.length > 0) {
         const matchList = matches.map(p => {
           if (p.in_stock) {
-            return `- ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
+            const link = p.product_url ? `\n  link: ${p.product_url}` : '';
+            return `- ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)${link}\n  Description: ${p.image_description || 'N/A'}`;
           } else {
-            return `- ${p.name}: ❌ NOT currently in stock — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
+            return `- ${p.name}: ❌ OUT OF STOCK — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
           }
         }).join('\n\n');
+
+        const browseLine = storefrontUrl
+          ? `then invite them to browse the website: ${storefrontUrl}`
+          : `then ask if they'd like to see similar in-stock pieces`;
 
         imageSearchSection = `
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔍 IMAGE SEARCH RESULTS
+🔍 IMAGE SEARCH RESULTS — AUTHORITATIVE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Based on visual similarity search, these are the most likely matching products:
+The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Our visual search engine compared ${searchImageUrls.length > 1 ? 'them' : 'it'} against the store's actual product photos and found these matches (best first):
 
 ${matchList}
 
 Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${queryDescription}
 
-⛔ STRICT RULES FOR IMAGE MATCHES:
-- IN STOCK ✅: confirm the product name, state price and availability, ask if they want to order
-- OUT OF STOCK ❌: say the product name only (NO price), say it's not currently available, suggest in-stock alternatives from the catalog. If the customer then tries to order it anyway → firmly say it's unavailable and redirect to what's in stock
-- If no match feels right visually, say so honestly — do not force a bad match`;
+⛔ STRICT RULES FOR IMAGE MATCHES — THESE OVERRIDE ALL CATALOG RULES ABOVE:
+- Every product listed in THIS section is a REAL product of this store, even if it does not appear in the catalog list above (that list is capped and omits many products). NEVER say "we don't have this" about a product listed here.
+- When the top match is 75%+ → it IS the product in the customer's photo. Identify it by name confidently.
+- IN STOCK ✅ match → give its name, price, and its "link:" from THIS section, then ask if they'd like to order.
+  Example: "That's our [Product Name]! It's [price] EGP and available — you can grab it here: [link]"
+- OUT OF STOCK ❌ match → NAME the product (never pretend not to recognize it), say it's currently out of stock, do NOT state its price, do NOT suggest another specific product, ${browseLine}.
+  Example: "That's our [Product Name]! Unfortunately it's currently out of stock right now.${storefrontUrl ? ` If you'd like to explore more of our pieces, feel free to browse: ${storefrontUrl}` : ''}"
+- ⛔ LINKS: only share a "link:" printed in THIS section${storefrontUrl ? ` or the website link (${storefrontUrl})` : ''}. NEVER pull a link from the catalog list above — pairing a match with another product's link sends customers to the WRONG product.
+- Alternatives: only offer one if it appears in THIS match list and is in stock. Otherwise just point to the website.
+- If none of the matches feels visually right, say so honestly — do not force a bad match.`;
       }
 
       const imageSystemPrompt = imageSearchSection
