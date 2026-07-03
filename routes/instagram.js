@@ -103,9 +103,12 @@ async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
     // 2) soft garment-type penalty — a polo must not beat a tank top for a
     //    tank-top query just because the colors/texture align. Soft (not a
     //    hard filter) so one mislabeled type can't hide a genuinely good match.
-    // Threshold applies to the ADJUSTED score. Env-tunable for re-calibration
-    // after the catalog is re-indexed under the structured description scheme.
-    const SIMILARITY_THRESHOLD = parseFloat(process.env.IMAGE_MATCH_THRESHOLD || '0.45');
+    // Threshold applies to the ADJUSTED score. Calibrated against the
+    // structured description scheme (live-measured 2026-07-03): exact product
+    // ~0.89 raw, plausible same-type alternative ~0.76, cross-category ~0.42
+    // raw → ~0.12 after penalty. 0.60 keeps genuine matches and alternatives,
+    // drops different-type items. Env-tunable without redeploy.
+    const SIMILARITY_THRESHOLD = parseFloat(process.env.IMAGE_MATCH_THRESHOLD || '0.60');
     const matches = (rawMatches || [])
       .map(m => {
         const penalty = garmentTypePenalty(queryType, m.garment_type || null);
