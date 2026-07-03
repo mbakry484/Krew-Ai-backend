@@ -13,8 +13,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const PRODUCT_PAGE_SIZE = 50;
 
 // Fetch ALL active products from Shopify (following pagination cursors) and
-// upsert them into Supabase page by page.
-async function autoSyncProducts({ shop, access_token, brand_id }) {
+// upsert them into Supabase page by page. forceReindex re-describes and
+// re-embeds every product image even if it already has an up-to-date
+// embedding — use after any change to the description scheme. reindexLimit
+// caps how many products get described/embedded (OpenAI quota control while
+// testing); the Shopify row sync itself is always full and costs no quota.
+async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = false, reindexLimit = null }) {
   console.log(`🔄 Auto-syncing products for ${shop}...`);
 
   const query = `
@@ -154,7 +158,7 @@ async function autoSyncProducts({ shop, access_token, brand_id }) {
   console.log(`✅ Auto-synced ${totalSynced} active products for brand ${brand_id}`);
 
   // Generate embeddings in background
-  generateEmbeddingsForBrand(brand_id).catch(err =>
+  generateEmbeddingsForBrand(brand_id, { force: forceReindex, limit: reindexLimit }).catch(err =>
     console.error('❌ Embedding error after auto-sync:', err.message)
   );
 }
@@ -422,6 +426,14 @@ router.post('/shopify/link', verifyToken, async (req, res) => {
 router.post('/shopify/resync', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
+    // { "force": true } in the body re-describes + re-embeds EVERY product
+    // image, not just missing/outdated ones. Use after description-scheme changes.
+    // { "limit": N } caps how many products get described/embedded — for
+    // testing a new description scheme without spending quota on the whole store.
+    const forceReindex = req.body?.force === true;
+    const reindexLimit = Number.isInteger(req.body?.limit) && req.body.limit > 0
+      ? req.body.limit
+      : null;
 
     // Look up the user's brand_id
     const { data: user, error: userError } = await supabase
@@ -463,7 +475,7 @@ router.post('/shopify/resync', verifyToken, async (req, res) => {
 
     // Kick off the full paginated sync in the background — don't block the response,
     // a large catalog can take a while to walk through every page.
-    autoSyncProducts({ shop, access_token: accessToken, brand_id: brandId }).catch(err =>
+    autoSyncProducts({ shop, access_token: accessToken, brand_id: brandId, forceReindex, reindexLimit }).catch(err =>
       console.error(`❌ Manual resync failed for ${shop}:`, err.message)
     );
 
