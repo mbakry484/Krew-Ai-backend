@@ -762,9 +762,10 @@ Do not invent product names. Only match against the listed products above.`
       console.log(`⏸️ Luna is globally disabled for brand ${brand_id} - AI will not respond`);
 
       // Still save the incoming messages for the team to see
-      await supabase
+      const { error: disabledInsertError } = await supabase
         .from('messages')
         .insert(buildCustomerMessageRows());
+      if (disabledInsertError) console.error(`❌ Failed to save customer message(s): ${disabledInsertError.message}`);
 
       return;
     }
@@ -775,10 +776,11 @@ Do not invent product names. Only match against the listed products above.`
       console.log(`   Reason: ${conversation.escalation_reason}`);
 
       // Still save the incoming messages for the team to see
-      const { data: escalatedMsgs } = await supabase
+      const { data: escalatedMsgs, error: escalatedInsertError } = await supabase
         .from('messages')
         .insert(buildCustomerMessageRows())
         .select('id');
+      if (escalatedInsertError) console.error(`❌ Failed to save customer message(s): ${escalatedInsertError.message}`);
 
       // Track interaction (fire-and-forget)
       trackInteraction({
@@ -806,10 +808,11 @@ Do not invent product names. Only match against the listed products above.`
       .limit(20);
 
     // 8. Save incoming messages (one row per content part, in order)
-    const { data: savedMsgs } = await supabase
+    const { data: savedMsgs, error: customerInsertError } = await supabase
       .from('messages')
       .insert(buildCustomerMessageRows())
       .select('id');
+    if (customerInsertError) console.error(`❌ Failed to save customer message(s): ${customerInsertError.message}`);
 
     // Track interaction (fire-and-forget)
     trackInteraction({
@@ -824,7 +827,7 @@ Do not invent product names. Only match against the listed products above.`
     // Filter out image-only placeholder messages — they have no useful text context
     const IMAGE_PLACEHOLDERS = ['[Image]', '[Image/Audio]', '[Voice Note]', '[Story Reply]'];
     const conversationHistory = (previousMessages || [])
-      .filter(msg => !IMAGE_PLACEHOLDERS.includes(msg.content?.trim()))
+      .filter(msg => msg.content && !IMAGE_PLACEHOLDERS.includes(msg.content.trim()))
       .map(msg => ({
         role: msg.sender === 'customer' ? 'user' : 'assistant',
         content: msg.content
