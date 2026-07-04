@@ -899,6 +899,22 @@ Do not invent product names. Only match against the listed products above.`
         matches.forEach(m => { m.product_url = urlById.get(m.id) || null; });
       }
 
+      // Persist this photo's matches in conversation metadata (saved in step
+      // 17) so follow-up TEXT questions stay grounded — "what is its name?",
+      // "how much?", "send the link" arrive as text turns where the image
+      // search section no longer exists, and without this Luna reaches back
+      // to older conversation topics for an answer. Overwritten (or cleared)
+      // on every new customer photo so the freshest photo always wins.
+      metadata.last_image_matches = matches.map(m => ({
+        item: (queryItems.find(it => it.matches.includes(m)) || {}).label || null,
+        name: m.name,
+        price: m.price,
+        in_stock: m.in_stock,
+        url: m.product_url || null,
+        similarity: Math.round(m.similarity * 100),
+        at: new Date().toISOString()
+      }));
+
       // Build the base system prompt using the optimized prompt builder.
       // hasVectorMatches suppresses the generic catalog-scanning image rules —
       // they conflict with the authoritative IMAGE SEARCH RESULTS below
@@ -962,6 +978,8 @@ ${itemBlocks}
 - Every product listed in THIS section is a REAL product of this store, even if it does not appear in the catalog list above (that list is capped and omits many products). NEVER say "we don't have this" about a product listed here.
 - COVER EVERY ITEM: if the customer did NOT ask about a specific item, address EVERY item above that has a match — identify each matched product in one reply. If the customer DID ask about specific item(s) (by naming them or pointing, e.g. "the shorts", "how much is the top?"), answer ONLY about those and ignore the rest.
 - SPEAK WITH CONFIDENCE: a match of 75%+ IS the product in the photo — state it as fact: "That's our [Product Name]". ⛔ NEVER hedge with "seems like", "looks like", "I think", "appears to be", "might be". Only for matches below 75% may you present the product as the closest option rather than a definite identification.
+- ALWAYS SAY THE NAME: every product you mention must be named explicitly — never reply about "that pair of jeans" or "this product" without its exact name. Write names EXACTLY as listed here — never translate or reword them.
+- NEAR-TIE: when an item's top two matches are within a few % of each other and one is in stock, identify the IN-STOCK one — do not tell the customer it's out of stock because of the out-of-stock twin.
 - IN STOCK ✅ match → give its name, price, and its "link:" from THIS section, then ask if they'd like to order.
   Example (two items): "The top is our [Name A] — [price] EGP: [link A]. And the shorts are our [Name B] — [price] EGP: [link B]. Want me to help you order them?"
 - OUT OF STOCK ❌ match → NAME the product (never pretend not to recognize it), say it's currently out of stock, do NOT state its price, do NOT suggest another specific product for that item, ${browseLine}.
