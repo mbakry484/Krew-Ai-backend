@@ -138,6 +138,13 @@ File: `routes/instagram.js`, image branch of the webhook handler (~line 852).
    and instructs Luna to address EVERY matched item (names + prices + links for
    in-stock) unless the customer asked about specific item(s), and to speak
    with confidence on 75%+ matches (no "seems like" / "looks like" hedging).
+7. **Persistence across turns**: the matches are also written to
+   `conversation.metadata.last_image_matches` (name, price, stock, link, item
+   label). On subsequent TEXT turns, `buildOptimizedPrompt` injects a
+   "📷 RECENT IMAGE CONTEXT" block from it, so follow-ups like "what is its
+   name?" / "how much?" / "send the link" stay grounded in the photo's matches
+   instead of drifting to older conversation topics. Overwritten (or cleared)
+   by the next customer photo.
 
 The log lines map 1:1:
 
