@@ -11,7 +11,7 @@ const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
 const { shopifyGraphQL, getValidAccessToken, getShopifyOrderByNumber, SHOPIFY_API_VERSION } = require('../lib/shopify');
 const { runStepDetector, postAiReplyTransition, postValidationTransition } = require('../lib/flow-detector');
-const { downloadImageAsBase64, describeImageForSearch, embedText } = require('../lib/embeddings');
+const { downloadImageAsBase64, describeImageItemsForSearch, embedText } = require('../lib/embeddings');
 const { garmentTypePenalty } = require('../lib/garment-vocab');
 
 // Initialize OpenAI client for image similarity search
@@ -53,86 +53,94 @@ const messageBuffers = new Map();
 const BATCH_WAIT_MS = parseInt(process.env.MESSAGE_BATCH_WAIT_MS || '10000', 10);
 
 /**
- * Find products similar to a customer's image using vector similarity search
+ * Find products matching EVERY distinct sellable item in a customer's image.
+ * The image is described once (multi-item structured schema, same per-item
+ * format as product indexing), then each detected item gets its own embedding,
+ * vector search, and type-penalty re-rank — so an outfit photo (tank top +
+ * shorts) produces matches for BOTH garments, not just the most prominent one.
  * @param {string} imageUrl - URL of the customer's image
  * @param {string} brandId - Brand ID to search within
- * @returns {Promise<{matches: Array, queryDescription: string|null}>}
+ * @returns {Promise<{items: Array<{label: string, description: string, garmentType: string|null, matches: Array}>}>}
  */
 async function findSimilarProducts(imageUrl, brandId, conversationId = null) {
   try {
-    // Describe the customer's image with the SAME structured vision prompt and
-    // schema used when indexing product images (lib/embeddings.js), so both
-    // sides produce embeddings in the same vector space.
     const image = await downloadImageAsBase64(imageUrl);
-    const described = await describeImageForSearch(image);
-    const queryDescription = described.summary;
-    const queryType = described.garmentType;
-    console.log(`🔍 Customer image described as: ${described.embeddingText}`);
-    console.log(`👕 Query garment type: ${queryType || 'unknown'}`);
+    const { items: describedItems, usage } = await describeImageItemsForSearch(image);
+    console.log(`🔍 Detected ${describedItems.length} item(s) in customer image`);
 
     logUsage({
       brandId,
       conversationId,
       messageType: 'image',
       model: 'gpt-4o',
-      promptTokens: described.usage?.prompt_tokens ?? 0,
-      completionTokens: described.usage?.completion_tokens ?? 0,
-      totalTokens: described.usage?.total_tokens ?? 0
+      promptTokens: usage?.prompt_tokens ?? 0,
+      completionTokens: usage?.completion_tokens ?? 0,
+      totalTokens: usage?.total_tokens ?? 0
     });
 
-    // Embed the canonical attribute string — same format as stored product embeddings
-    const queryEmbedding = await embedText(described.embeddingText);
-
-    // Search for similar products using pgvector.
-    // Fetch a wide candidate pool with a low raw threshold — the real ranking
-    // happens client-side after applying the garment-type penalty.
-    const { data: rawMatches, error } = await supabase.rpc('match_products_by_embedding', {
-      query_embedding: queryEmbedding,
-      match_brand_id: brandId,
-      match_threshold: 0.3,
-      match_count: 10
-    });
-
-    if (error) {
-      console.error('❌ Vector search error:', error.message);
-      return { matches: [], queryDescription };
-    }
-
-    // Two-stage ranking:
-    // 1) cosine similarity from pgvector (visual/attribute closeness)
-    // 2) soft garment-type penalty — a polo must not beat a tank top for a
-    //    tank-top query just because the colors/texture align. Soft (not a
-    //    hard filter) so one mislabeled type can't hide a genuinely good match.
     // Threshold applies to the ADJUSTED score. Calibrated against the
     // structured description scheme (live-measured 2026-07-03): exact product
     // ~0.89 raw, plausible same-type alternative ~0.76, cross-category ~0.42
     // raw → ~0.12 after penalty. 0.60 keeps genuine matches and alternatives,
     // drops different-type items. Env-tunable without redeploy.
     const SIMILARITY_THRESHOLD = parseFloat(process.env.IMAGE_MATCH_THRESHOLD || '0.60');
-    const matches = (rawMatches || [])
-      .map(m => {
-        const penalty = garmentTypePenalty(queryType, m.garment_type || null);
-        return { ...m, raw_similarity: m.similarity, similarity: m.similarity - penalty };
-      })
-      .sort((a, b) => b.similarity - a.similarity)
-      .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
-      .slice(0, 3);
 
-    const best = matches[0]?.similarity?.toFixed(2) || 'none';
-    console.log(`🎯 Found ${matches.length} confident matches above ${SIMILARITY_THRESHOLD} (best: ${best})`);
-    if (matches.length > 0) {
+    const items = [];
+    for (const item of describedItems) {
+      const queryType = item.garmentType;
+      // Short human label for logs and the reply prompt, e.g. "black base tank top"
+      const firstColor = Array.isArray(item.attributes?.colors) ? item.attributes.colors[0] : '';
+      const label = [firstColor, queryType || item.attributes?.type || 'item']
+        .filter(Boolean).join(' ');
+      console.log(`   👕 Item: ${label} | ${item.embeddingText.substring(0, 120)}...`);
+
+      const queryEmbedding = await embedText(item.embeddingText);
+
+      // Wide candidate pool with a low raw threshold — the real ranking
+      // happens client-side after applying the garment-type penalty.
+      const { data: rawMatches, error } = await supabase.rpc('match_products_by_embedding', {
+        query_embedding: queryEmbedding,
+        match_brand_id: brandId,
+        match_threshold: 0.3,
+        match_count: 10
+      });
+
+      if (error) {
+        console.error('❌ Vector search error:', error.message);
+        items.push({ label, description: item.summary, garmentType: queryType, matches: [] });
+        continue;
+      }
+
+      // Two-stage ranking:
+      // 1) cosine similarity from pgvector (visual/attribute closeness)
+      // 2) soft garment-type penalty — a polo must not beat a tank top for a
+      //    tank-top query just because the colors/texture align. Soft (not a
+      //    hard filter) so one mislabeled type can't hide a genuinely good match.
+      const matches = (rawMatches || [])
+        .map(m => {
+          const penalty = garmentTypePenalty(queryType, m.garment_type || null);
+          return { ...m, raw_similarity: m.similarity, similarity: m.similarity - penalty };
+        })
+        .sort((a, b) => b.similarity - a.similarity)
+        .filter(m => m.similarity >= SIMILARITY_THRESHOLD)
+        .slice(0, 2); // top 2 per item — the reply covers several items, keep each tight
+
+      console.log(`   🎯 "${label}": ${matches.length} match(es) above ${SIMILARITY_THRESHOLD}`);
       matches.forEach(m => {
         const penaltyNote = m.raw_similarity !== m.similarity
           ? ` (raw: ${(m.raw_similarity * 100).toFixed(1)}%, type mismatch: ${m.garment_type || '?'} vs ${queryType})`
           : '';
-        console.log(`   • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}%${penaltyNote} | type: ${m.garment_type || 'unknown'} | in_stock: ${m.in_stock}`);
+        console.log(`      • ${m.name} | similarity: ${(m.similarity * 100).toFixed(1)}%${penaltyNote} | type: ${m.garment_type || 'unknown'} | in_stock: ${m.in_stock}`);
       });
+
+      items.push({ label, description: item.summary, garmentType: queryType, matches });
     }
-    return { matches, queryDescription };
+
+    return { items };
 
   } catch (err) {
     console.error('❌ Image similarity search failed:', err.message);
-    return { matches: [], queryDescription: null };
+    return { items: [] };
   }
 }
 
@@ -854,21 +862,29 @@ Do not invent product names. Only match against the listed products above.`
       // Cap the number of images per batch to keep vision costs bounded
       const searchImageUrls = imageUrls.slice(0, 3);
       console.log(`📸 Processing ${searchImageUrls.length} customer image(s) with vector search...`);
-      let matches = [];
-      const queryDescriptions = [];
+      let queryItems = [];
       for (const url of searchImageUrls) {
         const result = await findSimilarProducts(url, brand_id, conversation.id);
-        matches.push(...(result.matches || []));
-        if (result.queryDescription) queryDescriptions.push(result.queryDescription);
+        queryItems.push(...(result.items || []));
       }
-      // Dedupe matches across images by product name, keeping the strongest
-      const matchByName = new Map();
-      for (const m of matches) {
-        const prev = matchByName.get(m.name);
-        if (!prev || m.similarity > prev.similarity) matchByName.set(m.name, m);
-      }
-      matches = [...matchByName.values()].sort((a, b) => b.similarity - a.similarity).slice(0, 4);
-      const queryDescription = queryDescriptions.join(' | ') || null;
+      // Cap total detected items across the batch to keep the prompt bounded
+      queryItems = queryItems.slice(0, 4);
+
+      // Global dedupe: if the same product matched several items (e.g. a
+      // matching set, or the same item in two photos), keep it only under the
+      // item where it scored highest.
+      const bestByProduct = new Map(); // product name -> { itemIdx, similarity }
+      queryItems.forEach((item, idx) => {
+        item.matches.forEach(m => {
+          const prev = bestByProduct.get(m.name);
+          if (!prev || m.similarity > prev.similarity) bestByProduct.set(m.name, { itemIdx: idx, similarity: m.similarity });
+        });
+      });
+      queryItems = queryItems.map((item, idx) => ({
+        ...item,
+        matches: item.matches.filter(m => bestByProduct.get(m.name).itemIdx === idx)
+      }));
+      const matches = queryItems.flatMap(item => item.matches); // all matched products
 
       // Attach each match's OWN product link so Luna never has to hunt for a
       // URL in the big catalog list (which is how a wrong product's link ends
@@ -909,16 +925,24 @@ Do not invent product names. Only match against the listed products above.`
         storefrontUrl
       });
 
-      // Build the image system prompt with vector search results appended
+      // Build the image system prompt with vector search results appended,
+      // grouped per detected item so Luna can address EVERY item in the photo.
       let imageSearchSection = '';
       if (matches && matches.length > 0) {
-        const matchList = matches.map(p => {
-          if (p.in_stock) {
-            const link = p.product_url ? `\n  link: ${p.product_url}` : '';
-            return `- ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)${link}\n  Description: ${p.image_description || 'N/A'}`;
-          } else {
-            return `- ${p.name}: ❌ OUT OF STOCK — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n  Description: ${p.image_description || 'N/A'}`;
+        const itemBlocks = queryItems.map((item, idx) => {
+          const header = `ITEM ${idx + 1} — ${item.label}:`;
+          if (item.matches.length === 0) {
+            return `${header}\n  (no confident match in the store for this item)`;
           }
+          const lines = item.matches.map(p => {
+            if (p.in_stock) {
+              const link = p.product_url ? `\n    link: ${p.product_url}` : '';
+              return `  • ${p.name}: ${p.price} EGP ✅ In Stock (${(p.similarity * 100).toFixed(0)}% visual match)${link}\n    Description: ${p.image_description || 'N/A'}`;
+            } else {
+              return `  • ${p.name}: ❌ OUT OF STOCK — do NOT show price, do NOT allow ordering (${(p.similarity * 100).toFixed(0)}% visual match)\n    Description: ${p.image_description || 'N/A'}`;
+            }
+          }).join('\n');
+          return `${header}\n${lines}`;
         }).join('\n\n');
 
         const browseLine = storefrontUrl
@@ -930,22 +954,21 @@ Do not invent product names. Only match against the listed products above.`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 IMAGE SEARCH RESULTS — AUTHORITATIVE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'}. Our visual search engine compared ${searchImageUrls.length > 1 ? 'them' : 'it'} against the store's actual product photos and found these matches (best first):
+The customer sent ${searchImageUrls.length > 1 ? `${searchImageUrls.length} images` : 'an image'} containing ${queryItems.length > 1 ? `${queryItems.length} distinct items` : 'one item'}. Our visual search engine compared each item against the store's actual product photos:
 
-${matchList}
-
-Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${queryDescription}
+${itemBlocks}
 
 ⛔ STRICT RULES FOR IMAGE MATCHES — THESE OVERRIDE ALL CATALOG RULES ABOVE:
 - Every product listed in THIS section is a REAL product of this store, even if it does not appear in the catalog list above (that list is capped and omits many products). NEVER say "we don't have this" about a product listed here.
-- When the top match is 75%+ → it IS the product in the customer's photo. Identify it by name confidently.
+- COVER EVERY ITEM: if the customer did NOT ask about a specific item, address EVERY item above that has a match — identify each matched product in one reply. If the customer DID ask about specific item(s) (by naming them or pointing, e.g. "the shorts", "how much is the top?"), answer ONLY about those and ignore the rest.
+- SPEAK WITH CONFIDENCE: a match of 75%+ IS the product in the photo — state it as fact: "That's our [Product Name]". ⛔ NEVER hedge with "seems like", "looks like", "I think", "appears to be", "might be". Only for matches below 75% may you present the product as the closest option rather than a definite identification.
 - IN STOCK ✅ match → give its name, price, and its "link:" from THIS section, then ask if they'd like to order.
-  Example: "That's our [Product Name]! It's [price] EGP and available — you can grab it here: [link]"
-- OUT OF STOCK ❌ match → NAME the product (never pretend not to recognize it), say it's currently out of stock, do NOT state its price, do NOT suggest another specific product, ${browseLine}.
-  Example: "That's our [Product Name]! Unfortunately it's currently out of stock right now.${storefrontUrl ? ` If you'd like to explore more of our pieces, feel free to browse: ${storefrontUrl}` : ''}"
+  Example (two items): "The top is our [Name A] — [price] EGP: [link A]. And the shorts are our [Name B] — [price] EGP: [link B]. Want me to help you order them?"
+- OUT OF STOCK ❌ match → NAME the product (never pretend not to recognize it), say it's currently out of stock, do NOT state its price, do NOT suggest another specific product for that item, ${browseLine}.
+- Item with no confident match → if the customer asked about it specifically, be honest you couldn't find it${storefrontUrl ? ` and point to the website (${storefrontUrl})` : ''}; otherwise you may simply skip it.
 - ⛔ LINKS: only share a "link:" printed in THIS section${storefrontUrl ? ` or the website link (${storefrontUrl})` : ''}. NEVER pull a link from the catalog list above — pairing a match with another product's link sends customers to the WRONG product.
 - Alternatives: only offer one if it appears in THIS match list and is in stock. Otherwise just point to the website.
-- If none of the matches feels visually right, say so honestly — do not force a bad match.`;
+- If a match genuinely contradicts what you see in the photo, say so honestly — do not force a bad match.`;
       }
 
       const imageSystemPrompt = imageSearchSection
@@ -1001,7 +1024,9 @@ Customer's image${searchImageUrls.length > 1 ? 's look' : ' looks'} like: ${quer
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: imageMessages,
-        max_tokens: 400
+        // Multi-item replies (several product names + links) need more room
+        // than single-product answers — 400 risked truncating the last link
+        max_tokens: 500
       });
       const imageLatency = Date.now() - imageStartTime;
 
