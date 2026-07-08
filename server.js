@@ -21,6 +21,7 @@ const metaDataDeletionRoutes = require('./routes/meta-data-deletion');
 const interactionsRoutes = require('./routes/interactions');
 const lunaRoutes = require('./routes/luna');
 const voiceRoutes = require('./routes/voice');
+const ivyRoutes = require('./routes/ivy');
 const supabase = require('./lib/supabase');
 const { client: aiClient, provider: aiProvider } = require('./lib/ai-provider');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
@@ -130,6 +131,7 @@ app.use('/api/meta/data-deletion', metaDataDeletionRoutes);
 app.use('/interactions', interactionsRoutes);
 app.use('/luna', lunaRoutes);
 app.use('/api/voice', voiceRoutes);
+app.use('/ivy', ivyRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
