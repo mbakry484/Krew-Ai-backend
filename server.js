@@ -22,6 +22,8 @@ const interactionsRoutes = require('./routes/interactions');
 const lunaRoutes = require('./routes/luna');
 const voiceRoutes = require('./routes/voice');
 const ivyRoutes = require('./routes/ivy');
+const membersRoutes = require('./routes/members');
+const telegramRoutes = require('./routes/telegram');
 const supabase = require('./lib/supabase');
 const { client: aiClient, provider: aiProvider } = require('./lib/ai-provider');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
@@ -132,6 +134,8 @@ app.use('/interactions', interactionsRoutes);
 app.use('/luna', lunaRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/ivy', ivyRoutes);
+app.use('/members', membersRoutes);
+app.use('/webhook/telegram', telegramRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
