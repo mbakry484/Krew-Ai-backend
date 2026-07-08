@@ -226,23 +226,34 @@ router.post('/expenses', verifyToken, async (req, res) => {
       .maybeSingle();
     if (!pool) return res.status(400).json({ error: 'Capital pool not found' });
 
-    const { data, error } = await supabase
-      .from('ivy_expenses')
-      .insert({
-        brand_id: brandId,
-        amount: value,
-        category,
-        capital_id,
-        source: src,
-        note: (note != null ? String(note) : ''),
-        spent_at: spent_at || new Date().toISOString(),
-      })
-      .select('*')
-      .single();
+    // Write through the atomic RPC so the expense insert and the capital
+    // balance decrement happen in one row-locked transaction (same path Ivy's
+    // Telegram agent uses). This keeps the stored current_balance authoritative.
+    const { data: result, error } = await supabase.rpc('ivy_log_expense', {
+      p_brand_id: brandId,
+      p_amount: value,
+      p_category: category,
+      p_capital_id: capital_id,
+      p_note: (note != null ? String(note) : ''),
+      p_source: src,
+      p_spent_at: spent_at || new Date().toISOString(),
+    });
 
     if (error) throw error;
-    // current_balance is derived on GET, so no balance write is needed here.
-    return res.status(201).json(data);
+    if (!result || !result.ok) {
+      const code = result && result.error;
+      if (code === 'capital_not_found') return res.status(400).json({ error: 'Capital pool not found' });
+      if (code === 'invalid_amount') return res.status(400).json({ error: 'amount must be > 0' });
+      return res.status(500).json({ error: 'Failed to create expense' });
+    }
+
+    // Return the created expense row so the response contract is unchanged.
+    const { data: expense } = await supabase
+      .from('ivy_expenses')
+      .select('*')
+      .eq('id', result.expense_id)
+      .single();
+    return res.status(201).json(expense);
   } catch (err) {
     console.error('[ivy] create expense error:', err.message);
     return res.status(500).json({ error: 'Failed to create expense' });
