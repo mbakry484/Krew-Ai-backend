@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
+const { verifyKrewAppAuth } = require('../middleware/krewAppAuth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
@@ -293,7 +294,7 @@ router.get('/shopify/callback', async (req, res) => {
 
     const tokenData = await tokenResponse.json();
     console.log('🔑 Shopify token response:', JSON.stringify(tokenData, null, 2));
-    const { access_token, refresh_token, expires_in } = tokenData;
+    const { access_token, refresh_token, expires_in, refresh_token_expires_in } = tokenData;
 
     if (!access_token) {
       console.error('No access token received from Shopify');
@@ -307,6 +308,11 @@ router.get('/shopify/callback', async (req, res) => {
     // Calculate token expiry (Shopify expiring tokens last ~1 hour)
     const token_expires_at = expires_in
       ? new Date(Date.now() + expires_in * 1000).toISOString()
+      : null;
+    // The refresh token has its own (longer) expiry — store it so we can detect a
+    // dead refresh token and prompt a reconnect instead of firing a doomed refresh.
+    const refresh_token_expires_at = refresh_token_expires_in
+      ? new Date(Date.now() + refresh_token_expires_in * 1000).toISOString()
       : null;
 
     // Fetch the brand's published storefront domain (custom domain if configured,
@@ -327,6 +333,7 @@ router.get('/shopify/callback', async (req, res) => {
         access_token,
         refresh_token: refresh_token || null,
         token_expires_at,
+        refresh_token_expires_at,
         storefront_url,
         platform: 'shopify'
       }, {
@@ -538,14 +545,10 @@ router.get('/shopify/status', verifyToken, async (req, res) => {
  * Unprotected endpoint - accepts shop_domain as query param
  * Used by: Shopify app embedded in Shopify admin
  */
-router.get('/shopify/app-status', async (req, res) => {
+router.get('/shopify/app-status', verifyKrewAppAuth, async (req, res) => {
   try {
-    const { shop_domain } = req.query;
-
-    // Validate required parameter
-    if (!shop_domain) {
-      return res.status(400).json({ error: 'shop_domain query parameter is required' });
-    }
+    // Shop comes from the verified signed header, not from user-supplied params.
+    const shop_domain = req.shopDomain;
 
     // Query the integrations table
     const { data: integration, error: fetchError } = await supabase
