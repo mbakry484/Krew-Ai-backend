@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 const { getValidAccessToken, getStorefrontUrl } = require('../lib/shopify');
+const { verifyKrewAppAuth } = require('../middleware/krewAppAuth');
 
 // POST /products/sync - Bulk sync products from Shopify
 router.post('/sync', async (req, res) => {
@@ -446,10 +447,9 @@ router.post('/shop/redact', async (req, res) => {
 });
 
 // GET /webhook/shopify/sync-status?shop_domain=x — poll sync state from embedded app
-router.get('/sync-status', async (req, res) => {
+router.get('/sync-status', verifyKrewAppAuth, async (req, res) => {
   try {
-    const { shop_domain } = req.query;
-    if (!shop_domain) return res.status(400).json({ error: 'shop_domain required' });
+    const shop_domain = req.shopDomain;
 
     const { data: integration } = await supabase
       .from('integrations')
