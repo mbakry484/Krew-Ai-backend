@@ -201,6 +201,7 @@ router.post('/product-update', async (req, res) => {
           shopify_product_id: product.shopify_product_id,
           name: product.name,
           image_url: product.image_url,
+          images: product.images || null,
           product_type: product.product_type || null,
           description: product.description || null
         }).catch(err =>
