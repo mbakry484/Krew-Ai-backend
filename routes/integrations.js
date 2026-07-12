@@ -293,8 +293,9 @@ router.get('/shopify/callback', async (req, res) => {
     }
 
     const tokenData = await tokenResponse.json();
-    console.log('🔑 Shopify token response:', JSON.stringify(tokenData, null, 2));
-    const { access_token, refresh_token, expires_in, refresh_token_expires_in } = tokenData;
+    const { access_token, refresh_token, expires_in, refresh_token_expires_in, scope } = tokenData;
+    // Never log token values or the raw response body — only non-sensitive metadata.
+    console.log('🔑 Shopify token response:', { scope, expires_in, refresh_token_expires_in, has_refresh_token: !!refresh_token });
 
     if (!access_token) {
       console.error('No access token received from Shopify');
