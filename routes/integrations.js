@@ -6,6 +6,8 @@ const { verifyKrewAppAuth } = require('../middleware/krewAppAuth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { syncShopifyCosts } = require('../lib/ivy/costs');
+const { bareVariantId } = require('../lib/ivy/variants');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,7 +32,11 @@ async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = f
           node {
             id title handle description onlineStoreUrl productType
             images(first: 20) { edges { node { url altText width height } } }
-            variants(first: 10) { edges { node { id title price inventoryQuantity } } }
+            variants(first: 10) { edges { node {
+              id title price sku inventoryQuantity
+              image { url }
+              inventoryItem { unitCost { amount } }
+            } } }
           }
         }
       }
@@ -134,6 +140,23 @@ async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = f
       if (error) throw error;
 
       totalSynced += productsToUpsert.length;
+
+      // Absorb Shopify "cost per item" into ivy_product_costs (manual rows win,
+      // unchanged values are skipped). A cost failure must not break the sync.
+      try {
+        const variantCosts = productsToUpsert.flatMap((p) =>
+          (p.variants || []).map((v) => ({
+            variantId: bareVariantId(v.id),
+            shopifyUnitCost: v.inventoryItem?.unitCost?.amount != null
+              ? Number(v.inventoryItem.unitCost.amount)
+              : null,
+          }))
+        );
+        const { inserted } = await syncShopifyCosts(brand_id, variantCosts);
+        if (inserted > 0) console.log(`  💰 Recorded ${inserted} Shopify unit cost(s) for ${shop}`);
+      } catch (err) {
+        console.error(`❌ Shopify cost sync failed for ${shop}:`, err.message);
+      }
     }
 
     page++;
@@ -742,4 +765,74 @@ router.delete('/disconnect', verifyToken, async (req, res) => {
   }
 });
 
+/**
+ * POST /integrations/bosta/connect  { api_key }
+ * Store the brand's Bosta API key (platform='bosta' row in integrations).
+ * The key itself is not exercised here — Ivy's revenue pipeline is fed by the
+ * Bosta webhook (routes/bosta.js); the key is kept for future pull-based
+ * reconciliation.
+ */
+router.post('/bosta/connect', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const apiKey = (req.body?.api_key || '').trim();
+    if (!apiKey) return res.status(400).json({ error: 'api_key is required' });
+
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
+    const { data: existing } = await supabase
+      .from('integrations')
+      .select('id')
+      .eq('brand_id', user.brand_id)
+      .eq('platform', 'bosta')
+      .maybeSingle();
+
+    const row = { brand_id: user.brand_id, platform: 'bosta', access_token: apiKey, updated_at: new Date().toISOString() };
+    const { error } = existing
+      ? await supabase.from('integrations').update(row).eq('id', existing.id)
+      : await supabase.from('integrations').insert(row);
+    if (error) throw error;
+
+    res.json({ success: true, webhook_path: `/webhook/bosta/${user.brand_id}` });
+  } catch (error) {
+    console.error('Bosta connect error:', error);
+    res.status(500).json({ error: 'Failed to connect Bosta' });
+  }
+});
+
+/** DELETE /integrations/bosta/disconnect — remove the stored Bosta API key. */
+router.delete('/bosta/disconnect', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { data: user } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+    if (!user?.brand_id) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const { error } = await supabase
+      .from('integrations')
+      .delete()
+      .eq('brand_id', user.brand_id)
+      .eq('platform', 'bosta');
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Bosta disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Bosta' });
+  }
+});
+
 module.exports = router;
+// Exposed for the nightly Ivy cron (full product + cost reconcile), matching
+// the routes/telegram.js pattern of attaching helpers to the router export.
+module.exports.autoSyncProducts = autoSyncProducts;

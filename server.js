@@ -24,10 +24,13 @@ const voiceRoutes = require('./routes/voice');
 const ivyRoutes = require('./routes/ivy');
 const membersRoutes = require('./routes/members');
 const telegramRoutes = require('./routes/telegram');
+const bostaRoutes = require('./routes/bosta');
 const supabase = require('./lib/supabase');
 const { client: aiClient, provider: aiProvider } = require('./lib/ai-provider');
 const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 const { startInteractionAnalysisCron } = require('./cron/interactionAnalysis');
+const { startIvyNightlyCron } = require('./cron/ivyNightly');
+const { startIvyWeeklyReportCron } = require('./cron/ivyWeeklyReport');
 
 const app = express();
 
@@ -136,6 +139,7 @@ app.use('/api/voice', voiceRoutes);
 app.use('/ivy', ivyRoutes);
 app.use('/members', membersRoutes);
 app.use('/webhook/telegram', telegramRoutes);
+app.use('/webhook/bosta', bostaRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -153,4 +157,8 @@ app.listen(PORT, () => {
 
   // Start interaction analysis cron job (every 5 minutes)
   startInteractionAnalysisCron();
+
+  // Ivy: nightly stock/velocity/alerts reconcile + Sunday-morning P&L report
+  startIvyNightlyCron();
+  startIvyWeeklyReportCron();
 });
