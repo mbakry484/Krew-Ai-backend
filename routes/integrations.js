@@ -221,16 +221,60 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
 
     const brandId = user.brand_id;
 
-    // Check if this Shopify store is already connected to another brand
+    // Load the existing integration row for this shop, if any. The embedded
+    // Shopify app's SDK creates it at install time with brand_id NULL
+    // ("installed but not linked to a Krew account").
     const { data: existingShopify } = await supabase
       .from('integrations')
-      .select('brand_id')
+      .select('*')
       .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify')
       .maybeSingle();
 
-    if (existingShopify && existingShopify.brand_id !== brandId) {
+    if (existingShopify?.brand_id && existingShopify.brand_id !== brandId) {
       return res.status(409).json({ error: 'This Shopify store is already connected to another brand' });
+    }
+
+    // App already installed → LINK the existing row instead of minting a second
+    // offline token via OAuth (Shopify allows one refreshable offline token per
+    // app+store; the embedded app's SDK owns minting now).
+    if (existingShopify) {
+      try {
+        const accessToken = await getValidAccessToken(existingShopify);
+
+        let storefrontUrl = existingShopify.storefront_url || null;
+        if (!storefrontUrl) {
+          try {
+            storefrontUrl = await getStorefrontUrl(shop_domain, accessToken);
+          } catch (err) {
+            console.error('⚠️ Failed to fetch storefront URL during link:', err.message);
+          }
+        }
+
+        const { error: linkError } = await supabase
+          .from('integrations')
+          .update({ brand_id: brandId, storefront_url: storefrontUrl })
+          .eq('id', existingShopify.id);
+
+        if (linkError) {
+          console.error('Error linking integration:', linkError);
+          return res.status(500).json({ error: 'Failed to link store' });
+        }
+
+        console.log(`🔗 Linked ${shop_domain} to brand ${brandId} (no OAuth mint)`);
+
+        // Sync the catalog in the background, same as the OAuth callback does.
+        autoSyncProducts({ shop: shop_domain, access_token: accessToken, brand_id: brandId }).catch(err =>
+          console.error('❌ Auto-sync failed after link:', err.message)
+        );
+
+        return res.json({ linked: true, shop_domain });
+      } catch (err) {
+        // Row exists but its tokens are unusable (e.g. uninstall leftovers).
+        // Fall back to the OAuth mint below — it upserts into the same row, so
+        // the lineage stays single.
+        console.warn(`⚠️ ${shop_domain}: existing integration has no usable token (${err.message}) — falling back to OAuth.`);
+      }
     }
 
     const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
@@ -243,7 +287,9 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
     );
 
     // Build Shopify OAuth URL
-    const scopes = 'read_products,write_products,read_orders,write_orders,read_inventory';
+    // Keep in sync with [access_scopes] in the embedded app's shopify.app.toml
+    // so a backend-minted lineage carries the same grants as SDK-minted ones.
+    const scopes = 'read_products,write_products,write_orders,read_orders,read_inventory,write_metaobject_definitions,write_metaobjects';
     const redirectUri = `${backendUrl}/integrations/shopify/callback`;
     const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
 
@@ -361,7 +407,7 @@ router.get('/shopify/callback', async (req, res) => {
         storefront_url,
         platform: 'shopify'
       }, {
-        onConflict: 'shopify_shop_domain'
+        onConflict: 'platform,shopify_shop_domain'
       });
 
     if (upsertError) {
