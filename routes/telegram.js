@@ -109,6 +109,25 @@ async function handleMessage(chatId, text) {
     return;
   }
 
+  // /report — the month-to-date P&L as one message. Owner-only: it contains
+  // revenue/profit figures media buyers must never see.
+  if (/^\/report\b/.test(text)) {
+    if (channel.role !== 'owner') {
+      await sendMessage(chatId, "Reports are owner-only — I can log expenses for you though.");
+      return;
+    }
+    try {
+      // Lazy require avoids a module cycle (lib/ivy/alerts.js imports this file).
+      const { buildReportMessage } = require('../lib/ivy/report');
+      const period = /last month/i.test(text) ? 'last_month' : 'this_month';
+      await sendMessage(chatId, await buildReportMessage(channel.brand_id, period));
+    } catch (err) {
+      console.error('[telegram] /report error:', err.message);
+      await sendMessage(chatId, "Sorry, I couldn't pull your report just now. Try again in a moment.");
+    }
+    return;
+  }
+
   const reply = await runIvyAgent({
     chatId: String(chatId),
     brandId: channel.brand_id,

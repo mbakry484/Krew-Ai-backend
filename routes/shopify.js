@@ -435,6 +435,11 @@ router.post('/shop/redact', async (req, res) => {
     await supabase.from('refunds').delete().eq('brand_id', brandId);
     await supabase.from('exchanges').delete().eq('brand_id', brandId);
 
+    // Ivy's Shopify-derived data (order lines cascade with ivy_orders)
+    await supabase.from('ivy_orders').delete().eq('brand_id', brandId);
+    await supabase.from('ivy_product_costs').delete().eq('brand_id', brandId);
+    await supabase.from('ivy_product_stats').delete().eq('brand_id', brandId);
+
     // Remove the Shopify integration record
     await supabase.from('integrations').delete().eq('id', integration.id);
 

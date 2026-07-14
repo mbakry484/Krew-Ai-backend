@@ -6,6 +6,8 @@ const { verifyKrewAppAuth } = require('../middleware/krewAppAuth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
 const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { syncShopifyCosts } = require('../lib/ivy/costs');
+const { bareVariantId } = require('../lib/ivy/variants');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,7 +32,11 @@ async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = f
           node {
             id title handle description onlineStoreUrl productType
             images(first: 20) { edges { node { url altText width height } } }
-            variants(first: 10) { edges { node { id title price inventoryQuantity } } }
+            variants(first: 10) { edges { node {
+              id title price sku inventoryQuantity
+              image { url }
+              inventoryItem { unitCost { amount } }
+            } } }
           }
         }
       }
@@ -134,6 +140,23 @@ async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = f
       if (error) throw error;
 
       totalSynced += productsToUpsert.length;
+
+      // Absorb Shopify "cost per item" into ivy_product_costs (manual rows win,
+      // unchanged values are skipped). A cost failure must not break the sync.
+      try {
+        const variantCosts = productsToUpsert.flatMap((p) =>
+          (p.variants || []).map((v) => ({
+            variantId: bareVariantId(v.id),
+            shopifyUnitCost: v.inventoryItem?.unitCost?.amount != null
+              ? Number(v.inventoryItem.unitCost.amount)
+              : null,
+          }))
+        );
+        const { inserted } = await syncShopifyCosts(brand_id, variantCosts);
+        if (inserted > 0) console.log(`  💰 Recorded ${inserted} Shopify unit cost(s) for ${shop}`);
+      } catch (err) {
+        console.error(`❌ Shopify cost sync failed for ${shop}:`, err.message);
+      }
     }
 
     page++;
@@ -198,16 +221,60 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
 
     const brandId = user.brand_id;
 
-    // Check if this Shopify store is already connected to another brand
+    // Load the existing integration row for this shop, if any. The embedded
+    // Shopify app's SDK creates it at install time with brand_id NULL
+    // ("installed but not linked to a Krew account").
     const { data: existingShopify } = await supabase
       .from('integrations')
-      .select('brand_id')
+      .select('*')
       .eq('shopify_shop_domain', shop_domain)
       .eq('platform', 'shopify')
       .maybeSingle();
 
-    if (existingShopify && existingShopify.brand_id !== brandId) {
+    if (existingShopify?.brand_id && existingShopify.brand_id !== brandId) {
       return res.status(409).json({ error: 'This Shopify store is already connected to another brand' });
+    }
+
+    // App already installed → LINK the existing row instead of minting a second
+    // offline token via OAuth (Shopify allows one refreshable offline token per
+    // app+store; the embedded app's SDK owns minting now).
+    if (existingShopify) {
+      try {
+        const accessToken = await getValidAccessToken(existingShopify);
+
+        let storefrontUrl = existingShopify.storefront_url || null;
+        if (!storefrontUrl) {
+          try {
+            storefrontUrl = await getStorefrontUrl(shop_domain, accessToken);
+          } catch (err) {
+            console.error('⚠️ Failed to fetch storefront URL during link:', err.message);
+          }
+        }
+
+        const { error: linkError } = await supabase
+          .from('integrations')
+          .update({ brand_id: brandId, storefront_url: storefrontUrl })
+          .eq('id', existingShopify.id);
+
+        if (linkError) {
+          console.error('Error linking integration:', linkError);
+          return res.status(500).json({ error: 'Failed to link store' });
+        }
+
+        console.log(`🔗 Linked ${shop_domain} to brand ${brandId} (no OAuth mint)`);
+
+        // Sync the catalog in the background, same as the OAuth callback does.
+        autoSyncProducts({ shop: shop_domain, access_token: accessToken, brand_id: brandId }).catch(err =>
+          console.error('❌ Auto-sync failed after link:', err.message)
+        );
+
+        return res.json({ linked: true, shop_domain });
+      } catch (err) {
+        // Row exists but its tokens are unusable (e.g. uninstall leftovers).
+        // Fall back to the OAuth mint below — it upserts into the same row, so
+        // the lineage stays single.
+        console.warn(`⚠️ ${shop_domain}: existing integration has no usable token (${err.message}) — falling back to OAuth.`);
+      }
     }
 
     const backendUrl = process.env.BACKEND_URL || 'https://krew-ai-backend-production.up.railway.app';
@@ -220,7 +287,9 @@ router.post('/shopify/connect', verifyToken, async (req, res) => {
     );
 
     // Build Shopify OAuth URL
-    const scopes = 'read_products,write_products,read_orders,write_orders,read_inventory';
+    // Keep in sync with [access_scopes] in the embedded app's shopify.app.toml
+    // so a backend-minted lineage carries the same grants as SDK-minted ones.
+    const scopes = 'read_products,write_products,write_orders,read_orders,read_inventory,write_metaobject_definitions,write_metaobjects';
     const redirectUri = `${backendUrl}/integrations/shopify/callback`;
     const oauthUrl = `https://${shop_domain}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${state}`;
 
@@ -338,7 +407,7 @@ router.get('/shopify/callback', async (req, res) => {
         storefront_url,
         platform: 'shopify'
       }, {
-        onConflict: 'shopify_shop_domain'
+        onConflict: 'platform,shopify_shop_domain'
       });
 
     if (upsertError) {
@@ -742,4 +811,74 @@ router.delete('/disconnect', verifyToken, async (req, res) => {
   }
 });
 
+/**
+ * POST /integrations/bosta/connect  { api_key }
+ * Store the brand's Bosta API key (platform='bosta' row in integrations).
+ * The key itself is not exercised here — Ivy's revenue pipeline is fed by the
+ * Bosta webhook (routes/bosta.js); the key is kept for future pull-based
+ * reconciliation.
+ */
+router.post('/bosta/connect', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const apiKey = (req.body?.api_key || '').trim();
+    if (!apiKey) return res.status(400).json({ error: 'api_key is required' });
+
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+    if (userError || !user?.brand_id) {
+      return res.status(400).json({ error: 'No brand found for this user' });
+    }
+
+    const { data: existing } = await supabase
+      .from('integrations')
+      .select('id')
+      .eq('brand_id', user.brand_id)
+      .eq('platform', 'bosta')
+      .maybeSingle();
+
+    const row = { brand_id: user.brand_id, platform: 'bosta', access_token: apiKey, updated_at: new Date().toISOString() };
+    const { error } = existing
+      ? await supabase.from('integrations').update(row).eq('id', existing.id)
+      : await supabase.from('integrations').insert(row);
+    if (error) throw error;
+
+    res.json({ success: true, webhook_path: `/webhook/bosta/${user.brand_id}` });
+  } catch (error) {
+    console.error('Bosta connect error:', error);
+    res.status(500).json({ error: 'Failed to connect Bosta' });
+  }
+});
+
+/** DELETE /integrations/bosta/disconnect — remove the stored Bosta API key. */
+router.delete('/bosta/disconnect', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { data: user } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', userId)
+      .single();
+    if (!user?.brand_id) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const { error } = await supabase
+      .from('integrations')
+      .delete()
+      .eq('brand_id', user.brand_id)
+      .eq('platform', 'bosta');
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Bosta disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Bosta' });
+  }
+});
+
 module.exports = router;
+// Exposed for the nightly Ivy cron (full product + cost reconcile), matching
+// the routes/telegram.js pattern of attaching helpers to the router export.
+module.exports.autoSyncProducts = autoSyncProducts;
