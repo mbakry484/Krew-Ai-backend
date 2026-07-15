@@ -32,30 +32,62 @@ function toTelegramHtml(text) {
   return escaped.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
 }
 
-async function sendMessage(chatId, text) {
+// replyMarkup (optional) attaches an inline keyboard, e.g. { inline_keyboard: [[…]] }.
+async function sendMessage(chatId, text, replyMarkup = null) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error('[telegram] TELEGRAM_BOT_TOKEN is not set — cannot send message');
     return;
   }
+  const markup = replyMarkup ? { reply_markup: replyMarkup } : {};
   const post = (body) => fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   try {
-    let resp = await post({ chat_id: chatId, text: toTelegramHtml(text), parse_mode: 'HTML' });
+    let resp = await post({ chat_id: chatId, ...markup, text: toTelegramHtml(text), parse_mode: 'HTML' });
     if (!resp.ok) {
       // Bad entities (400) must never eat the message — retry as plain text.
       const body = await resp.text();
       console.error('[telegram] HTML sendMessage failed, retrying plain:', resp.status, body);
-      resp = await post({ chat_id: chatId, text: String(text).replace(/\*\*/g, '') });
+      resp = await post({ chat_id: chatId, ...markup, text: String(text).replace(/\*\*/g, '') });
       if (!resp.ok) {
         console.error('[telegram] sendMessage failed:', resp.status, await resp.text());
       }
     }
   } catch (err) {
     console.error('[telegram] sendMessage error:', err.message);
+  }
+}
+
+// Acknowledge a button tap so Telegram stops the loading spinner on the button.
+async function answerCallbackQuery(callbackQueryId, text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
+    });
+  } catch (err) {
+    console.error('[telegram] answerCallbackQuery error:', err.message);
+  }
+}
+
+// Strip the inline keyboard off a message (so pool buttons can't be tapped twice).
+async function removeInlineKeyboard(chatId, messageId) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/editMessageReplyMarkup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+    });
+  } catch (err) {
+    console.error('[telegram] removeInlineKeyboard error:', err.message);
   }
 }
 
@@ -153,7 +185,61 @@ async function handleMessage(chatId, text) {
     role: channel.role,
     userText: text,
   });
-  await sendMessage(chatId, reply);
+  // Ivy may return a directive to show tappable pool buttons instead of text.
+  if (reply && typeof reply === 'object' && reply.kind === 'buttons') {
+    await sendMessage(chatId, reply.text, { inline_keyboard: reply.keyboard });
+  } else {
+    await sendMessage(chatId, reply);
+  }
+}
+
+// ── Handle a pool-button tap (callback_query) ────────────────────────────────
+async function handleCallback(callbackQuery) {
+  await answerCallbackQuery(callbackQuery.id); // clear the spinner regardless
+
+  const chatId = callbackQuery.message && callbackQuery.message.chat && callbackQuery.message.chat.id;
+  const messageId = callbackQuery.message && callbackQuery.message.message_id;
+  const data = callbackQuery.data || '';
+  if (!chatId || !data.startsWith('pool.')) return;
+
+  // callback_data is "pool.<choiceId>.<capitalId>" (capital UUIDs have no dots).
+  const parts = data.split('.');
+  const choiceId = parts[1];
+  const capitalId = parts.slice(2).join('.');
+  if (!choiceId || !capitalId) return;
+
+  const { data: channel } = await supabase
+    .from('owner_channels')
+    .select('brand_id, role')
+    .eq('channel', 'telegram')
+    .eq('channel_user_id', String(chatId))
+    .maybeSingle();
+  if (!channel || !channel.brand_id) return;
+
+  // Remove the keyboard first so a second tap can't double-deduct.
+  if (messageId) await removeInlineKeyboard(chatId, messageId);
+
+  try {
+    // Lazy require mirrors runIvyAgent's import direction (avoids a module cycle).
+    const { finalizePoolChoice } = require('../lib/agents/ivy-agent');
+    const res = await finalizePoolChoice({
+      chatId: String(chatId),
+      brandId: channel.brand_id,
+      role: channel.role,
+      capitalId,
+      choiceId,
+    });
+    if (res.ok) {
+      await sendMessage(chatId, res.text);
+    } else if (res.error === 'expired') {
+      // Almost always a double-tap or a superseded button — stay silent.
+    } else {
+      await sendMessage(chatId, "Sorry, I couldn't log that just now. Try sending the expense again.");
+    }
+  } catch (err) {
+    console.error('[telegram] callback processing error:', err.message);
+    await sendMessage(chatId, "Sorry, something went wrong logging that. Please try again.");
+  }
 }
 
 // ── Webhook ──────────────────────────────────────────────────────────────────
@@ -169,6 +255,13 @@ router.post('/', async (req, res) => {
   res.sendStatus(200);
 
   try {
+    // A tapped inline button arrives as a callback_query, not a message.
+    const callbackQuery = req.body && req.body.callback_query;
+    if (callbackQuery) {
+      await handleCallback(callbackQuery);
+      return;
+    }
+
     const message = req.body && req.body.message;
     if (!message || !message.chat) return;
 
