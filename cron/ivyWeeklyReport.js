@@ -7,7 +7,7 @@ const { periodRange } = require('../lib/ivy/profit');
 // =============================================================================
 // IVY WEEKLY REPORT — Sunday 09:00 Cairo, Telegram, owners only
 // =============================================================================
-// Sends the month-to-date P&L to every brand that (a) has a verified owner
+// Sends the "week in numbers" skeleton to every brand that (a) has a verified owner
 // Telegram chat and (b) had any activity in the last 7 days — an expense
 // logged or a delivery/return booked. Quiet brands get no message.
 // =============================================================================
@@ -50,7 +50,8 @@ async function runIvyWeeklyReport() {
   for (const [brandId, chatIds] of byBrand) {
     try {
       if (!(await brandHadRecentActivity(brandId))) continue;
-      const message = `🗞 Your weekly Ivy report\n\n${await buildReportMessage(brandId, 'this_month')}`;
+      // The skeleton carries its own 📊 header — no wrapper line.
+      const message = await buildReportMessage(brandId, 'last_7');
       for (const chatId of chatIds) {
         await sendMessage(chatId, message);
         sent++;
