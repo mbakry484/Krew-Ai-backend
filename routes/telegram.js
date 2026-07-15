@@ -22,21 +22,37 @@ const { runIvyAgent } = require('../lib/agents/ivy-agent');
 // =============================================================================
 
 // ── Telegram Bot API: send a text message ────────────────────────────────────
+// Ivy writes **bold** markdown (money amounts, report headers). Telegram needs
+// parse_mode for that, so escape everything else and convert **…** → <b>…</b>.
+function toTelegramHtml(text) {
+  const escaped = String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return escaped.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+}
+
 async function sendMessage(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error('[telegram] TELEGRAM_BOT_TOKEN is not set — cannot send message');
     return;
   }
+  const post = (body) => fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
   try {
-    const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    });
+    let resp = await post({ chat_id: chatId, text: toTelegramHtml(text), parse_mode: 'HTML' });
     if (!resp.ok) {
+      // Bad entities (400) must never eat the message — retry as plain text.
       const body = await resp.text();
-      console.error('[telegram] sendMessage failed:', resp.status, body);
+      console.error('[telegram] HTML sendMessage failed, retrying plain:', resp.status, body);
+      resp = await post({ chat_id: chatId, text: String(text).replace(/\*\*/g, '') });
+      if (!resp.ok) {
+        console.error('[telegram] sendMessage failed:', resp.status, await resp.text());
+      }
     }
   } catch (err) {
     console.error('[telegram] sendMessage error:', err.message);
@@ -109,8 +125,9 @@ async function handleMessage(chatId, text) {
     return;
   }
 
-  // /report — the month-to-date P&L as one message. Owner-only: it contains
-  // revenue/profit figures media buyers must never see.
+  // /report — the fixed report skeleton as one message. Defaults to the week
+  // ("/report month" / "/report last month" for months). Owner-only: it
+  // contains revenue/profit figures media buyers must never see.
   if (/^\/report\b/.test(text)) {
     if (channel.role !== 'owner') {
       await sendMessage(chatId, "Reports are owner-only — I can log expenses for you though.");
@@ -119,7 +136,9 @@ async function handleMessage(chatId, text) {
     try {
       // Lazy require avoids a module cycle (lib/ivy/alerts.js imports this file).
       const { buildReportMessage } = require('../lib/ivy/report');
-      const period = /last month/i.test(text) ? 'last_month' : 'this_month';
+      const period = /last month/i.test(text) ? 'last_month'
+        : /month/i.test(text) ? 'this_month'
+        : 'last_7';
       await sendMessage(chatId, await buildReportMessage(channel.brand_id, period));
     } catch (err) {
       console.error('[telegram] /report error:', err.message);
