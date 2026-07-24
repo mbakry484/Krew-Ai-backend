@@ -10,6 +10,7 @@ const { getValidPageToken } = require('../src/utils/metaToken');
 const { logUsage } = require('../lib/usage-logger');
 const { trackInteraction } = require('../lib/interaction-tracker');
 const { shopifyGraphQL, getValidAccessToken, getShopifyOrderByNumber, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { decryptSecret } = require('../lib/crypto');
 const { runStepDetector, postAiReplyTransition, postValidationTransition } = require('../lib/flow-detector');
 const { downloadImageAsBase64, describeImageItemsForSearch, embedText } = require('../lib/embeddings');
 const { garmentTypePenalty } = require('../lib/garment-vocab');
@@ -472,7 +473,8 @@ async function handleIncomingMessage(messagingEvents, recipientId) {
       return;
     }
 
-    const { brand_id, access_token: integrationToken } = integration;
+    const { brand_id } = integration;
+    const integrationToken = decryptSecret(integration.access_token);
     // Brand resolved from integration lookup
 
     // Try to get a managed long-lived page token, fall back to integrations table token
@@ -2016,7 +2018,7 @@ Now show these products to the customer and proceed with Step 2 of the exchange/
           try {
             fallbackToken = await getValidPageToken(integration.brand_id);
           } catch {
-            fallbackToken = integration?.access_token;
+            fallbackToken = decryptSecret(integration?.access_token);
           }
         }
       } catch (_) {}

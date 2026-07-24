@@ -1,6 +1,11 @@
 const supabase = require('../../lib/supabase');
+const { encryptSecret, decryptSecret } = require('../../lib/crypto');
 
 const INSTAGRAM_GRAPH_BASE = 'https://graph.instagram.com';
+
+// Instagram tokens are encrypted at rest (lib/crypto.js). getValidPageToken and
+// refreshPageToken are the read boundaries — they return PLAINTEXT, so every
+// caller (webhook DM flow, cron, routes) keeps working unchanged. Writes encrypt.
 
 /**
  * Refresh a long-lived Instagram user token.
@@ -37,7 +42,7 @@ async function refreshLongLivedToken(currentToken) {
 async function syncTokenToIntegrations(brandId, accessToken) {
   const { error } = await supabase
     .from('integrations')
-    .update({ access_token: accessToken })
+    .update({ access_token: encryptSecret(accessToken) })
     .eq('brand_id', brandId)
     .eq('platform', 'instagram');
 
@@ -72,15 +77,16 @@ async function refreshPageToken(brandId) {
   }
 
   // Refresh the long-lived token for another 60 days
-  const { access_token: freshToken, expires_in } = await refreshLongLivedToken(brand.long_lived_user_token);
+  const { access_token: freshToken, expires_in } = await refreshLongLivedToken(decryptSecret(brand.long_lived_user_token));
   const expiresAt = new Date(Date.now() + expires_in * 1000).toISOString();
 
-  // Save the refreshed token to brands table
+  // Save the refreshed token to brands table (encrypted at rest)
+  const encrypted = encryptSecret(freshToken);
   const { error: updateError } = await supabase
     .from('brands')
     .update({
-      page_access_token: freshToken,
-      long_lived_user_token: freshToken,
+      page_access_token: encrypted,
+      long_lived_user_token: encrypted,
       token_expires_at: expiresAt
     })
     .eq('id', brandId);
@@ -113,8 +119,9 @@ async function getValidPageToken(brandId) {
     throw new Error(`Brand ${brandId} not found: ${fetchError?.message || 'not found'}`);
   }
 
-  // Use whichever token is available (they are the same in the new flow)
-  const currentToken = brand.page_access_token || brand.long_lived_user_token;
+  // Use whichever token is available (they are the same in the new flow).
+  // Read boundary: decrypt here so callers always get a usable token.
+  const currentToken = decryptSecret(brand.page_access_token || brand.long_lived_user_token);
   if (!currentToken) {
     throw new Error(`Brand ${brandId} has no Instagram token. Run the OAuth flow first.`);
   }

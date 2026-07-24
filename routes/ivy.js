@@ -8,6 +8,7 @@ const { getLatestCosts, setManualCost } = require('../lib/ivy/costs');
 const { explodeVariants, bareVariantId } = require('../lib/ivy/variants');
 const { getProductStats } = require('../lib/ivy/stats');
 const { getAlertPreferences } = require('../lib/ivy/alerts');
+const { getPayoutReconciliation } = require('../lib/bosta/reconcile');
 
 // =============================================================================
 // IVY — FINANCIAL VISIBILITY · backend
@@ -608,6 +609,63 @@ router.get('/telegram/link-code', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[ivy] link-code error:', err.message);
     return res.status(500).json({ error: 'Failed to generate link code' });
+  }
+});
+
+// =============================================================================
+// BOSTA — payout reconciliation + unmatched deliveries
+// =============================================================================
+
+/**
+ * GET /ivy/bosta/reconciliation?from=&to=
+ *
+ * Expected Bosta payout (Σ delivered COD − Σ fees − Σ returned COD) against
+ * what the founder actually logged landing in a pool. Defaults to the last
+ * completed Sunday→Sunday week, matching Bosta's weekly payout cycle.
+ *
+ * Read-only by design: this NEVER credits a pool. Cash only moves when the
+ * founder logs the real payout — auto-crediting an estimate is exactly the
+ * invented money the two-layer split exists to prevent.
+ */
+router.get('/bosta/reconciliation', verifyToken, async (req, res) => {
+  try {
+    const brandId = await resolveBrandId(req);
+    if (!brandId) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const { from, to } = req.query;
+    const result = await getPayoutReconciliation(brandId, {
+      from: from || undefined,
+      to: to || undefined,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('[ivy] reconciliation error:', err.message);
+    res.status(500).json({ error: 'Failed to compute reconciliation' });
+  }
+});
+
+/**
+ * GET /ivy/bosta/unmatched — deliveries whose COD we counted as revenue but
+ * whose businessReference never resolved to a Shopify order, so COGS is
+ * unknown. The repair list behind the cost-coverage number.
+ */
+router.get('/bosta/unmatched', verifyToken, async (req, res) => {
+  try {
+    const brandId = await resolveBrandId(req);
+    if (!brandId) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const { data, error } = await supabase
+      .from('unmatched_bosta_deliveries')
+      .select('*')
+      .eq('brand_id', brandId)
+      .order('first_delivered_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+
+    res.json({ deliveries: data || [], count: (data || []).length });
+  } catch (err) {
+    console.error('[ivy] unmatched deliveries error:', err.message);
+    res.status(500).json({ error: 'Failed to load unmatched deliveries' });
   }
 });
 

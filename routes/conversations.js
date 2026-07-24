@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../lib/supabase');
 const { verifyToken } = require('../middleware/auth');
 const { sendDM } = require('../lib/meta');
+const { decryptSecret } = require('../lib/crypto');
 
 /**
  * GET /conversations
@@ -308,9 +309,10 @@ router.post('/:id/messages', verifyToken, async (req, res) => {
       } else if (!integration.access_token) {
         console.error('❌ Integration found but access_token is empty for brand_id:', conv.brand_id);
       } else {
-        console.log(`🔑 Using token for page ${integration.instagram_page_id}: ${integration.access_token.substring(0, 15)}...`);
+        const igToken = decryptSecret(integration.access_token);
+        console.log(`🔑 Using token for page ${integration.instagram_page_id}`);
         try {
-          await sendDM(conv.customer_id, content.trim(), integration.access_token);
+          await sendDM(conv.customer_id, content.trim(), igToken);
           console.log(`✅ Agent DM delivered to Instagram user ${conv.customer_id}`);
         } catch (dmErr) {
           console.error('❌ sendDM failed:', dmErr.message);

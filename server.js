@@ -31,6 +31,8 @@ const { startTokenRefreshCron } = require('./cron/tokenRefresh');
 const { startInteractionAnalysisCron } = require('./cron/interactionAnalysis');
 const { startIvyNightlyCron } = require('./cron/ivyNightly');
 const { startIvyWeeklyReportCron } = require('./cron/ivyWeeklyReport');
+const { startBostaSyncCron } = require('./cron/bostaSync');
+const { isEncryptionEnabled } = require('./lib/crypto');
 
 const app = express();
 
@@ -108,6 +110,12 @@ app.get('/health', async (req, res) => {
     checks.openai = false;
   }
 
+  // Surfaced, not asserted: a missing KREW_ENCRYPTION_KEY silently stores
+  // credentials in plaintext, which is exactly the kind of thing that's only
+  // ever noticed long after it matters. Not part of the healthy/degraded gate —
+  // it's a config fact, not an outage.
+  checks.encryption_at_rest = isEncryptionEnabled();
+
   const healthy = checks.supabase && checks.openai;
   res.status(healthy ? 200 : 503).json({
     status: healthy ? 'ok' : 'degraded',
@@ -161,4 +169,7 @@ app.listen(PORT, () => {
   // Ivy: nightly stock/velocity/alerts reconcile + Sunday-morning P&L report
   startIvyNightlyCron();
   startIvyWeeklyReportCron();
+
+  // Bosta: poll deliveries every 10 min, apply finance events every minute
+  startBostaSyncCron();
 });

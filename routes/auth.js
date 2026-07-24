@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const supabase = require('../lib/supabase');
 const { verifyToken, resolveUserFromToken } = require('../middleware/auth');
 const { syncTokenToIntegrations } = require('../src/services/metaTokenService');
+const { encryptSecret } = require('../lib/crypto');
 
 const crypto = require('crypto');
 
@@ -635,15 +636,17 @@ router.get('/instagram/callback', async (req, res) => {
       return res.redirect(`${dashboardUrl}?error=instagram_already_connected`);
     }
 
-    // Step 4: Save to brands table
+    // Step 4: Save to brands table (tokens encrypted at rest — lib/crypto.js;
+    // src/services/metaTokenService.js decrypts on read)
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+    const encryptedUserToken = encryptSecret(longLivedUserToken);
 
     const { error: updateError } = await supabase
       .from('brands')
       .update({
         fb_page_id: null,
-        page_access_token: longLivedUserToken,
-        long_lived_user_token: longLivedUserToken,
+        page_access_token: encryptedUserToken,
+        long_lived_user_token: encryptedUserToken,
         token_expires_at: expiresAt,
         instagram_page_id: instagramBusinessAccountId,
         instagram_business_account_id: instagramBusinessAccountId
@@ -668,7 +671,7 @@ router.get('/instagram/callback', async (req, res) => {
     if (existingIntegration) {
       await supabase
         .from('integrations')
-        .update({ instagram_page_id: instagramBusinessAccountId, access_token: longLivedUserToken })
+        .update({ instagram_page_id: instagramBusinessAccountId, access_token: encryptedUserToken })
         .eq('id', existingIntegration.id);
     } else {
       const { error: insertError } = await supabase
@@ -677,7 +680,7 @@ router.get('/instagram/callback', async (req, res) => {
           brand_id,
           platform: 'instagram',
           instagram_page_id: instagramBusinessAccountId,
-          access_token: longLivedUserToken
+          access_token: encryptedUserToken
         });
 
       if (insertError) {

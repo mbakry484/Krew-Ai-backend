@@ -1,91 +1,84 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const supabase = require('../lib/supabase');
-const { recordDelivery, recordReturn } = require('../lib/ivy/cogs');
+const { getCredentials } = require('../lib/bosta/credentials');
+const { persistPage } = require('../lib/bosta/ingest');
+const { processEvents } = require('../lib/bosta/processor');
 
 // =============================================================================
-// BOSTA WEBHOOK — delivery/return events → Ivy's profit layer
+// BOSTA WEBHOOK — SECONDARY ingestion path
 // =============================================================================
-// Bosta (the COD courier) is the revenue source of truth: an order counts as
-// revenue when DELIVERED and reverses when RETURNED. Configure the webhook in
-// the Bosta business dashboard per brand as:
+// Mounted at /webhook/bosta/:brandId.
 //
-//   https://<host>/webhook/bosta/<brand_id>?secret=<BOSTA_WEBHOOK_SECRET>
+// Read this before assuming webhooks matter here: Ivy does NOT create
+// deliveries — the founder ships via the Shopify-Bosta plugin or Bosta's
+// dashboard. Bosta webhooks are registered PER DELIVERY at creation time, so we
+// have no way to attach one to the founder's existing sales. Polling
+// (lib/bosta/ingest.js, every 10 min) is the primary and only path that runs
+// today.
 //
-// The brand id is in the path because Bosta payloads don't carry it; the
-// shared secret (env BOSTA_WEBHOOK_SECRET) gates the endpoint. The Shopify
-// order number MUST be set as the Bosta businessReference when the shipment is
-// created — that is how a Bosta delivery is matched back to its Shopify order
-// and line items.
+// This endpoint exists so that IF a future Krew shipping flow creates
+// deliveries — registering our URL plus an Authorization header via Bosta's
+// webhookCustomHeaders — those events land cleanly without another deploy. The
+// unique constraint on ivy_bosta_events dedupes whatever polling already caught,
+// so the two paths are safely redundant rather than double-counting.
 //
-// Payload parsing is deliberately tolerant: Bosta has shipped both flat and
-// nested ("_id"/"state.value"/"specs") shapes across API versions.
+// Auth: `Authorization` header must match ivy_bosta_credentials.webhook_secret
+// for the brand. A per-brand secret in a header beats the old global
+// ?secret= query param — query strings land in access logs, and one shared
+// env-var secret meant any brand's webhook could forge another's.
 // =============================================================================
 
-/** Extract what we need from a Bosta webhook body, tolerating shape drift. */
-function parseBostaPayload(body = {}) {
-  const stateRaw = body.state?.value || body.state?.state || body.state || body.deliveryState || '';
-  const state = String(stateRaw).toLowerCase();
-
-  const orderNumber =
-    body.businessReference || body.business_reference ||
-    body.specs?.packageDetails?.businessReference || body.orderReference || null;
-
-  const trackingNumber = body.trackingNumber || body.tracking_number || body._id || null;
-
-  const codRaw = body.cod ?? body.codAmount ?? body.cod_amount ?? body.specs?.cod ?? null;
-  const codAmount = codRaw != null && Number.isFinite(Number(codRaw)) ? Number(codRaw) : null;
-
-  const occurredAt = body.timestamp || body.updatedAt || body.updated_at || null;
-
-  let event = null;
-  if (state.includes('deliver') && !state.includes('out for')) event = 'delivered';
-  // "Returned to business" / "Returned" / state code 46-style strings
-  if (state.includes('return')) event = 'returned';
-
-  return { event, state, orderNumber, trackingNumber, codAmount, occurredAt };
+/** Constant-time compare that tolerates length mismatch without throwing. */
+function secretMatches(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 router.post('/:brandId', async (req, res) => {
-  const secret = process.env.BOSTA_WEBHOOK_SECRET;
-  if (secret && req.query.secret !== secret && req.headers['x-bosta-secret'] !== secret) {
+  const { brandId } = req.params;
+
+  let cred;
+  try {
+    cred = await getCredentials(brandId);
+  } catch (err) {
+    console.error(`[bosta-webhook] credential lookup failed for ${brandId}: ${err.message}`);
+    return res.sendStatus(500);
+  }
+  if (!cred) return res.sendStatus(404);
+
+  // Accept a bare secret or "Bearer <secret>" — we control what we register, but
+  // Bosta's header passthrough has not been exercised end-to-end.
+  const header = req.headers.authorization || '';
+  const provided = header.startsWith('Bearer ') ? header.slice(7) : header;
+  if (!secretMatches(provided, cred.webhook_secret)) {
+    console.warn(`[bosta-webhook] rejected unauthorized webhook for brand ${brandId}`);
     return res.sendStatus(401);
   }
 
-  const { brandId } = req.params;
   // Ack immediately — couriers retry aggressively on slow responses, and the
-  // Shopify order lookup below can take a few seconds.
+  // Shopify order lookup downstream can take seconds.
   res.json({ received: true });
 
   try {
-    const { data: brand } = await supabase.from('brands').select('id').eq('id', brandId).maybeSingle();
-    if (!brand) {
-      console.error(`[bosta] webhook for unknown brand ${brandId} — dropping`);
-      return;
-    }
+    // The payload matches the delivery detail shape, so it goes through exactly
+    // the same normalize → upsert → event path as polling. No parallel parser to
+    // drift out of sync.
+    const body = req.body?.delivery || req.body?.data || req.body;
+    const deliveries = Array.isArray(body) ? body : [body];
 
-    const parsed = parseBostaPayload(req.body);
-    if (!parsed.event) return; // intermediate state (picked up, in transit, …) — not a revenue event
-    if (!parsed.orderNumber) {
-      console.error(`[bosta] ${parsed.event} event for brand ${brandId} has no businessReference — cannot match a Shopify order (tracking: ${parsed.trackingNumber})`);
-      return;
-    }
-
-    const result = parsed.event === 'delivered'
-      ? await recordDelivery(brandId, parsed.orderNumber, {
-          codAmount: parsed.codAmount,
-          trackingNumber: parsed.trackingNumber,
-          deliveredAt: parsed.occurredAt,
-        })
-      : await recordReturn(brandId, parsed.orderNumber, { returnedAt: parsed.occurredAt });
-
-    if (!result.ok) {
-      console.error(`[bosta] ${parsed.event} for order #${parsed.orderNumber} (brand ${brandId}) failed: ${result.error}`);
-    } else if (!result.skipped) {
-      console.log(`[bosta] ${parsed.event} booked for order #${parsed.orderNumber} (brand ${brandId})`);
+    const result = await persistPage(brandId, deliveries, { source: 'webhook' });
+    if (result.events > 0) {
+      console.log(`[bosta-webhook] brand ${brandId}: ${result.events} finance event(s) queued`);
+      // Webhooks imply someone is watching — don't wait for the next cron tick.
+      await processEvents({ limit: 20 });
     }
   } catch (err) {
-    console.error('[bosta] webhook processing error:', err.message);
+    console.error(`[bosta-webhook] processing error for brand ${brandId}: ${err.message}`);
   }
 });
 

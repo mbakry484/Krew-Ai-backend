@@ -5,9 +5,19 @@ const { verifyToken } = require('../middleware/auth');
 const { verifyKrewAppAuth } = require('../middleware/krewAppAuth');
 const jwt = require('jsonwebtoken');
 const { generateEmbeddingsForBrand } = require('../lib/embeddings');
-const { getShopName, getStorefrontUrl, getValidAccessToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
+const { getShopName, getStorefrontUrl, getValidAccessToken, redactToken, SHOPIFY_API_VERSION } = require('../lib/shopify');
 const { syncShopifyCosts } = require('../lib/ivy/costs');
 const { bareVariantId } = require('../lib/ivy/variants');
+const {
+  saveCredentials,
+  getCredentials,
+  deleteCredentials,
+  markConnectionStatus,
+  markFromError,
+} = require('../lib/bosta/credentials');
+const { getTotalDeliveries } = require('../lib/bosta/client');
+const { runHistoricalSync } = require('../lib/bosta/ingest');
+const { encryptSecret, decryptSecret } = require('../lib/crypto');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,7 +80,7 @@ async function autoSyncProducts({ shop, access_token, brand_id, forceReindex = f
       if (!response.ok) {
         const errorBody = await response.text();
         console.error(`❌ Shopify GraphQL ${response.status} response body:`, errorBody);
-        console.error(`❌ Token used (first 10 chars): ${access_token?.substring(0, 10)}...`);
+        console.error(`❌ Token used: ${redactToken(access_token)}`);
         console.error(`❌ URL called: https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
         throw new Error(`Shopify GraphQL error: ${response.status}`);
       }
@@ -394,14 +404,15 @@ router.get('/shopify/callback', async (req, res) => {
       console.error('⚠️ Failed to fetch storefront URL:', err.message);
     }
 
-    // Upsert into integrations table using the authenticated brand_id
+    // Upsert into integrations table using the authenticated brand_id.
+    // Tokens are encrypted at rest — lib/shopify.js decrypts on read.
     const { error: upsertError } = await supabase
       .from('integrations')
       .upsert({
         brand_id,
         shopify_shop_domain: shop,
-        access_token,
-        refresh_token: refresh_token || null,
+        access_token: encryptSecret(access_token),
+        refresh_token: refresh_token ? encryptSecret(refresh_token) : null,
         token_expires_at,
         refresh_token_expires_at,
         storefront_url,
@@ -702,7 +713,7 @@ router.get('/status', verifyToken, async (req, res) => {
     // Fetch Instagram username from Graph API
     let instagramUsername = null;
     const igAccountId = meta?.instagram_page_id || brand?.instagram_business_account_id;
-    const igAccessToken = meta?.access_token || brand?.page_access_token;
+    const igAccessToken = decryptSecret(meta?.access_token || brand?.page_access_token);
     if (igAccountId && igAccessToken) {
       try {
         const igRes = await fetch(
@@ -811,17 +822,44 @@ router.delete('/disconnect', verifyToken, async (req, res) => {
   }
 });
 
+// =============================================================================
+// BOSTA — connection management
+// =============================================================================
+// Credentials live in ivy_bosta_credentials (NOT an integrations row): the
+// connection carries polling state (cursor, status, sync progress) that has no
+// home in the integrations shape. add-ivy-bosta-schema.sql migrates any key
+// previously parked there and drops the platform='bosta' rows.
+// =============================================================================
+
+/** Shape the connection state for the onboarding / settings UI. Never leaks the key. */
+function bostaStatusPayload(cred, brandId) {
+  if (!cred) return { connected: false };
+  return {
+    connected: true,
+    env: cred.env,
+    connection_status: cred.connection_status,
+    connection_error: cred.connection_error,
+    last_poll_at: cred.last_poll_at,
+    historical_sync: cred.historical_sync_state || (cred.historical_sync_completed_at ? { status: 'done' } : null),
+    historical_sync_completed_at: cred.historical_sync_completed_at,
+    webhook_path: `/webhook/bosta/${brandId}`,
+  };
+}
+
 /**
- * POST /integrations/bosta/connect  { api_key }
- * Store the brand's Bosta API key (platform='bosta' row in integrations).
- * The key itself is not exercised here — Ivy's revenue pipeline is fed by the
- * Bosta webhook (routes/bosta.js); the key is kept for future pull-based
- * reconciliation.
+ * POST /integrations/bosta/connect  { api_key, env? }
+ *
+ * Verifies the key against GET /deliveries/analytics/total-deliveries before
+ * storing it — an unverified key means the founder believes they're connected
+ * while revenue silently never arrives. On success, kicks off the 90-day
+ * historical sync in the background and returns immediately; the UI polls
+ * GET /integrations/bosta/status for progress.
  */
 router.post('/bosta/connect', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
     const apiKey = (req.body?.api_key || '').trim();
+    const env = (req.body?.env || 'production').trim();
     if (!apiKey) return res.status(400).json({ error: 'api_key is required' });
 
     const { data: user, error: userError } = await supabase
@@ -833,27 +871,85 @@ router.post('/bosta/connect', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'No brand found for this user' });
     }
 
-    const { data: existing } = await supabase
-      .from('integrations')
-      .select('id')
-      .eq('brand_id', user.brand_id)
-      .eq('platform', 'bosta')
-      .maybeSingle();
+    const result = await saveCredentials(user.brand_id, apiKey, env);
+    if (!result.ok) {
+      // Bosta's own wording, verbatim — "Invalid API key" / IP guidance is more
+      // actionable to the founder than anything we'd paraphrase.
+      return res.status(400).json({ error: result.error, kind: result.kind });
+    }
 
-    const row = { brand_id: user.brand_id, platform: 'bosta', access_token: apiKey, updated_at: new Date().toISOString() };
-    const { error } = existing
-      ? await supabase.from('integrations').update(row).eq('id', existing.id)
-      : await supabase.from('integrations').insert(row);
-    if (error) throw error;
+    // Detached: a 90-day sync can take minutes and must not hold the request.
+    runHistoricalSync(user.brand_id).catch((err) =>
+      console.error(`[bosta] historical sync crashed for brand ${user.brand_id}: ${err.message}`)
+    );
 
-    res.json({ success: true, webhook_path: `/webhook/bosta/${user.brand_id}` });
+    res.json({
+      success: true,
+      env,
+      totals: result.totals,
+      webhook_path: `/webhook/bosta/${user.brand_id}`,
+      historical_sync: { status: 'running' },
+    });
   } catch (error) {
     console.error('Bosta connect error:', error);
     res.status(500).json({ error: 'Failed to connect Bosta' });
   }
 });
 
-/** DELETE /integrations/bosta/disconnect — remove the stored Bosta API key. */
+/** GET /integrations/bosta/status — connection health + historical sync progress. */
+router.get('/bosta/status', verifyToken, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', req.user.user_id)
+      .single();
+    if (!user?.brand_id) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const cred = await getCredentials(user.brand_id);
+    res.json(bostaStatusPayload(cred, user.brand_id));
+  } catch (error) {
+    console.error('Bosta status error:', error);
+    res.status(500).json({ error: 'Failed to read Bosta status' });
+  }
+});
+
+/**
+ * POST /integrations/bosta/test — re-verify the STORED key without changing it.
+ * Powers a "test connection" button on an already-connected brand, and clears a
+ * stale invalid/ip_blocked banner once the founder fixes their side.
+ */
+router.post('/bosta/test', verifyToken, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('brand_id')
+      .eq('id', req.user.user_id)
+      .single();
+    if (!user?.brand_id) return res.status(400).json({ error: 'No brand found for this user' });
+
+    const cred = await getCredentials(user.brand_id);
+    if (!cred) return res.status(404).json({ error: 'Bosta is not connected' });
+
+    try {
+      const totals = await getTotalDeliveries(cred.api_key, cred.env);
+      await markConnectionStatus(user.brand_id, 'active', null);
+      res.json({ ok: true, totals });
+    } catch (err) {
+      await markFromError(user.brand_id, err);
+      res.status(400).json({ ok: false, error: err.message, kind: err.kind || 'error' });
+    }
+  } catch (error) {
+    console.error('Bosta test error:', error);
+    res.status(500).json({ error: 'Failed to test Bosta connection' });
+  }
+});
+
+/**
+ * DELETE /integrations/bosta/disconnect — remove the stored credentials.
+ * Deliveries and events are intentionally KEPT: they're the history behind
+ * already-booked revenue, and deleting them would silently rewrite past months.
+ */
 router.delete('/bosta/disconnect', verifyToken, async (req, res) => {
   try {
     const userId = req.user.user_id;
@@ -864,13 +960,7 @@ router.delete('/bosta/disconnect', verifyToken, async (req, res) => {
       .single();
     if (!user?.brand_id) return res.status(400).json({ error: 'No brand found for this user' });
 
-    const { error } = await supabase
-      .from('integrations')
-      .delete()
-      .eq('brand_id', user.brand_id)
-      .eq('platform', 'bosta');
-    if (error) throw error;
-
+    await deleteCredentials(user.brand_id);
     res.json({ success: true });
   } catch (error) {
     console.error('Bosta disconnect error:', error);
